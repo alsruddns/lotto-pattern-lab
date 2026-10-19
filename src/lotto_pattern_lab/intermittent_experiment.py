@@ -225,6 +225,7 @@ def run_intermittent_experiment(
             }
         )
 
+    actual_gp_started = time.perf_counter()
     one_number = run_intermittent_search(
         splits,
         config,
@@ -241,6 +242,7 @@ def run_intermittent_experiment(
         run_label="actual_six_number_set",
         elite_seeds=elite_seeds,
     )
+    actual_gp_runtime = time.perf_counter() - actual_gp_started
     paired_unseeded = None
     paired_unseeded_runtime = None
     if one_number.seeding["seeded_count"] or set_model.seeding["seeded_count"]:
@@ -360,6 +362,7 @@ def run_intermittent_experiment(
         "started_at": started,
         "finished_at": datetime.now(UTC).isoformat(),
         "runtime_seconds": time.perf_counter() - timer,
+        "actual_gp_runtime_seconds": actual_gp_runtime,
         "dataset": dataset_metadata(dataset),
         "config": asdict(config),
         "feature_schema": {

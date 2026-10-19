@@ -1,6 +1,7 @@
 """Research-round list, detailed research results, and ChatGPT report export."""
 
 from pathlib import Path
+from statistics import median
 
 import streamlit as st
 
@@ -9,13 +10,14 @@ from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.report_clipboard import report_copy_button
 from lotto_pattern_lab.research import load_checkpoint
 from lotto_pattern_lab.research_rounds import (
+    SUMMARY_SCHEMA_VERSION,
     ResearchRoundStore,
     build_chatgpt_report,
     collect_prediction_candidates,
     compare_research_rounds,
-    load_round_experiments,
     model_metric_stats,
-    rebuild_dashboard_summary,
+    paired_comparison_summary,
+    rebuild_dashboard_summary_from_store,
 )
 
 st.set_page_config(page_title="연구 회차 대시보드", layout="wide")
@@ -25,6 +27,7 @@ st.caption("연구 ID는 UUID로 유지하고, 연구 회차는 생성 순서에
 checkpoint_directory = project_path("checkpoints")
 experiment_directory = project_path("experiments")
 rounds_store = ResearchRoundStore()
+pattern_library = PatternLibrary()
 rounds_store.migrate_legacy(checkpoint_directory, experiment_directory)
 rounds = rounds_store.list()
 
@@ -60,7 +63,9 @@ def _duration(seconds: int | float | None) -> str:
     return f"{hours}시간 {minutes}분 {seconds}초"
 
 
-def hydrate_round(record: dict) -> dict:
+def hydrate_round(
+    record: dict, *, reaggregate: bool = False, library: PatternLibrary = pattern_library
+) -> dict:
     hydrated = dict(record)
     checkpoint_path = record.get("checkpoint_path")
     if checkpoint_path and Path(checkpoint_path).is_file():
@@ -70,44 +75,38 @@ def hydrate_round(record: dict) -> dict:
             hydrated["research_round"] = record["research_round"]
         except (OSError, ValueError):
             pass
-    experiments = load_round_experiments(hydrated, experiment_directory)
     summary = hydrated.get("dashboard_summary")
+    checkpoint_summary = hydrated.get("dashboard_summary")
+    registry_summary = record.get("dashboard_summary")
     if (
+        isinstance(registry_summary, dict)
+        and registry_summary.get("summary_schema_version") == SUMMARY_SCHEMA_VERSION
+        and (
+            not isinstance(checkpoint_summary, dict)
+            or checkpoint_summary.get("summary_schema_version") != SUMMARY_SCHEMA_VERSION
+        )
+    ):
+        hydrated["dashboard_summary"] = registry_summary
+    summary = hydrated.get("dashboard_summary")
+    needs_reaggregation = (
         not isinstance(summary, dict)
         or summary.get("completed_experiment_count") is None
-        or summary.get("summary_schema_version") != 1
-    ):
-        summary = rebuild_dashboard_summary(
-            experiments,
-            failed_experiment_count=int(
-                hydrated.get("failed_runs_count", hydrated.get("failed_runs", 0)) or 0
-            )
-            if isinstance(hydrated.get("failed_runs"), int)
-            else len(hydrated.get("failed_runs", [])),
-        )
-        hydrated["dashboard_summary"] = summary
-    if not summary.get("registration_metrics_available", True):
-        pattern_counts = PatternLibrary().research_pattern_counts(str(hydrated["research_id"]))
-        summary["new_pattern_count"] = pattern_counts["new_pattern_count"]
-        summary["child_pattern_count"] = pattern_counts["child_pattern_count"]
-        summary["duplicate_pattern_count"] = None
-    has_legacy_match_metadata = bool(experiments) and any(
-        "full_set_match_discoveries" not in experiment for experiment in experiments
+        or summary.get("summary_schema_version") != SUMMARY_SCHEMA_VERSION
     )
-    if has_legacy_match_metadata:
+    if needs_reaggregation and reaggregate:
+        with st.spinner("실험 상세 기록에서 회차 통계를 다시 계산하고 있습니다..."):
+            summary = rebuild_dashboard_summary_from_store(hydrated, experiment_directory)
+        hydrated["dashboard_summary"] = summary
+    pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
+    summary.update(pattern_counts)
+    summary["registration_metrics_available"] = True
+    summary["registration_count_source"] = "pattern_library"
+    if not summary.get("exact_match_count") and hydrated.get("discovered_exact_matches"):
         summary["exact_match_count"] = len(hydrated.get("discovered_exact_matches", []))
-    summary["summary_schema_version"] = 1
-    rounds_store.update(str(hydrated["research_id"]), {"dashboard_summary": summary})
-    if hydrated.get("total_elapsed_seconds") is None and experiments:
-        elapsed = sum(
-            float(item["runtime_seconds"])
-            for item in experiments
-            if isinstance(item.get("runtime_seconds"), (int, float))
-        )
-        if elapsed:
-            hydrated["total_elapsed_seconds"] = elapsed
-            rounds_store.update(str(hydrated["research_id"]), {"total_elapsed_seconds": elapsed})
-    hydrated["experiment_summaries"] = experiments
+    if reaggregate:
+        summary["summary_schema_version"] = SUMMARY_SCHEMA_VERSION
+        rounds_store.update(str(hydrated["research_id"]), {"dashboard_summary": summary})
+    hydrated["experiment_summaries"] = summary.get("experiment_summaries", [])
     return hydrated
 
 
@@ -128,16 +127,22 @@ else:
                 "상태": item.get("status", "미수집"),
                 "탐색 엔진": ", ".join(item.get("engines", [])) or "미수집",
                 "특징 프로파일": config.get("feature_profile", "미수집"),
-                "Elite Seeding": item.get("elite_seeding", {}).get("enabled", "미수집"),
+                "Elite Seeding": (
+                    "활성화"
+                    if item.get("elite_seeding", {}).get("enabled") is True
+                    else "비활성화"
+                    if item.get("elite_seeding", {}).get("enabled") is False
+                    else "미수집"
+                ),
                 "완료 실험": summary.get(
                     "completed_experiment_count", item.get("completed_runs", 0)
                 ),
                 "실패 실험": summary.get("failed_experiment_count", item.get("failed_runs", 0)),
                 "신규 패턴": summary.get("new_pattern_count", "미수집"),
-                "3개 이상 적중": _hit_total(summary, "3_plus"),
-                "4개 이상 적중": _hit_total(summary, "4_plus"),
-                "5개 이상 적중": _hit_total(summary, "5_plus"),
-                "6개 완전 일치": _hit_total(summary, "6_exact"),
+                "3개 이상 반복 평가": _hit_total(summary, "3_plus"),
+                "4개 이상 반복 평가": _hit_total(summary, "4_plus"),
+                "5개 이상 반복 평가": _hit_total(summary, "5_plus"),
+                "6개 완전 일치 반복 평가": _hit_total(summary, "6_exact"),
                 "독립 테스트 요약": _test_summary(summary),
             }
         )
@@ -147,7 +152,7 @@ else:
         f"연구 {item['research_round']}회차 · {item['research_id'][:8]}": item for item in rounds
     }
     selected_label = st.selectbox("상세 연구 회차", list(choices))
-    selected = hydrate_round(choices[selected_label])
+    selected = hydrate_round(choices[selected_label], reaggregate=True)
     summary = selected.get("dashboard_summary", {})
     config = selected.get("config", {})
     selected["prediction_candidates"] = collect_prediction_candidates(
@@ -171,6 +176,15 @@ else:
     second[4].metric(
         "다음 난수 시드",
         selected.get("next_seed", selected.get("rng_resume", {}).get("next_seed", "미수집")),
+    )
+    st.caption(
+        f"패턴 등록 시도 {summary.get('registration_attempt_count', '미수집')}회 · "
+        f"변형 신규 자식 {summary.get('new_modified_child_pattern_count', '미수집')}개 · "
+        f"신규 자식 전체 {summary.get('new_child_pattern_count', '미수집')}개 · "
+        f"부모 패턴 {summary.get('parent_pattern_count', '미수집')}개"
+    )
+    st.caption(
+        "검사 후보 수는 세대별 개체 평가 횟수이며, 같은 수식의 반복 평가는 중복 포함입니다."
     )
 
     left, right = st.columns(2)
@@ -246,6 +260,48 @@ else:
     )
 
     st.markdown("#### 적중 분포 및 활성화")
+    aggregate_hit_rows = []
+    for model, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
+        model_rows = summary.get("model_metrics", {}).get(model, [])
+        for phase, phase_label in (
+            ("training", "학습"),
+            ("validation", "검증/탐색 선택"),
+            ("independent_test", "독립 테스트"),
+        ):
+            repeated = summary.get("hit_totals", {}).get(f"{model}:{phase}", {})
+            unique = summary.get("unique_hit_totals", {}).get(model, {}).get(phase, {})
+            aggregate_hit_rows.append(
+                {
+                    "모델": label,
+                    "평가 구간": phase_label,
+                    "활성 예측 / 전체 대상 회차 수": (
+                        sum(int(row.get(f"{phase}_activation_count") or 0) for row in model_rows),
+                        sum(
+                            int(row.get(f"{phase}_target_round_count") or 0)
+                            for row in model_rows
+                        ),
+                    ),
+                    "반복 평가 3+ / 4+ / 5+ / 6개": [
+                        repeated.get("3_plus", 0),
+                        repeated.get("4_plus", 0),
+                        repeated.get("5_plus", 0),
+                        repeated.get("6_exact", 0),
+                    ],
+                    "고유 로또 회차 3+ / 4+ / 5+ / 6개": [
+                        unique.get("3_plus", 0),
+                        unique.get("4_plus", 0),
+                        unique.get("5_plus", 0),
+                        unique.get("6_exact", 0),
+                    ],
+                }
+            )
+    st.dataframe(aggregate_hit_rows, hide_index=True, width="stretch")
+    st.caption(
+        "반복 평가는 실험별 활성 예측 회차를 합산합니다. 고유 회차는 같은 로또 회차를 "
+        "여러 실험이 맞혀도 한 번만 셉니다. 3+/4+/5+/6개 기준의 분모는 활성 평가 회차입니다. "
+        "비활성 회차는 번호 예측이 없으므로 적중 분포에서 제외합니다. 검증 구간은 GP 세대 선택에 "
+        "사용되어 독립 검증으로 해석할 수 없습니다."
+    )
     hit_rows = []
     for item in summary.get("experiment_summaries", []):
         for model, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
@@ -262,7 +318,7 @@ else:
                     {
                         "실험 ID": item.get("experiment_id"),
                         "모델": label,
-                        "평가 구간": phase_label,
+                    "평가 구간": "검증/탐색 선택" if phase == "validation" else phase_label,
                         "활성화 횟수": metrics.get(f"{phase}_activation_count", "미수집"),
                         "적중 번호 수": metrics.get(f"{phase}_hit_count", "미수집"),
                         "0개": distribution.get("0", 0),
@@ -280,6 +336,59 @@ else:
         st.info("적중 분포는 과거 실험에서 상세 이벤트가 저장되지 않은 경우 미수집으로 표시됩니다.")
 
     st.markdown("#### 무작위 대조 및 Elite GP 비교")
+    pvalue_rows = []
+    control_runs = config.get("control_runs")
+    for model, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
+        values = summary.get("p_value_distributions", {}).get(model, [])
+        pvalue_rows.append(
+            {
+                "모델": label,
+                "경험적 p값 평균": sum(values) / len(values) if values else None,
+                "중앙값": median(values) if values else None,
+                "범위": [min(values), max(values)] if values else None,
+                "계산 실험 수": len(values),
+                "대조 반복/실험": control_runs,
+                "p값 최소 해상도": 1 / (1 + control_runs)
+                if isinstance(control_runs, int)
+                else None,
+            }
+        )
+    st.dataframe(pvalue_rows, hide_index=True, width="stretch")
+    st.caption(
+        "각 실험은 대조 반복이 적어 p값 해상도가 거칩니다. 서로 겹치는 회차와 데이터 분할을 "
+        "사용한 실험이므로 p값 69개를 독립 표본처럼 해석하지 않습니다."
+    )
+    paired_stats = paired_comparison_summary(summary)
+    paired_rows = []
+    for model, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
+        stats = paired_stats.get(model, {})
+        paired_rows.append(
+            {
+                "모델": label,
+                "검증 평균 점수 차(Elite-일반)": stats.get("validation_mean_delta"),
+                "검증 우세 / 열세 / 동률": [
+                    stats.get("validation_wins"),
+                    stats.get("validation_losses"),
+                    stats.get("validation_ties"),
+                ],
+                "독립 테스트 평균 점수 차": stats.get("test_mean_delta"),
+                "테스트 우세 / 열세 / 동률": [
+                    stats.get("test_wins"),
+                    stats.get("test_losses"),
+                    stats.get("test_ties"),
+                ],
+                "GP 시간 평균 실제 / 일반(초)": [
+                    stats.get("actual_runtime_mean"),
+                    stats.get("paired_runtime_mean"),
+                ],
+                "시간 근거": stats.get("runtime_source", "미수집"),
+            }
+        )
+    st.dataframe(paired_rows, hide_index=True, width="stretch")
+    st.caption(
+        "점수 차는 같은 실험 시드·데이터 분할 paired 비교입니다. 시간 추정은 진행 로그의 첫/마지막 "
+        "세대 기록 차이로 실제 탐색 시작·종료 비용을 모두 포함하지 않습니다."
+    )
     compare_rows = []
     for item in summary.get("experiment_summaries", []):
         for model, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
@@ -294,7 +403,6 @@ else:
                     "일반 GP 검증": paired.get("validation_score", "해당 없음"),
                     "일반 GP 독립 테스트": paired.get("independent_test_score", "해당 없음"),
                     "동일 데이터 분할": paired.get("same_dataset_and_splits", "미수집"),
-                    "무작위 대조 p값": item.get("p_values", {}).get(model),
                     "대조 반복": item.get("control_replicates", "미수집"),
                 }
             )
@@ -390,8 +498,8 @@ else:
             "비교할 연구 B", labels, index=min(1, len(labels) - 1), key="round_compare_right"
         )
         if selected_left != selected_right:
-            left_record = hydrate_round(choices[selected_left])
-            right_record = hydrate_round(choices[selected_right])
+            left_record = hydrate_round(choices[selected_left], reaggregate=True)
+            right_record = hydrate_round(choices[selected_right], reaggregate=True)
             comparison = compare_research_rounds(left_record, right_record)
             if comparison["directly_comparable"]:
                 st.success(

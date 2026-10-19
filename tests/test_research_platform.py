@@ -357,6 +357,8 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
         )
     )
     assert saved_experiment["config"] == saved_config
+    assert saved_experiment["pattern_library_candidates"]
+    assert "full_set_match_discoveries" in saved_experiment
 
     second = run_research_schedule(
         dataset,

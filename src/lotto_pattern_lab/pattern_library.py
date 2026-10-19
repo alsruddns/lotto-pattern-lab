@@ -702,8 +702,8 @@ class PatternLibrary:
             )
             return [{**json.loads(row["payload"]), "current_status": row["status"]} for row in rows]
 
-    def research_pattern_counts(self, research_id: str) -> dict[str, int]:
-        """Return unique patterns and lineage children first registered by a research run."""
+    def research_pattern_counts(self, research_id: str) -> dict[str, Any]:
+        """Return inserted patterns, duplicate attempts, and recorded lineage children."""
         with self._connect() as connection:
             pattern_row = connection.execute(
                 "SELECT COUNT(*) AS count FROM patterns WHERE origin_research_id=?",
@@ -714,9 +714,51 @@ class PatternLibrary:
                 "WHERE research_id=?",
                 (research_id,),
             ).fetchone()
+            new_child_row = connection.execute(
+                "SELECT COUNT(DISTINCT l.child_pattern_id) AS count "
+                "FROM pattern_lineage l JOIN patterns p ON p.pattern_id=l.child_pattern_id "
+                "WHERE l.research_id=? AND p.origin_research_id=?",
+                (research_id, research_id),
+            ).fetchone()
+            modified_child_row = connection.execute(
+                "SELECT COUNT(DISTINCT child_pattern_id) AS count FROM pattern_lineage "
+                "WHERE research_id=? AND method!='elite_seed'",
+                (research_id,),
+            ).fetchone()
+            new_modified_child_row = connection.execute(
+                "SELECT COUNT(DISTINCT l.child_pattern_id) AS count "
+                "FROM pattern_lineage l JOIN patterns p ON p.pattern_id=l.child_pattern_id "
+                "WHERE l.research_id=? AND p.origin_research_id=? AND l.method!='elite_seed'",
+                (research_id, research_id),
+            ).fetchone()
+            parent_row = connection.execute(
+                "SELECT COUNT(DISTINCT parent_pattern_id) AS count FROM pattern_lineage "
+                "WHERE research_id=?",
+                (research_id,),
+            ).fetchone()
+            lineage_rows = connection.execute(
+                "SELECT method, COUNT(*) AS count FROM pattern_lineage "
+                "WHERE research_id=? GROUP BY method",
+                (research_id,),
+            ).fetchall()
+            duplicate_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM pattern_events "
+                "WHERE event_type='duplicate_discovery' "
+                "AND json_extract(payload, '$.research_id')=?",
+                (research_id,),
+            ).fetchone()
+        new_count = int(pattern_row["count"])
+        duplicate_count = int(duplicate_row["count"])
         return {
-            "new_pattern_count": int(pattern_row["count"]),
+            "new_pattern_count": new_count,
+            "duplicate_pattern_count": duplicate_count,
+            "registration_attempt_count": new_count + duplicate_count,
             "child_pattern_count": int(child_row["count"]),
+            "new_child_pattern_count": int(new_child_row["count"]),
+            "modified_child_pattern_count": int(modified_child_row["count"]),
+            "new_modified_child_pattern_count": int(new_modified_child_row["count"]),
+            "parent_pattern_count": int(parent_row["count"]),
+            "lineage_event_counts": {str(row["method"]): int(row["count"]) for row in lineage_rows},
         }
 
     def list_exact_matches(self) -> list[dict[str, Any]]:

@@ -24,9 +24,11 @@ from .pattern_library import (
     register_experiment_exact_matches,
 )
 from .research_rounds import (
+    SUMMARY_SCHEMA_VERSION,
     ResearchRoundStore,
     empty_dashboard_summary,
-    rebuild_dashboard_summary,
+    merge_unique_hit_rounds,
+    rebuild_dashboard_summary_from_store,
     summarize_experiment,
 )
 from .storage import ExperimentStore
@@ -242,19 +244,17 @@ def run_research_schedule(
         store.directory,
     )
     state["research_round"] = round_number
-    if "dashboard_summary" not in state:
-        prior_experiments = []
-        for reference in state.get("completed_experiments", []):
-            experiment_id = reference.get("experiment_id")
-            if not experiment_id:
-                continue
-            try:
-                prior_experiments.append(store.load(str(experiment_id), expand_details=False))
-            except (OSError, ValueError):
-                continue
-        state["dashboard_summary"] = rebuild_dashboard_summary(
-            prior_experiments,
-            failed_experiment_count=len(state.get("failed_runs", [])),
+    if state.get("dashboard_summary", {}).get("summary_schema_version") != SUMMARY_SCHEMA_VERSION:
+        state["dashboard_summary"] = rebuild_dashboard_summary_from_store(
+            {
+                **state,
+                "completed_experiment_ids": [
+                    item.get("experiment_id")
+                    for item in state.get("completed_experiments", [])
+                    if item.get("experiment_id")
+                ],
+            },
+            store.directory,
         )
     state["rng_resume"] = {
         "mode": "per_attempt_seed",
@@ -396,6 +396,9 @@ def run_research_schedule(
                 compact_summary["models"]["six_number_set"]
             )
             dashboard_summary["experiment_summaries"].append(compact_summary)
+            merge_unique_hit_rounds(
+                dashboard_summary, compact_summary.get("unique_hit_rounds", {})
+            )
             for model_key, metrics in compact_summary["paired"].items():
                 dashboard_summary["paired_metrics"].setdefault(model_key, []).append(metrics)
             for key, values in compact_summary["hits"].items():

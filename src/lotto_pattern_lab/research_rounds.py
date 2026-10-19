@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from .paths import project_path
+from .storage import ExperimentStore
+
+SUMMARY_SCHEMA_VERSION = 2
 
 
 def _read_top_level_fields(path: Path, wanted: set[str]) -> dict[str, Any]:
@@ -346,7 +349,7 @@ class ResearchRoundStore:
 
 def empty_dashboard_summary() -> dict[str, Any]:
     return {
-        "summary_schema_version": 1,
+        "summary_schema_version": SUMMARY_SCHEMA_VERSION,
         "completed_experiment_count": 0,
         "failed_experiment_count": 0,
         "candidate_count": 0,
@@ -358,6 +361,9 @@ def empty_dashboard_summary() -> dict[str, Any]:
         "model_metrics": {"one_number": [], "six_number_set": []},
         "paired_metrics": {"one_number": [], "six_number_set": []},
         "hit_totals": {},
+        "unique_hit_round_sets": {},
+        "unique_hit_totals": {},
+        "p_value_distributions": {"one_number": [], "six_number_set": []},
         "experiment_summaries": [],
         "registration_metrics_available": True,
     }
@@ -380,7 +386,9 @@ def summarize_experiment(
     )
     config = result.get("config", {})
     output: dict[str, Any] = {
+        "dashboard_compact": True,
         "experiment_id": result.get("experiment_id"),
+        "status": result.get("status"),
         "seed": result.get("seed", config.get("seed")),
         "runtime_seconds": result.get("runtime_seconds"),
         "candidate_count": _progress_count(result) * int(config.get("population_size", 0)),
@@ -413,30 +421,36 @@ def summarize_experiment(
     ):
         model = result.get(model_key, {})
         selected = model.get("selected", {})
+        distribution = selected.get("match_distribution_by_split", {})
+        events = _events(selected)
+        activation_counts = {}
+        for phase in ("training", "validation", "independent_test"):
+            phase_events = [
+                event for event in events if _event_phase(event, result) == phase
+            ]
+            if events:
+                activation_counts[phase] = sum(bool(event.get("active")) for event in phase_events)
+            else:
+                # Compact experiment JSON stores split-level active match distributions while
+                # activation-event arrays live in a compressed sidecar.
+                activation_counts[phase] = sum(
+                    int(value) for value in distribution.get(phase, {}).values()
+                )
         model_summary = {
             "training_score": selected.get("training_score"),
             "validation_score": selected.get("validation_score"),
             "independent_test_score": selected.get("test_score"),
-            "training_activation_count": sum(
-                bool(event.get("active"))
-                for event in _events(selected)
-                if _event_phase(event, result) == "training"
-            ),
-            "validation_activation_count": sum(
-                bool(event.get("active"))
-                for event in _events(selected)
-                if _event_phase(event, result) == "validation"
-            ),
-            "independent_test_activation_count": sum(
-                bool(event.get("active"))
-                for event in _events(selected)
-                if _event_phase(event, result) == "independent_test"
-            ),
+            "training_activation_count": activation_counts["training"],
+            "validation_activation_count": activation_counts["validation"],
+            "independent_test_activation_count": activation_counts["independent_test"],
+            "training_target_round_count": _phase_round_count(result, "train_rounds"),
+            "validation_target_round_count": _phase_round_count(result, "validation_rounds"),
+            "independent_test_target_round_count": _phase_round_count(result, "test_rounds"),
             "training_hit_count": selected.get("training_hit_count"),
             "validation_hit_count": selected.get("validation_hit_count"),
             "independent_test_hit_count": selected.get("test_hit_count"),
             "activation_rate": selected.get("test_activation_rate"),
-            "match_distribution": selected.get("match_distribution_by_split", {}),
+            "match_distribution": distribution,
             "at_least_3_hits": selected.get("at_least_3_hits_by_split", {}),
             "at_least_4_hits": selected.get("at_least_4_hits_by_split", {}),
             "at_least_5_hits": selected.get("at_least_5_hits_by_split", {}),
@@ -447,6 +461,25 @@ def summarize_experiment(
             },
         }
         output["models"][short_key] = model_summary
+        output.setdefault("unique_hit_rounds", {})[short_key] = {
+            phase: {
+                str(threshold): sorted(
+                    {
+                        int(event["round_number"])
+                        for event in events
+                        if event.get("active")
+                        and _event_phase(event, result) == phase
+                        and (
+                            bool(event.get("full_set_match"))
+                            if threshold == 6
+                            else int(event.get("hit_count") or 0) >= threshold
+                        )
+                    }
+                )
+                for threshold in (3, 4, 5, 6)
+            }
+            for phase in ("training", "validation", "independent_test")
+        }
         for split, distribution in model_summary["match_distribution"].items():
             key = f"{short_key}:{split}"
             output["hits"][key] = {
@@ -456,6 +489,16 @@ def summarize_experiment(
                 "6_exact": int(distribution.get("6", 0) or 0),
             }
     paired = result.get("paired_unseeded_comparison") or {}
+    progress = result.get("progress", [])
+    actual_progress_span = _progress_span(progress, "actual_")
+    paired_progress_span = _progress_span(progress, "paired_unseeded_")
+    actual_runtime = result.get("actual_gp_runtime_seconds")
+    paired_runtime = paired.get("runtime_seconds")
+    runtime_source = "measured"
+    if actual_runtime is None:
+        actual_runtime = actual_progress_span
+        paired_runtime = paired_progress_span or paired_runtime
+        runtime_source = "progress_timestamp_span_estimate"
     for model_key, short_key in (
         ("one_number_model", "one_number"),
         ("six_number_set_model", "six_number_set"),
@@ -463,9 +506,18 @@ def summarize_experiment(
         selected = paired.get(model_key, {}).get("selected", {})
         if selected:
             output["paired"][short_key] = {
+                "actual_validation_score": result.get(model_key, {}).get("selected", {}).get(
+                    "validation_score"
+                ),
+                "actual_independent_test_score": result.get(model_key, {}).get(
+                    "selected", {}
+                ).get("test_score"),
                 "validation_score": selected.get("validation_score"),
                 "independent_test_score": selected.get("test_score"),
                 "same_dataset_and_splits": paired.get("same_dataset_and_splits"),
+                "actual_runtime_seconds": actual_runtime,
+                "paired_runtime_seconds": paired_runtime,
+                "runtime_source": runtime_source,
             }
     output["p_values"] = result.get("random_control_empirical_p_value", {})
     output["control_replicates"] = result.get("random_control_replicates")
@@ -486,6 +538,22 @@ def _progress_count(result: dict[str, Any]) -> int:
     return int(result.get("storage", {}).get("statistics", {}).get("progress_event_count", 0))
 
 
+def _progress_span(progress: Any, prefix: str) -> float | None:
+    if not isinstance(progress, list):
+        return None
+    timestamps = []
+    for event in progress:
+        if not str(event.get("run", "")).startswith(prefix):
+            continue
+        try:
+            timestamps.append(datetime.fromisoformat(event["timestamp"]).timestamp())
+        except (KeyError, TypeError, ValueError):
+            continue
+    if len(timestamps) < 2:
+        return None
+    return max(timestamps) - min(timestamps)
+
+
 def _event_phase(event: dict[str, Any], result: dict[str, Any]) -> str | None:
     round_number = int(event.get("round_number", -1))
     splits = result.get("splits", {})
@@ -498,6 +566,38 @@ def _event_phase(event: dict[str, Any], result: dict[str, Any]) -> str | None:
         if bounds and int(bounds[0]) <= round_number <= int(bounds[1]):
             return name
     return None
+
+
+def _phase_round_count(result: dict[str, Any], split_key: str) -> int | None:
+    bounds = result.get("splits", {}).get(split_key)
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        return None
+    return max(0, int(bounds[1]) - int(bounds[0]) + 1)
+
+
+def merge_unique_hit_rounds(
+    summary: dict[str, Any], additions: dict[str, Any]
+) -> None:
+    """Merge distinct target rounds for 3+, 4+, 5+, and exact six hits."""
+    round_sets = summary.setdefault("unique_hit_round_sets", {})
+    for model, phases in additions.items():
+        model_target = round_sets.setdefault(model, {})
+        for phase, thresholds in phases.items():
+            phase_target = model_target.setdefault(phase, {})
+            for threshold, rounds in thresholds.items():
+                phase_target[threshold] = sorted(
+                    set(phase_target.get(threshold, ())) | {int(value) for value in rounds}
+                )
+    summary["unique_hit_totals"] = {
+        model: {
+            phase: {
+                f"{threshold}_plus" if int(threshold) < 6 else "6_exact": len(rounds)
+                for threshold, rounds in thresholds.items()
+            }
+            for phase, thresholds in phases.items()
+        }
+        for model, phases in round_sets.items()
+    }
 
 
 def _top_candidates(result: dict[str, Any], limit: int = 10) -> list[dict[str, Any]]:
@@ -548,7 +648,11 @@ def rebuild_dashboard_summary(
             summary["failed_experiment_count"] += 1
             continue
         summary["completed_experiment_count"] += 1
-        compact = summarize_experiment(experiment)
+        compact = (
+            experiment
+            if experiment.get("dashboard_compact")
+            else summarize_experiment(experiment)
+        )
         all_registration_data = (
             all_registration_data and compact["registration_metrics_available"]
         )
@@ -572,12 +676,68 @@ def rebuild_dashboard_summary(
             )
             for metric, value in values.items():
                 target[metric] += int(value)
+        for model, phases in compact.get("unique_hit_rounds", {}).items():
+            model_target = summary["unique_hit_round_sets"].setdefault(model, {})
+            for phase, thresholds in phases.items():
+                phase_target = model_target.setdefault(phase, {})
+                for threshold, rounds in thresholds.items():
+                    phase_target.setdefault(threshold, set()).update(rounds)
+        for model, value in compact.get("p_values", {}).items():
+            if value is not None and model in summary["p_value_distributions"]:
+                summary["p_value_distributions"][model].append(value)
     summary["registration_metrics_available"] = all_registration_data
     if not all_registration_data:
         summary["new_pattern_count"] = None
         summary["duplicate_pattern_count"] = None
         summary["child_pattern_count"] = None
+    summary["unique_hit_totals"] = {
+        model: {
+            phase: {
+                    f"{threshold}_plus" if int(threshold) < 6 else "6_exact": len(rounds)
+                for threshold, rounds in thresholds.items()
+            }
+            for phase, thresholds in phases.items()
+        }
+        for model, phases in summary["unique_hit_round_sets"].items()
+    }
+    summary["unique_hit_round_sets"] = {
+        model: {
+            phase: {threshold: sorted(rounds) for threshold, rounds in thresholds.items()}
+            for phase, thresholds in phases.items()
+        }
+        for model, phases in summary["unique_hit_round_sets"].items()
+    }
     return summary
+
+
+def rebuild_dashboard_summary_from_store(
+    research_record: dict[str, Any], experiment_directory: str | Path
+) -> dict[str, Any]:
+    """Rebuild compact aggregates from one expanded experiment at a time."""
+    root = project_path(experiment_directory)
+    experiment_ids = research_record.get("completed_experiment_ids") or []
+    compact_experiments = []
+    store = ExperimentStore(root)
+    for experiment_id in experiment_ids:
+        if not experiment_id or Path(str(experiment_id)).name != str(experiment_id):
+            continue
+        try:
+            experiment = store.load(str(experiment_id), expand_details=True)
+        except (OSError, ValueError):
+            continue
+        compact_experiments.append(summarize_experiment(experiment))
+    failures = research_record.get("failed_runs", [])
+    failed_count = (
+        int(failures)
+        if isinstance(failures, int)
+        else len(failures)
+        if isinstance(failures, list)
+        else int(research_record.get("failed_run_count", 0) or 0)
+    )
+    return rebuild_dashboard_summary(
+        compact_experiments,
+        failed_experiment_count=failed_count,
+    )
 
 
 def load_round_experiments(
@@ -651,6 +811,54 @@ def model_metric_stats(summary: dict[str, Any]) -> dict[str, Any]:
             metric: _stats([item.get(metric) for item in experiments])
             for metric in ("training_score", "validation_score", "independent_test_score")
         }
+    return output
+
+
+def paired_comparison_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Summarize paired seeded-versus-new-initialization comparisons by model."""
+    output = {}
+    for model, experiments in summary.get("paired_metrics", {}).items():
+        row: dict[str, Any] = {}
+        for metric, label in (
+            ("validation_score", "validation"),
+            ("independent_test_score", "test"),
+        ):
+            deltas = [
+                float(item[f"actual_{metric}"]) - float(item[metric])
+                for item in experiments
+                if item.get(f"actual_{metric}") is not None and item.get(metric) is not None
+            ]
+            row[f"{label}_mean_delta"] = statistics.fmean(deltas) if deltas else None
+            row[f"{label}_wins"] = sum(value > 1e-12 for value in deltas)
+            row[f"{label}_losses"] = sum(value < -1e-12 for value in deltas)
+            row[f"{label}_ties"] = sum(abs(value) <= 1e-12 for value in deltas)
+            row[f"{label}_count"] = len(deltas)
+        actual_times = [
+            float(item["actual_runtime_seconds"])
+            for item in experiments
+            if item.get("actual_runtime_seconds") is not None
+        ]
+        paired_times = [
+            float(item["paired_runtime_seconds"])
+            for item in experiments
+            if item.get("paired_runtime_seconds") is not None
+        ]
+        row["actual_runtime_mean"] = (
+            statistics.fmean(actual_times) if actual_times else None
+        )
+        row["paired_runtime_mean"] = (
+            statistics.fmean(paired_times) if paired_times else None
+        )
+        row["runtime_difference_mean"] = (
+            row["paired_runtime_mean"] - row["actual_runtime_mean"]
+            if actual_times and paired_times and len(actual_times) == len(paired_times)
+            else None
+        )
+        row["runtime_source"] = next(
+            (item.get("runtime_source") for item in experiments if item.get("runtime_source")),
+            None,
+        )
+        output[model] = row
     return output
 
 
@@ -735,10 +943,16 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         f"- 완료/실패 실험: {_display(summary.get('completed_experiment_count'))} / "
         f"{_display(summary.get('failed_experiment_count'))}",
         f"- 검사 수식 후보: {_display(summary.get('candidate_count'))}",
+        "- 검사 후보 수는 세대별 개체 평가 횟수이며 같은 수식의 반복 평가를 포함합니다.",
         f"- 신규/중복 패턴 등록: {_display(summary.get('new_pattern_count'))} / "
         f"{_display(summary.get('duplicate_pattern_count'))}",
-        f"- 실제 계승/자식 패턴: {_display(summary.get('inherited_pattern_count'))} / "
+        f"- 패턴 등록 시도: {_display(summary.get('registration_attempt_count'))}",
+        f"- 계승 개체/자식 패턴: {_display(summary.get('inherited_pattern_count'))} / "
         f"{_display(summary.get('child_pattern_count'))}",
+        f"- 신규 수정 자식/신규 전체 자식: "
+        f"{_display(summary.get('new_modified_child_pattern_count'))} / "
+        f"{_display(summary.get('new_child_pattern_count'))}",
+        f"- 계보 연결 부모 패턴: {_display(summary.get('parent_pattern_count'))}",
         f"- 과거 데이터 완전 일치 후보: {_display(summary.get('exact_match_count'))} "
         "(회고적 적합이며 사전 예측으로 간주하지 않음)",
         "",
@@ -765,24 +979,61 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
             ("independent_test", "독립 테스트"),
         ):
             active = [row.get(f"{split}_activation_count") for row in model_rows]
+            targets = [row.get(f"{split}_target_round_count") for row in model_rows]
             hits = [row.get(f"{split}_hit_count") for row in model_rows]
             lines.append(
-                f"- {split_label} 활성화/적중 번호 합계: "
+                f"- {split_label} 활성/전체 대상 회차 및 적중 번호 합계: "
                 f"{_display(sum(x for x in active if isinstance(x, int)) if active else None)} / "
+                f"{_display(sum(x for x in targets if isinstance(x, int)) if targets else None)} / "
                 f"{_display(sum(x for x in hits if isinstance(x, int)) if hits else None)}"
             )
     lines.extend(["", "## 무작위 대조 및 초기화 비교"])
-    lines.append(f"- 대조 반복 수: {_display(round_record.get('config', {}).get('control_runs'))}")
-    pvalues = [
-        item.get("p_values", {}).get(model)
-        for item in summary.get("experiment_summaries", [])
+    control_runs = config.get("control_runs")
+    lines.append(f"- 대조 반복 수/실험: {_display(control_runs)}")
+    for model, label in (("one_number", "한 번호"), ("six_number_set", "6개 집합")):
+        values = summary.get("p_value_distributions", {}).get(model, [])
+        stats = _stats(values)
+        resolution = 1 / (1 + control_runs) if isinstance(control_runs, int) else None
+        lines.append(
+            f"- {label} 경험적 p값 평균/중앙값/범위: {_display(stats['mean'])} / "
+            f"{_display(stats['median'])} / "
+            f"{_display((min(values), max(values)) if values else None)} "
+            f"(계산 실험 {stats['count']}, 반복별 해상도 {_display(resolution)})"
+        )
+    paired_summary = paired_comparison_summary(summary)
+    paired_count = paired_summary.get("one_number", {}).get("validation_count")
+    runtime_is_measured = all(
+        paired_summary.get(model, {}).get("runtime_source") == "measured"
         for model in ("one_number", "six_number_set")
-        if item.get("p_values", {}).get(model) is not None
-    ]
-    lines.append(f"- 경험적 p값 관측치: {_display(pvalues if pvalues else None)}")
+    )
+    runtime_note = (
+        "시간은 탐색 구간 stopwatch 측정입니다. "
+        if runtime_is_measured
+        else "시간은 진행 로그 첫/마지막 이벤트 간 추정치이며 초기화·마무리 비용을 제외합니다. "
+    )
+    lines.append("- Elite GP 대 신규 무작위 초기화 GP paired 결과:")
+    for model, label in (("one_number", "한 번호"), ("six_number_set", "6개 집합")):
+        stats = paired_summary.get(model, {})
+        lines.append(
+            f"  - {label}: 검증 평균 차 { _display(stats.get('validation_mean_delta')) }, "
+            f"우세/열세/동률 { _display(stats.get('validation_wins')) }/"
+            f"{ _display(stats.get('validation_losses')) }/"
+            f"{ _display(stats.get('validation_ties')) }; "
+            f"독립 테스트 평균 차 { _display(stats.get('test_mean_delta')) }, "
+            f"우세/열세/동률 { _display(stats.get('test_wins')) }/"
+            f"{ _display(stats.get('test_losses')) }/{ _display(stats.get('test_ties'))}; "
+            f"진행 로그 구간 시간 평균 실제/paired {_display(stats.get('actual_runtime_mean'))}/"
+            f"{_display(stats.get('paired_runtime_mean'))}초, 차 "
+            f"{_display(stats.get('runtime_difference_mean'))}초"
+        )
     lines.append(
-        "- Elite GP와 무작위 초기화 GP는 동일 데이터 분할 paired 비교가 저장된 실험에 한해 "
-        "비교합니다."
+        f"- 같은 데이터 분할에서 {_display(paired_count)}회 paired 비교했습니다. "
+        f"난수 시드 결과는 완전히 독립이 아닙니다. {runtime_note}"
+        "무작위 데이터 대조는 누적 탐색 이력을 재현하지 않아 검증에 제한이 있습니다."
+    )
+    lines.append(
+        f"- p값은 실험당 대조 반복이 적어 분해능이 거칩니다. {_display(paired_count)}개 관측을 "
+        "독립 표본처럼 평균내어 통계적 유의성으로 해석하지 마세요."
     )
     lines.extend(["", "## 적중 현황 (선택 모델의 학습/검증/독립 테스트 집계)"])
     for key, values in summary.get("hit_totals", {}).items():
@@ -790,6 +1041,18 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
             f"- {key}: 3+ {values['3_plus']}, 4+ {values['4_plus']}, "
             f"5+ {values['5_plus']}, 6개 {values['6_exact']}"
         )
+    lines.append("- 위 적중 횟수는 모델·실험·평가 구간별 활성 예측을 모두 합한 반복 평가 수입니다.")
+    for model, phases in summary.get("unique_hit_totals", {}).items():
+        for phase, counts in phases.items():
+            lines.append(
+                f"- 고유 회차 {model}/{phase}: 3+ {counts.get('3_plus', 0)}, "
+                f"4+ {counts.get('4_plus', 0)}, 5+ {counts.get('5_plus', 0)}, "
+                f"6개 {counts.get('6_exact', 0)}"
+            )
+    lines.append(
+        "- 완전 일치는 활성 6개 집합 예측의 번호 집합이 당첨 6개 번호와 모두 같은 경우로 셉니다. "
+        "3+/4+/5+/6 기준은 활성 평가 회차를 분모로 합니다. 반복 평가와 고유 로또 회차는 구분합니다."
+    )
     lines.extend(["", "## 상위 후보 (검증 기반 정렬)"])
     candidates = [
         candidate
@@ -854,7 +1117,11 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         f"개체군 {_display(config.get('population_size'))}, "
         f"세대 {_display(config.get('generations'))}"
     )
-    failures = round_record.get("failed_run_summary") or round_record.get("failed_runs", [])
+    failures = round_record.get("failed_run_summary")
+    if not isinstance(failures, list):
+        failures = round_record.get("failed_runs", [])
+    if not isinstance(failures, list):
+        failures = []
     failure_summary = [
         {
             "seed": item.get("seed"),

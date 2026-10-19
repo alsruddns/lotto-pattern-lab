@@ -2,14 +2,18 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.research_rounds import (
     ResearchRoundStore,
     build_chatgpt_report,
     compare_research_rounds,
     legacy_research_records,
+    paired_comparison_summary,
     rebuild_dashboard_summary,
+    rebuild_dashboard_summary_from_store,
     summarize_experiment,
 )
+from lotto_pattern_lab.storage import ExperimentStore
 
 
 def test_research_round_migration_orders_history_and_resume_keeps_number(tmp_path) -> None:
@@ -196,6 +200,140 @@ def test_summary_separates_models_counts_hits_and_elite_seeding() -> None:
     assert summary["paired"]["one_number"]["same_dataset_and_splits"] is True
 
 
+def test_compressed_event_reference_uses_distribution_for_activation_counts() -> None:
+    experiment = _experiment("exp-pointer", 0.4, elite=True)
+    selected = experiment["six_number_set_model"]["selected"]
+    expected = sum(
+        int(value)
+        for value in selected["match_distribution_by_split"]["validation"].values()
+    )
+    selected["activation_events"] = {"$detail_ref": "/events", "item_count": 3}
+    summary = summarize_experiment(experiment)
+    assert summary["models"]["six_number_set"]["validation_activation_count"] == expected
+
+
+def test_hit_repetition_and_unique_round_counts_are_separate() -> None:
+    first = _experiment("exp-a", 0.4, elite=False)
+    second = _experiment("exp-b", 0.4, elite=False)
+    for experiment in (first, second):
+        selected = experiment["six_number_set_model"]["selected"]
+        selected["match_distribution_by_split"]["validation"] = {"5": 1}
+        selected["activation_events"] = [
+            {"round_number": 2, "active": True, "hit_count": 5}
+        ]
+    summary = rebuild_dashboard_summary([first, second])
+    repeated = summary["hit_totals"]["six_number_set:validation"]["5_plus"]
+    unique = summary["unique_hit_totals"]["six_number_set"]["validation"]["5_plus"]
+    assert repeated == 2
+    assert unique == 1
+
+
+def test_paired_comparison_summarizes_delta_wins_losses_and_time() -> None:
+    experiment = _experiment("exp-paired", 0.4, elite=True)
+    compact = summarize_experiment(experiment)
+    summary = rebuild_dashboard_summary([compact])
+    stats = paired_comparison_summary(summary)["six_number_set"]
+    assert stats["validation_mean_delta"] == 0.4
+    assert stats["validation_wins"] == 1
+    assert stats["test_wins"] == 1
+    assert stats["actual_runtime_mean"] is None
+
+
+def test_report_summarizes_p_values_instead_of_dumping_each_observation() -> None:
+    experiment = _experiment("exp-p", 0.4, elite=False)
+    summary = rebuild_dashboard_summary([experiment, experiment])
+    record = {
+        "research_round": 1,
+        "research_id": "study",
+        "config": {**experiment["config"], "control_runs": 3},
+        "dashboard_summary": summary,
+    }
+    report = build_chatgpt_report(record)
+    assert "0.25" in report
+    assert "p값은 실험당 대조 반복이 적어 분해능이 거칩니다" in report
+    assert "[0.5, 0.5" not in report
+
+
+def test_pattern_registration_and_child_counts_come_from_library_events(tmp_path) -> None:
+    library = PatternLibrary(tmp_path / "patterns.sqlite")
+    parent_id, _ = library.register_pattern(
+        {
+            "activation_condition": "x0",
+            "formulas": ["x1"],
+            "research_id": "prior-study",
+            "origin_research_id": "prior-study",
+        }
+    )
+    child_payload = {
+        "activation_condition": "x0",
+        "formulas": ["add(x1,1)"],
+        "research_id": "current-study",
+        "origin_research_id": "current-study",
+        "experiment_id": "exp-1",
+    }
+    child_id, created = library.register_pattern(child_payload)
+    duplicate_id, duplicate_created = library.register_pattern(child_payload)
+    library.record_lineage(
+        parent_id,
+        child_id,
+        research_id="current-study",
+        generation=1,
+        method="mutation",
+        operators=["mutation"],
+        parent_formula="x1",
+        child_formula="add(x1,1)",
+    )
+    assert created and not duplicate_created and duplicate_id == child_id
+    assert library.research_pattern_counts("current-study") == {
+        "new_pattern_count": 1,
+        "duplicate_pattern_count": 1,
+        "registration_attempt_count": 2,
+        "child_pattern_count": 1,
+        "new_child_pattern_count": 1,
+        "modified_child_pattern_count": 1,
+        "new_modified_child_pattern_count": 1,
+        "parent_pattern_count": 1,
+        "lineage_event_counts": {"mutation": 1},
+    }
+
+
+def test_store_reaggregation_expands_sidecars_and_counts_distinct_hit_rounds(tmp_path) -> None:
+    experiment = _experiment("exp-detail", 0.4, elite=False)
+    experiment["splits"] = {
+        "train_rounds": [1, 10],
+        "validation_rounds": [11, 30],
+        "test_rounds": [31, 40],
+    }
+    event_rows = [
+        {
+            "round_number": round_number,
+            "active": True,
+            "hit_count": 5 if round_number in (11, 12) else 1,
+            "full_set_match": False,
+        }
+        for round_number in range(1, 41)
+    ]
+    for model_key in ("one_number_model", "six_number_set_model"):
+        selected = experiment[model_key]["selected"]
+        selected["activation_events"] = event_rows
+        selected["match_distribution_by_split"] = {
+            "training": {"1": 10},
+            "validation": {"1": 18, "5": 2},
+            "independent_test": {"1": 10},
+        }
+    store = ExperimentStore(tmp_path / "experiments")
+    store.save(experiment)
+    record = {
+        "research_id": "study",
+        "completed_experiment_ids": ["exp-detail"],
+        "failed_runs": [],
+    }
+    summary = rebuild_dashboard_summary_from_store(record, store.directory)
+    assert summary["model_metrics"]["six_number_set"][0]["validation_activation_count"] == 20
+    assert summary["hit_totals"]["six_number_set:validation"]["5_plus"] == 2
+    assert summary["unique_hit_totals"]["six_number_set"]["validation"]["5_plus"] == 2
+
+
 def test_missing_legacy_registration_data_is_not_reported_as_zero() -> None:
     experiment = _experiment("legacy-exp", 0.4, elite=False)
     del experiment["pattern_library_candidates"]
@@ -214,6 +352,7 @@ def test_report_missing_fields_are_explicit_and_comparison_flags_differences() -
         "status": "completed",
         "dashboard_summary": summary,
         "config": experiment["config"],
+        "failed_runs": 0,
     }
     report = build_chatgpt_report(round_record)
     assert "uuid-2" in report

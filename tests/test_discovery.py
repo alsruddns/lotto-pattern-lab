@@ -160,6 +160,7 @@ def test_intermittent_experiment_persists_selected_rules_and_control_status(tmp_
     assert loaded["status"] == "completed"
     assert loaded["splits"]["test_set_used_for_selection"] is False
     assert loaded["inference_status"] == "tentative"
+    assert loaded["actual_gp_runtime_seconds"] >= 0
     assert loaded["random_control_empirical_p_value"]["one_number"] is None
     for model_key in ("one_number_model", "six_number_set_model"):
         selected = loaded[model_key]["selected"]
