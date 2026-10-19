@@ -5,6 +5,7 @@ from statistics import median
 
 import streamlit as st
 
+from lotto_pattern_lab.hit_audit import audit_research_round, build_hit_audit_markdown
 from lotto_pattern_lab.paths import project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.report_clipboard import report_copy_button
@@ -152,7 +153,7 @@ else:
         f"연구 {item['research_round']}회차 · {item['research_id'][:8]}": item for item in rounds
     }
     selected_label = st.selectbox("상세 연구 회차", list(choices))
-    selected = hydrate_round(choices[selected_label], reaggregate=True)
+    selected = hydrate_round(choices[selected_label], reaggregate=False)
     summary = selected.get("dashboard_summary", {})
     config = selected.get("config", {})
     selected["prediction_candidates"] = collect_prediction_candidates(
@@ -183,9 +184,7 @@ else:
         f"신규 자식 전체 {summary.get('new_child_pattern_count', '미수집')}개 · "
         f"부모 패턴 {summary.get('parent_pattern_count', '미수집')}개"
     )
-    st.caption(
-        "검사 후보 수는 세대별 개체 평가 횟수이며, 같은 수식의 반복 평가는 중복 포함입니다."
-    )
+    st.caption("검사 후보 수는 세대별 개체 평가 횟수이며, 같은 수식의 반복 평가는 중복 포함입니다.")
 
     left, right = st.columns(2)
     with left:
@@ -276,10 +275,7 @@ else:
                     "평가 구간": phase_label,
                     "활성 예측 / 전체 대상 회차 수": (
                         sum(int(row.get(f"{phase}_activation_count") or 0) for row in model_rows),
-                        sum(
-                            int(row.get(f"{phase}_target_round_count") or 0)
-                            for row in model_rows
-                        ),
+                        sum(int(row.get(f"{phase}_target_round_count") or 0) for row in model_rows),
                     ),
                     "반복 평가 3+ / 4+ / 5+ / 6개": [
                         repeated.get("3_plus", 0),
@@ -318,7 +314,7 @@ else:
                     {
                         "실험 ID": item.get("experiment_id"),
                         "모델": label,
-                    "평가 구간": "검증/탐색 선택" if phase == "validation" else phase_label,
+                        "평가 구간": "검증/탐색 선택" if phase == "validation" else phase_label,
                         "활성화 횟수": metrics.get(f"{phase}_activation_count", "미수집"),
                         "적중 번호 수": metrics.get(f"{phase}_hit_count", "미수집"),
                         "0개": distribution.get("0", 0),
@@ -473,6 +469,155 @@ else:
     else:
         st.info("해당 연구의 저장된 예측 후보 없음")
 
+    st.markdown("#### 고적중 수식과 당첨 회차 직접 재검증")
+    st.caption(
+        "원본 JSON의 예측을 기준 데이터와 대조하고 GP 공식을 과거 입력 특징으로 다시 실행합니다. "
+        "원본 연구 파일은 수정하지 않습니다."
+    )
+    audit_state_key = f"research_hit_audit:{selected['research_id']}"
+    if st.button("고적중 기록 전체 재검증", key=f"audit:{selected['research_id']}"):
+        try:
+            with st.spinner("연결된 실험의 상세 기록과 GP 공식을 읽어 재계산하고 있습니다..."):
+                st.session_state[audit_state_key] = audit_research_round(
+                    str(selected["research_id"])
+                )
+        except (OSError, ValueError, KeyError) as error:
+            st.error(f"고적중 기록 재검증 실패: {error}")
+    hit_audit = st.session_state.get(audit_state_key)
+    if hit_audit:
+        six_audit = hit_audit.get("models", {}).get("six_number_set", {})
+        audit_counts = []
+        for phase, phase_name in (("validation", "검증"), ("independent_test", "독립 테스트")):
+            repeated = six_audit.get("repeated_hit_counts", {}).get(phase, {})
+            unique = six_audit.get("unique_round_counts", {}).get(phase, {})
+            audit_counts.append(
+                {
+                    "평가 구간": phase_name,
+                    "반복 평가 4+ / 5+ / 6개": [
+                        repeated.get("4_plus", 0),
+                        repeated.get("5_plus", 0),
+                        repeated.get("6_exact", 0),
+                    ],
+                    "고유 회차 4+ / 5+ / 6개": [
+                        unique.get("4_plus", 0),
+                        unique.get("5_plus", 0),
+                        unique.get("6_exact", 0),
+                    ],
+                }
+            )
+        st.dataframe(audit_counts, hide_index=True, width="stretch")
+        formula_check = six_audit.get("formula_prediction_reproduction", {})
+        winner_check = six_audit.get("winning_numbers_match_official", {})
+        st.caption(
+            f"실험 JSON 상세 로드 {hit_audit.get('loaded_experiment_count')} / "
+            f"{hit_audit.get('linked_experiment_count')} · "
+            f"공식 재실행 {formula_check.get('reproduced')} / "
+            f"{formula_check.get('compared')} 이벤트 일치 · "
+            f"당첨번호 기준 데이터 대조 {winner_check.get('verified')} / "
+            f"{winner_check.get('compared')} 이벤트 일치"
+        )
+        st.caption(
+            "연구 당시 메인 번호·날짜 해시 대조: "
+            f"{'일치' if hit_audit.get('main_draw_date_hash_matches_study') else '불일치'} · "
+            f"연구 해시 {hit_audit.get('recorded_dataset_sha256')} · "
+            f"보너스 포함 데이터 해시 {hit_audit.get('current_full_dataset_sha256')}"
+        )
+        feature_map = hit_audit.get("feature_variables", {})
+        st.caption(
+            f"특징 변수 의미: x0 = {feature_map.get('x0', '미수집')} · "
+            f"x57 = {feature_map.get('x57', '미수집')} (10회 전 번호의 쌍별 합)"
+        )
+        seed_provenance = hit_audit.get("elite_seed_provenance", {})
+        st.caption(
+            f"Elite 원본 {seed_provenance.get('source_pattern_count', 0)}개 중 동일 데이터 해시 "
+            f"{seed_provenance.get('same_dataset_hash_count', 0)}개, 동일 검증·테스트 분할 "
+            f"{seed_provenance.get('same_validation_split_count', 0)} / "
+            f"{seed_provenance.get('same_test_split_count', 0)}개"
+        )
+        seed_rows = [
+            {
+                "원본 패턴 ID": item.get("pattern_id"),
+                "원본 실험 ID": item.get("experiment_id"),
+                "동일 데이터 해시": item.get("same_dataset_hash"),
+                "동일 검증 / 테스트 분할": [
+                    item.get("same_validation_split"),
+                    item.get("same_test_split"),
+                ],
+                "테스트로 선택 여부": item.get("test_set_used_for_selection"),
+                "원본 수식 검증 5+ 회차": item.get("seed_formula_validation_5_plus_rounds"),
+                "원본 실험 테스트 4+ 회차": item.get("test_4_plus_rounds"),
+            }
+            for item in seed_provenance.get("patterns", [])
+            if item.get("seed_formula_validation_5_plus_rounds") or item.get("test_4_plus_rounds")
+        ]
+        if seed_rows:
+            st.dataframe(seed_rows, hide_index=True, width="stretch")
+        high_hit_rows = [
+            {
+                "평가 구간": "검증" if item.get("phase") == "validation" else "독립 테스트",
+                "로또 회차": item.get("round_number"),
+                "일치 수": item.get("hit_count"),
+                "예측 번호": item.get("predicted_numbers"),
+                "실제 당첨번호": item.get("winning_numbers"),
+                "실험 ID": item.get("experiment_id"),
+                "활성화 조건": item.get("activation_condition"),
+                "분기": item.get("rule_index"),
+                "적중 분기 수식": item.get("active_formulas"),
+                "사용 변수 의미": item.get("used_feature_variables"),
+            }
+            for item in six_audit.get("high_hits", [])
+        ]
+        if high_hit_rows:
+            st.dataframe(high_hit_rows, hide_index=True, width="stretch")
+        else:
+            st.info("기록된 고적중 이벤트가 없습니다.")
+        ranking_rows = [
+            {
+                "순위": index,
+                "독립 테스트 4+ 반복": item.get("independent_test_4_plus"),
+                "검증 5+ 반복": item.get("validation_5_plus"),
+                "고유 적중 회차": item.get("independent_test_unique_rounds"),
+                "검증 4+ 회차": item.get("validation_unique_rounds"),
+                "실험 ID": item.get("experiment_ids"),
+                "일치 Elite 원본 패턴": item.get("elite_seed_pattern_ids"),
+                "활성화 조건": item.get("activation_condition"),
+                "적중 분기 수식": item.get("active_formulas"),
+                "변수 의미": item.get("variables"),
+            }
+            for index, item in enumerate(
+                [
+                    row
+                    for row in six_audit.get("hit_formula_rankings", [])
+                    if row.get("independent_test_4_plus", 0)
+                ][:10],
+                start=1,
+            )
+        ]
+        if ranking_rows:
+            st.markdown("**독립 테스트 고적중 공식 순위**")
+            st.dataframe(ranking_rows, hide_index=True, width="stretch")
+        for key, audit_report, detailed in (
+            (
+                "hit_audit_summary",
+                build_hit_audit_markdown(hit_audit),
+                False,
+            ),
+            (
+                "hit_audit_detailed",
+                build_hit_audit_markdown(hit_audit, detailed=True),
+                True,
+            ),
+        ):
+            response = report_copy_button(audit_report, key=key, detailed=detailed)
+            if response and response.get("request_id") != st.session_state.get(
+                f"{key}_last_request"
+            ):
+                st.session_state[f"{key}_last_request"] = response.get("request_id")
+                if response.get("status") == "copied":
+                    st.toast("재검증 보고서를 클립보드에 복사했습니다.", icon="✅")
+                else:
+                    st.error(f"재검증 보고서 복사 실패: {response.get('message', '브라우저 오류')}")
+
     report = build_chatgpt_report(selected)
     full_report = build_chatgpt_report(selected, detailed=True)
     st.markdown("#### ChatGPT 분석 보고서")
@@ -498,8 +643,8 @@ else:
             "비교할 연구 B", labels, index=min(1, len(labels) - 1), key="round_compare_right"
         )
         if selected_left != selected_right:
-            left_record = hydrate_round(choices[selected_left], reaggregate=True)
-            right_record = hydrate_round(choices[selected_right], reaggregate=True)
+            left_record = hydrate_round(choices[selected_left], reaggregate=False)
+            right_record = hydrate_round(choices[selected_right], reaggregate=False)
             comparison = compare_research_rounds(left_record, right_record)
             if comparison["directly_comparable"]:
                 st.success(
