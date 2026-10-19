@@ -23,6 +23,7 @@ st.caption(
 
 store = ExperimentStore("experiments")
 official_path = Path("data/official/draws.csv")
+local_draws_path = Path("data/raw/lotto_draws_753_1246.csv")
 
 with st.sidebar:
     st.header("데이터")
@@ -50,7 +51,12 @@ with st.sidebar:
 
     source_mode = st.radio(
         "분석 데이터",
-        ("동행복권 공식 데이터", "CSV 업로드", "합성 무작위 데이터"),
+        (
+            "로컬 실데이터 753~1246회 (공식 대조 전)",
+            "동행복권 공식 데이터",
+            "CSV 업로드",
+            "합성 무작위 데이터",
+        ),
         help="실제 데이터와 합성 대조 데이터는 분리된 선택지입니다.",
     )
     uploaded = st.file_uploader("CSV 파일", type=("csv",)) if source_mode == "CSV 업로드" else None
@@ -77,7 +83,15 @@ with st.sidebar:
 base_dataset = None
 data_error = None
 try:
-    if source_mode == "동행복권 공식 데이터":
+    if source_mode == "로컬 실데이터 753~1246회 (공식 대조 전)":
+        if local_draws_path.exists():
+            base_dataset = load_csv(local_draws_path)
+            rounds = [record.round_number for record in base_dataset.records]
+            if rounds != list(range(753, 1247)):
+                raise ValueError("로컬 실데이터는 753~1246회 전체가 연속되어야 합니다.")
+        else:
+            data_error = f"실데이터 파일을 찾을 수 없습니다: {local_draws_path}"
+    elif source_mode == "동행복권 공식 데이터":
         if official_path.exists():
             base_dataset = load_csv(official_path)
         else:
@@ -101,9 +115,18 @@ if base_dataset is not None:
     st.subheader("분석 구간")
     low_round = base_dataset.records[0].round_number
     high_round = base_dataset.records[-1].round_number
+    status_labels = {
+        "locally_validated_unreconciled": "내부 형식·회차 검증 완료 · 공식 원본 대조 전",
+        "official_verified": "동행복권 공식 원본 확인 완료",
+        "unverified": "출처 미검증 CSV",
+        "synthetic": "합성 무작위 데이터",
+    }
+    status_text = status_labels.get(
+        base_dataset.verification_status, base_dataset.verification_status
+    )
     st.caption(
-        f"데이터 출처 상태: {base_dataset.verification_status} · "
-        f"기본 회차 범위: {low_round}~{high_round}"
+        f"데이터 상태: {status_text} · "
+        f"기본 연구 범위: 2017-05-06(753회) 이후 · 현재 {low_round}~{high_round}회"
     )
     date_values = [
         record.draw_date for record in base_dataset.records if record.draw_date is not None

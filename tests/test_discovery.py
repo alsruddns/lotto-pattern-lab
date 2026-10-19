@@ -189,6 +189,27 @@ def test_csv_loader_validates_draws_and_records_unverified_source(tmp_path) -> N
         load_csv(path)
 
 
+def test_csv_loader_maps_draw_no_and_marks_complete_unreconciled_range(tmp_path) -> None:
+    path = tmp_path / "draw_no.csv"
+    records = make_random_dataset(494, 753, first_round=753)
+    rows = ["draw_no,n1,n2,n3,n4,n5,n6"]
+    rows.extend(
+        f"{record.round_number},{','.join(map(str, record.draw.numbers))}"
+        for record in records.records
+    )
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    dataset = load_csv(path)
+
+    assert len(dataset.records) == 494
+    assert dataset.records[0].round_number == 753
+    assert dataset.records[-1].round_number == 1246
+    assert dataset.records[0].draw_date is None
+    assert dataset.records[0].draw.bonus is None
+    assert dataset.source_kind == "csv_locally_validated"
+    assert dataset.verification_status == "locally_validated_unreconciled"
+
+
 def test_dataset_range_filter_does_not_keep_pre_range_rounds() -> None:
     first_date = date(2017, 5, 6)
     records = tuple(

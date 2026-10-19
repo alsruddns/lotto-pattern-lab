@@ -10,7 +10,9 @@
 .\.venv\Scripts\python.exe -m lotto_pattern_lab sync --start-round 753
 ```
 
-직접 CSV를 가져올 때 필요한 열은 `round,n1,n2,n3,n4,n5,n6`이며 `date`/`draw_date`와 `bonus`는 선택 열입니다. 별도 검증 manifest가 없는 업로드 파일은 `csv_unverified`로 표시하고, URL만으로 공식성을 인증하지 않습니다. 합성 데이터는 실제 추첨 데이터와 별도 유형으로 기록합니다. 날짜/회차 필터링 후 선택된 행만 모델 입력에 전달하므로 선택 구간 앞의 데이터는 과거 lag로 들어가지 않습니다.
+로컬 `data/raw/lotto_draws_753_1246.csv`도 선택할 수 있습니다. 파일은 `draw_no,n1,n2,n3,n4,n5,n6` 형식이며 Git에서 제외됩니다. 로더는 `draw_no`와 `round`를 모두 지원합니다. 753~1246회 494개가 연속되고 각 회차에 유효한 6개 번호가 있으면 `locally_validated_unreconciled`로 표시합니다. 이는 파일 내부 구조 검증을 뜻하며 공식 원본과 행별 대조를 마쳤다는 뜻은 아닙니다.
+
+직접 CSV를 가져올 때 필요한 열은 `round` 또는 `draw_no`와 `n1,n2,n3,n4,n5,n6`이며 `date`/`draw_date`와 `bonus`는 선택 열입니다. 별도 검증 manifest가 없는 다른 업로드 파일은 `csv_unverified`로 표시하고, URL만으로 공식성을 인증하지 않습니다. 합성 데이터는 실제 추첨 데이터와 별도 유형으로 기록합니다. 기본 연구 구간은 2017-05-06의 753회 이후입니다. 날짜/회차 필터링 후 선택된 행만 모델 입력에 전달하므로 선택 구간 앞의 데이터는 과거 lag로 들어가지 않습니다.
 
 ## 설치 및 실행
 
@@ -19,12 +21,13 @@
 .\.venv\Scripts\python.exe -m streamlit run src/lotto_pattern_lab/app.py
 ```
 
-Streamlit 화면에서 공식 스냅샷, CSV, 합성 데이터 중 하나를 선택하고 날짜·회차 범위와 GP 설정을 조정할 수 있습니다. `간헐적 패턴 탐색`은 게이트가 활성화하는 회차에서만 규칙을 적용합니다. 진행 중인 세대별 상태와 부분 결과는 `experiments/`에 원자적으로 저장됩니다.
+Streamlit 화면에서 로컬 실데이터, 공식 스냅샷, CSV, 합성 데이터 중 하나를 선택하고 회차 범위와 GP 설정을 조정할 수 있습니다. 날짜 열이 없는 CSV에는 회차 범위 필터가 적용됩니다. `간헐적 패턴 탐색`은 게이트가 활성화하는 회차에서만 규칙을 적용합니다. 진행 중인 세대별 상태와 부분 결과는 `experiments/`에 원자적으로 저장됩니다.
 
 CLI에서도 같은 간헐적 엔진을 실행할 수 있습니다.
 
 ```powershell
 .\.venv\Scripts\python.exe -m lotto_pattern_lab intermittent --csv data/official/draws.csv --population 32 --generations 10 --workers 4 --controls 20 --seed 12345
+.\.venv\Scripts\python.exe -m lotto_pattern_lab intermittent --csv data/raw/lotto_draws_753_1246.csv --population 8 --generations 1 --workers 1 --controls 1 --seed 753
 .\.venv\Scripts\python.exe -m lotto_pattern_lab intermittent --synthetic 180 --population 16 --generations 2 --workers 1 --controls 1 --seed 12345
 ```
 
@@ -41,7 +44,7 @@ CLI에서도 같은 간헐적 엔진을 실행할 수 있습니다.
 
 ## 가설적 상태 분석
 
-대각 공분산 Gaussian HMM은 학습 구간에만 적합하고, 이후 상태 확률은 과거 관측만 이용한 순방향 필터링으로 계산합니다. 뒤 관측으로 과거 상태를 사후 확정해 예측 점수로 보고하지 않습니다. 변화점 탐지기는 이전 회차 요약량의 두 이동 창 평균을 온라인 비교합니다. 상태 A/B/C 라벨은 계산 편의를 위한 가설적 분류이며 실제 추첨기 내부 상태를 뜻하지 않습니다.
+대각 공분산 Gaussian HMM은 학습 구간에만 적합하고, 이후 상태 확률은 과거 관측만 이용한 순방향 필터링으로 계산합니다. 뒤 관측으로 과거 상태를 사후 확정해 예측 점수로 보고하지 않습니다. 변화점 탐지기는 이전 회차 요약량의 두 이동 창 평균을 온라인 비교합니다. 상태 A~E 라벨은 계산 편의를 위한 가설적 분류이며 실제 추첨기 내부 상태를 뜻하지 않습니다.
 
 ## 실험 산출물 및 한계
 

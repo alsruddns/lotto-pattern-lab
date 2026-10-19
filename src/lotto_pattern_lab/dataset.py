@@ -35,10 +35,16 @@ class DrawDataset:
             raise ValueError("Round numbers must be positive integers.")
         if rounds != sorted(set(rounds)):
             raise ValueError("Rounds must be unique and in ascending order.")
-        if self.source_kind not in {"csv_unverified", "official_verified", "synthetic"}:
+        if self.source_kind not in {
+            "csv_unverified",
+            "csv_locally_validated",
+            "official_verified",
+            "synthetic",
+        }:
             raise ValueError("Unsupported dataset source kind.")
         expected_status = {
             "csv_unverified": "unverified",
+            "csv_locally_validated": "locally_validated_unreconciled",
             "official_verified": "official_verified",
             "synthetic": "synthetic",
         }[self.source_kind]
@@ -49,16 +55,19 @@ class DrawDataset:
 
 
 def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
-    """Load round,n1,...,n6 CSV; provenance is recorded but not independently authenticated."""
+    """Load round/draw_no and n1..n6 CSV with locally checked round continuity."""
     records: list[DrawRecord] = []
     with Path(path).open(encoding="utf-8-sig", newline="") as csv_file:
         reader = csv.DictReader(csv_file)
-        required = {"round", *(f"n{i}" for i in range(1, 7))}
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
-            raise ValueError("CSV requires columns: round,n1,n2,n3,n4,n5,n6 (bonus is optional).")
+        if reader.fieldnames is None:
+            raise ValueError("CSV header is missing.")
+        round_column = "round" if "round" in reader.fieldnames else "draw_no"
+        required = {round_column, *(f"n{i}" for i in range(1, 7))}
+        if not required.issubset(reader.fieldnames):
+            raise ValueError("CSV requires round or draw_no plus n1,n2,n3,n4,n5,n6 columns.")
         for line_number, row in enumerate(reader, start=2):
             try:
-                round_number = int(row["round"])
+                round_number = int(row[round_column])
                 numbers = tuple(int(row[f"n{i}"]) for i in range(1, 7))
                 bonus_value = row.get("bonus", "")
                 bonus = int(bonus_value) if bonus_value else None
@@ -85,12 +94,15 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
             str(manifest.get("source_url", "")),
             verified_at=str(manifest.get("verified_at", "")),
         )
-    return DrawDataset(
-        tuple(records),
-        "csv_unverified",
-        "User supplied CSV; source has not been independently verified.",
-        source_url,
+    rounds = [record.round_number for record in records]
+    is_complete_study_range = len(rounds) == 494 and rounds == list(range(753, 1247))
+    source_kind = "csv_locally_validated" if is_complete_study_range else "csv_unverified"
+    description = (
+        "Local checks passed for draws 753-1246; full row-by-row official reconciliation pending."
+        if is_complete_study_range
+        else "User supplied CSV; source has not been independently verified."
     )
+    return DrawDataset(tuple(records), source_kind, description, source_url)
 
 
 def save_official_csv(dataset: DrawDataset, path: str | Path) -> tuple[Path, Path]:
