@@ -9,6 +9,8 @@ from math import ceil
 import streamlit as st
 
 from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
+from lotto_pattern_lab.gp_config import GPConfig
+from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary, import_historical_experiment
 from lotto_pattern_lab.periodicity import periodicity_report
@@ -24,6 +26,7 @@ st.caption(
 )
 
 checkpoint_dir = project_path("checkpoints")
+gp_defaults = GPConfig()
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 checkpoint_paths = sorted(
     checkpoint_dir.glob("research*.json"), key=lambda p: p.stat().st_mtime, reverse=True
@@ -36,7 +39,11 @@ with st.sidebar:
         if data_source == "공식 검증 데이터"
         else project_path("data/raw/lotto_draws_753_1246.csv")
     )
-    workflow = st.radio("작업", ("새 장시간 연구", "저장된 연구 재개"))
+    workflow = st.radio(
+        "작업",
+        ("새 장시간 연구", "저장된 연구 재개"),
+        key="research_workflow",
+    )
     selected_checkpoint = None
     if workflow == "저장된 연구 재개":
         if checkpoint_paths:
@@ -50,6 +57,35 @@ with st.sidebar:
                 resume_config = load_checkpoint(selected_checkpoint).get("config", {})
             except (OSError, ValueError):
                 resume_config = {}
+        if selected_checkpoint is not None:
+            resume_widget_values = {
+                "research_feature_profile": resume_config.get("feature_profile", "legacy"),
+                "research_elite_enabled": resume_config.get("elite_seeding_enabled", False),
+                "research_elite_ratio": resume_config.get("elite_seed_ratio", 0.2),
+                "research_population_size": resume_config.get(
+                    "population_size", gp_defaults.population_size
+                ),
+                "research_generations": resume_config.get("generations", gp_defaults.generations),
+                "research_crossover_probability": resume_config.get(
+                    "crossover_probability", gp_defaults.crossover_probability
+                ),
+                "research_mutation_probability": resume_config.get(
+                    "mutation_probability", gp_defaults.mutation_probability
+                ),
+                "research_max_depth": resume_config.get("max_depth", gp_defaults.max_depth),
+                "research_workers": resume_config.get("workers", gp_defaults.workers),
+                "research_train_ratio": resume_config.get("train_ratio", gp_defaults.train_ratio),
+                "research_validation_ratio": resume_config.get(
+                    "validation_ratio", gp_defaults.validation_ratio
+                ),
+                "research_max_lag": resume_config.get("max_lag", gp_defaults.max_lag),
+                "research_control_runs": resume_config.get("control_runs", 3),
+                "research_min_activation_rate": resume_config.get("min_activation_rate", 0.1),
+                "research_hidden_states": resume_config.get("hidden_states", 3),
+                "research_seed": resume_config.get("seed", gp_defaults.seed),
+            }
+            for widget_key, value in resume_widget_values.items():
+                st.session_state[widget_key] = value
     engine = st.selectbox("탐색 엔진", ("intermittent_gp",))
     feature_profile = st.selectbox(
         "특징 프로파일",
@@ -60,6 +96,7 @@ with st.sidebar:
             else "legacy"
         ),
         disabled=workflow == "저장된 연구 재개",
+        key="research_feature_profile",
     )
     elite_enabled = st.checkbox(
         "Elite Seeding 사용",
@@ -68,6 +105,7 @@ with st.sidebar:
         ),
         disabled=workflow == "저장된 연구 재개",
         help="검증 성능과 호환성을 통과한 기존 수식을 초기 GP 개체군에 넣습니다.",
+        key="research_elite_enabled",
     )
     elite_ratio = st.slider(
         "기존 수식 계승 비율",
@@ -77,6 +115,7 @@ with st.sidebar:
         step=0.05,
         disabled=workflow == "저장된 연구 재개" or not elite_enabled,
         help="나머지 개체는 무작위로 새로 생성합니다.",
+        key="research_elite_ratio",
     )
     duration_option = st.selectbox("실행 시간", ("30분", "1시간", "3시간", "6시간", "사용자 지정"))
     duration_minutes = {"30분": 30, "1시간": 60, "3시간": 180, "6시간": 360}.get(duration_option)
@@ -86,23 +125,78 @@ with st.sidebar:
         "개체군 크기",
         min_value=8,
         max_value=1000,
-        value=int(resume_config.get("population_size", 32)),
+        value=int(resume_config.get("population_size", gp_defaults.population_size)),
         step=8,
         disabled=workflow == "저장된 연구 재개",
+        key="research_population_size",
     )
     generations = st.number_input(
         "세대 수",
         min_value=1,
         max_value=1000,
-        value=int(resume_config.get("generations", 10)),
+        value=int(resume_config.get("generations", gp_defaults.generations)),
         disabled=workflow == "저장된 연구 재개",
+        key="research_generations",
+    )
+    crossover = st.slider(
+        "교차 확률",
+        0.0,
+        1.0,
+        float(resume_config.get("crossover_probability", gp_defaults.crossover_probability)),
+        0.05,
+        disabled=workflow == "저장된 연구 재개",
+        key="research_crossover_probability",
+    )
+    mutation = st.slider(
+        "돌연변이 확률",
+        0.0,
+        1.0,
+        float(resume_config.get("mutation_probability", gp_defaults.mutation_probability)),
+        0.05,
+        disabled=workflow == "저장된 연구 재개",
+        key="research_mutation_probability",
+    )
+    max_depth = st.slider(
+        "최대 수식 깊이",
+        2,
+        10,
+        int(resume_config.get("max_depth", gp_defaults.max_depth)),
+        disabled=workflow == "저장된 연구 재개",
+        key="research_max_depth",
     )
     workers = st.slider(
         "CPU 워커",
         1,
         4,
-        int(resume_config.get("workers", 4)),
+        int(resume_config.get("workers", gp_defaults.workers)),
         disabled=workflow == "저장된 연구 재개",
+        key="research_workers",
+    )
+    train_ratio = st.slider(
+        "학습 비율",
+        0.1,
+        0.8,
+        float(resume_config.get("train_ratio", gp_defaults.train_ratio)),
+        0.05,
+        disabled=workflow == "저장된 연구 재개",
+        key="research_train_ratio",
+    )
+    validation_ratio = st.slider(
+        "검증 비율",
+        0.05,
+        0.4,
+        float(resume_config.get("validation_ratio", gp_defaults.validation_ratio)),
+        0.05,
+        disabled=workflow == "저장된 연구 재개",
+        key="research_validation_ratio",
+    )
+    max_lag = st.slider(
+        "최대 과거 참조",
+        1,
+        10,
+        int(resume_config.get("max_lag", gp_defaults.max_lag)),
+        disabled=workflow == "저장된 연구 재개",
+        key="research_max_lag",
     )
     controls = st.number_input(
         "무작위 대조 반복",
@@ -110,14 +204,97 @@ with st.sidebar:
         max_value=1000,
         value=int(resume_config.get("control_runs", 3)),
         disabled=workflow == "저장된 연구 재개",
+        key="research_control_runs",
+    )
+    min_activation = st.slider(
+        "최소 활성화 비율",
+        0.05,
+        1.0,
+        float(resume_config.get("min_activation_rate", 0.1)),
+        0.05,
+        disabled=workflow == "저장된 연구 재개",
+        key="research_min_activation_rate",
+    )
+    hidden_states = st.slider(
+        "숨겨진 상태 수",
+        2,
+        5,
+        int(resume_config.get("hidden_states", 3)),
+        disabled=workflow == "저장된 연구 재개",
+        key="research_hidden_states",
     )
     seed = st.number_input(
         "기본 난수 시드",
         min_value=0,
         max_value=2**31 - 1,
-        value=int(resume_config.get("seed", 12345)),
+        value=int(resume_config.get("seed", gp_defaults.seed)),
         disabled=workflow == "저장된 연구 재개",
+        key="research_seed",
     )
+
+try:
+    effective_config = IntermittentConfig(
+        population_size=int(population),
+        generations=int(generations),
+        crossover_probability=float(crossover),
+        mutation_probability=float(mutation),
+        max_depth=int(max_depth),
+        seed=int(seed),
+        workers=int(workers),
+        train_ratio=float(train_ratio),
+        validation_ratio=float(validation_ratio),
+        max_lag=int(max_lag),
+        control_runs=int(controls),
+        min_activation_rate=float(min_activation),
+        hidden_states=int(hidden_states),
+        feature_profile=feature_profile,
+        elite_seeding_enabled=bool(elite_enabled),
+        elite_seed_ratio=float(elite_ratio),
+    )
+    config_error = None
+except ValueError as error:
+    effective_config = None
+    config_error = str(error)
+
+if effective_config is not None:
+    st.subheader("연구 시작 전 적용 설정")
+    st.dataframe(
+        [
+            {"설정": label, "적용값": value}
+            for label, value in (
+                ("개체군 크기", effective_config.population_size),
+                ("탐색 엔진", engine),
+                ("실행 시간(분)", duration_minutes),
+                ("세대 수", effective_config.generations),
+                ("교차 확률", effective_config.crossover_probability),
+                ("돌연변이 확률", effective_config.mutation_probability),
+                ("최대 수식 깊이", effective_config.max_depth),
+                ("CPU 워커", effective_config.workers),
+                ("학습 비율", effective_config.train_ratio),
+                ("검증 비율", effective_config.validation_ratio),
+                (
+                    "테스트 비율",
+                    1 - effective_config.train_ratio - effective_config.validation_ratio,
+                ),
+                ("최대 과거 참조", effective_config.max_lag),
+                ("무작위 대조 반복", effective_config.control_runs),
+                ("최소 활성화 비율", effective_config.min_activation_rate),
+                ("숨겨진 상태 수", effective_config.hidden_states),
+                ("상위 후보 수", effective_config.top_candidates),
+                ("난수 시드", effective_config.seed),
+                ("특징 프로파일", effective_config.feature_profile),
+                (
+                    "Elite Seeding",
+                    "사용" if effective_config.elite_seeding_enabled else "사용 안 함",
+                ),
+                ("수식 계승 비율", effective_config.elite_seed_ratio),
+            )
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+else:
+    st.error(f"설정값을 확인하세요: {config_error}")
 
 dataset = None
 integrity = None
@@ -291,6 +468,7 @@ with button_col:
         "연구 시작 또는 재개",
         type="primary",
         disabled=dataset is None
+        or effective_config is None
         or integrity is None
         or not integrity["rounds_contiguous"]
         or (feature_profile == "calendar_round" and not integrity["all_draws_dated"])
@@ -324,6 +502,22 @@ with button_col:
             str(int(generations)),
             "--workers",
             str(int(workers)),
+            "--crossover",
+            str(float(crossover)),
+            "--mutation",
+            str(float(mutation)),
+            "--max-depth",
+            str(int(max_depth)),
+            "--train-ratio",
+            str(float(train_ratio)),
+            "--validation-ratio",
+            str(float(validation_ratio)),
+            "--max-lag",
+            str(int(max_lag)),
+            "--min-activation",
+            str(float(min_activation)),
+            "--hidden-states",
+            str(int(hidden_states)),
             "--controls",
             str(int(controls)),
             "--seed",

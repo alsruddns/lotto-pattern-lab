@@ -1,3 +1,4 @@
+import json
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -310,10 +311,17 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     config = IntermittentConfig(
         population_size=8,
         generations=1,
+        crossover_probability=0.7,
+        mutation_probability=0.15,
         max_depth=2,
         seed=31,
         workers=1,
+        train_ratio=0.55,
+        validation_ratio=0.25,
+        max_lag=7,
         control_runs=0,
+        min_activation_rate=0.15,
+        hidden_states=4,
     )
     first = run_research_schedule(
         dataset,
@@ -332,6 +340,21 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     assert first["rng_resume"] == {"mode": "per_attempt_seed", "base_seed": 31, "next_seed": 32}
     assert first["completed_experiments"][0]["seed"] == 31
     assert first["completed_experiments"][0]["experiment_id"] == first["last_experiment_id"]
+    saved_config = first["config"]
+    assert saved_config["crossover_probability"] == 0.7
+    assert saved_config["mutation_probability"] == 0.15
+    assert saved_config["max_depth"] == 2
+    assert saved_config["train_ratio"] == 0.55
+    assert saved_config["validation_ratio"] == 0.25
+    assert saved_config["max_lag"] == 7
+    assert saved_config["min_activation_rate"] == 0.15
+    assert saved_config["hidden_states"] == 4
+    saved_experiment = json.loads(
+        (tmp_path / "experiments" / f"{first['last_experiment_id']}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert saved_experiment["config"] == saved_config
 
     second = run_research_schedule(
         dataset,

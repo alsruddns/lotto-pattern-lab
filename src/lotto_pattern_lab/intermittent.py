@@ -14,6 +14,7 @@ from deap import base, creator, gp, tools
 from .backtest import DataSplits
 from .feature_schema import PRIMITIVE_SET_VERSION, feature_mapping, remap_formula_features
 from .features import Example
+from .gp_config import GPConfig
 from .gp_engine import _make_primitive_set, _predict
 
 _WORKER_EXAMPLES: tuple[Example, ...] = ()
@@ -24,17 +25,7 @@ _WORKER_MIN_COVERAGE = 0.1
 
 
 @dataclass(frozen=True, slots=True)
-class IntermittentConfig:
-    population_size: int = 80
-    generations: int = 25
-    crossover_probability: float = 0.65
-    mutation_probability: float = 0.25
-    max_depth: int = 6
-    seed: int = 12345
-    workers: int = 4
-    train_ratio: float = 0.6
-    validation_ratio: float = 0.2
-    max_lag: int = 10
+class IntermittentConfig(GPConfig):
     control_runs: int = 20
     min_activation_rate: float = 0.1
     top_candidates: int = 10
@@ -44,14 +35,9 @@ class IntermittentConfig:
     elite_seed_ratio: float = 0.2
 
     def __post_init__(self) -> None:
-        if self.population_size < 8 or self.generations < 1:
-            raise ValueError("Population must be >= 8 and generations must be positive.")
-        if not 0 <= self.crossover_probability <= 1 or not 0 <= self.mutation_probability <= 1:
-            raise ValueError("Crossover and mutation probabilities must be between 0 and 1.")
-        if not 2 <= self.max_depth <= 10 or not 1 <= self.workers <= 4:
-            raise ValueError("Maximum depth must be 2..10 and workers must be 1..4.")
-        if not 1 <= self.max_lag <= 10:
-            raise ValueError("Maximum lag must be 1..10.")
+        GPConfig.__post_init__(self)
+        if self.population_size < 8:
+            raise ValueError("Intermittent GP population must be at least 8.")
         if not 0.05 <= self.min_activation_rate <= 1:
             raise ValueError("Minimum activation rate must be between 0.05 and 1.")
         if self.control_runs < 0 or self.top_candidates < 1:
@@ -64,10 +50,6 @@ class IntermittentConfig:
             raise ValueError("Feature profile must be legacy or calendar_round.")
         if not 0 <= self.elite_seed_ratio <= 0.8:
             raise ValueError("Elite seed ratio must be between 0 and 0.8.")
-        if self.train_ratio <= 0 or self.validation_ratio <= 0:
-            raise ValueError("Train and validation ratios must be positive.")
-        if self.train_ratio + self.validation_ratio >= 1:
-            raise ValueError("Train plus validation ratios must be less than 1.")
 
 
 @dataclass(frozen=True, slots=True)

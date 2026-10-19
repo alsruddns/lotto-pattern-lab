@@ -13,6 +13,7 @@ from lotto_pattern_lab.dataset import (
     save_official_csv,
 )
 from lotto_pattern_lab.experiment import run_experiment
+from lotto_pattern_lab.gp_config import GPConfig
 from lotto_pattern_lab.gp_engine import SearchConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.intermittent_experiment import run_intermittent_experiment
@@ -31,6 +32,7 @@ from lotto_pattern_lab.storage_management import (
 )
 
 st.set_page_config(page_title="Lotto Pattern Lab", layout="wide")
+gp_defaults = GPConfig()
 storage_settings = load_storage_settings()
 storage_state = storage_inventory()
 if storage_over_quota(storage_state, storage_settings["quota_bytes"]):
@@ -88,21 +90,58 @@ with st.sidebar:
     synthetic_count = st.number_input(
         "합성 회차 수", min_value=20, max_value=10000, value=160, step=10
     )
-    seed = st.number_input("데이터 난수 시드", min_value=0, max_value=2**31 - 1, value=12345)
+    seed = st.number_input(
+        "데이터 난수 시드",
+        min_value=0,
+        max_value=2**31 - 1,
+        value=gp_defaults.seed,
+        key="general_seed",
+    )
 
     st.header("탐색 설정")
     research_mode = st.radio("탐색 방식", ("간헐적 패턴 탐색", "기존 전체 회차 GP"))
-    population = st.number_input("개체군 크기", min_value=4, max_value=1000, value=80, step=4)
-    generations = st.number_input("세대 수", min_value=1, max_value=1000, value=25)
-    crossover = st.slider("교차 확률", 0.0, 1.0, 0.65)
-    mutation = st.slider("돌연변이 확률", 0.0, 1.0, 0.25)
-    max_depth = st.slider("최대 수식 깊이", 2, 10, 6)
-    workers = st.slider("CPU 워커 (최대 4)", 1, 4, 4)
-    train_ratio = st.slider("학습 비율", 0.4, 0.8, 0.6, 0.05)
-    validation_ratio = st.slider("검증 비율", 0.1, 0.4, 0.2, 0.05)
-    controls = st.number_input("무작위 대조 탐색 횟수", min_value=0, max_value=99, value=20)
-    min_activation = st.slider("최소 활성 비율", 0.05, 1.0, 0.1, 0.05)
-    hidden_states = st.slider("가설 상태 수", 2, 5, 3)
+    population = st.number_input(
+        "개체군 크기", min_value=4, max_value=1000, value=gp_defaults.population_size, step=4,
+        key="general_population_size",
+    )
+    generations = st.number_input(
+        "세대 수",
+        min_value=1,
+        max_value=1000,
+        value=gp_defaults.generations,
+        key="general_generations",
+    )
+    crossover = st.slider(
+        "교차 확률", 0.0, 1.0, gp_defaults.crossover_probability,
+        key="general_crossover_probability"
+    )
+    mutation = st.slider(
+        "돌연변이 확률", 0.0, 1.0, gp_defaults.mutation_probability,
+        key="general_mutation_probability"
+    )
+    max_depth = st.slider(
+        "최대 수식 깊이", 2, 10, gp_defaults.max_depth, key="general_max_depth"
+    )
+    workers = st.slider("CPU 워커 (최대 4)", 1, 4, gp_defaults.workers, key="general_workers")
+    train_ratio = st.slider(
+        "학습 비율", 0.1, 0.8, gp_defaults.train_ratio, 0.05,
+        key="general_train_ratio"
+    )
+    validation_ratio = st.slider(
+        "검증 비율", 0.05, 0.4, gp_defaults.validation_ratio, 0.05,
+        key="general_validation_ratio"
+    )
+    max_lag = st.slider(
+        "최대 과거 참조 회차", 1, 10, gp_defaults.max_lag, key="general_max_lag"
+    )
+    controls = st.number_input(
+        "무작위 대조 탐색 횟수", min_value=0, max_value=99, value=20,
+        key="general_control_runs",
+    )
+    min_activation = st.slider(
+        "최소 활성 비율", 0.05, 1.0, 0.1, 0.05, key="general_min_activation_rate"
+    )
+    hidden_states = st.slider("가설 상태 수", 2, 5, 3, key="general_hidden_states")
 
 base_dataset = None
 data_error = None
@@ -152,6 +191,7 @@ if base_dataset is not None:
         "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
         ("legacy", "calendar_round"),
         help="\uae30\uc874\u0020\ud2b9\uc9d5\u0020\ud504\ub85c\ud30c\uc77c\uc785\ub2c8\ub2e4\u002e\u0020\ub0a0\uc9dc\u0020\ud2b9\uc9d5\uc740\u0020\ubaa8\ub4e0\u0020\ud68c\ucc28\uc5d0\u0020\uacf5\uc2dd\u0020\ucd94\ucc28\uc77c\uc774\u0020\uc788\uc744\u0020\ub54c\ub9cc\u0020\uc0ac\uc6a9\ud569\ub2c8\ub2e4\u002e",
+        key="general_feature_profile",
     )
     st.caption(
         f"데이터 상태: {status_text} · "
@@ -266,6 +306,7 @@ if run_clicked and selected_dataset is not None:
                 workers=workers,
                 train_ratio=train_ratio,
                 validation_ratio=validation_ratio,
+                max_lag=max_lag,
                 control_runs=int(controls),
                 min_activation_rate=min_activation,
                 hidden_states=hidden_states,
@@ -288,6 +329,7 @@ if run_clicked and selected_dataset is not None:
                 workers=workers,
                 train_ratio=train_ratio,
                 validation_ratio=validation_ratio,
+                max_lag=max_lag,
                 control_runs=int(controls),
             )
             with st.spinner("탐색 중입니다. 진행 결과는 experiments 폴더에 저장됩니다."):

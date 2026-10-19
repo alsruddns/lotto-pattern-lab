@@ -8,6 +8,7 @@ from datetime import date
 from .dataset import load_csv, make_random_dataset, save_official_csv
 from .draw import Draw
 from .experiment import run_experiment
+from .gp_config import GPConfig
 from .gp_engine import SearchConfig
 from .intermittent import IntermittentConfig
 from .intermittent_experiment import run_intermittent_experiment
@@ -17,6 +18,8 @@ from .pattern_library import PatternLibrary
 from .patterns import summarize_draw
 from .research import SUPPORTED_ENGINES, request_stop, run_research_schedule
 from .storage import ExperimentStore
+
+GP_DEFAULTS = GPConfig()
 
 
 def main() -> None:
@@ -61,15 +64,16 @@ def _run_search_cli(argv: list[str]) -> None:
     parser.add_argument(
         "--source-url", help="record the claimed source URL for a user supplied CSV"
     )
-    parser.add_argument("--population", type=int, default=80)
-    parser.add_argument("--generations", type=int, default=25)
-    parser.add_argument("--crossover", type=float, default=0.65)
-    parser.add_argument("--mutation", type=float, default=0.25)
-    parser.add_argument("--max-depth", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--train-ratio", type=float, default=0.6)
-    parser.add_argument("--validation-ratio", type=float, default=0.2)
+    parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)
+    parser.add_argument("--generations", type=int, default=GP_DEFAULTS.generations)
+    parser.add_argument("--crossover", type=float, default=GP_DEFAULTS.crossover_probability)
+    parser.add_argument("--mutation", type=float, default=GP_DEFAULTS.mutation_probability)
+    parser.add_argument("--max-depth", type=int, default=GP_DEFAULTS.max_depth)
+    parser.add_argument("--seed", type=int, default=GP_DEFAULTS.seed)
+    parser.add_argument("--workers", type=int, default=GP_DEFAULTS.workers)
+    parser.add_argument("--train-ratio", type=float, default=GP_DEFAULTS.train_ratio)
+    parser.add_argument("--validation-ratio", type=float, default=GP_DEFAULTS.validation_ratio)
+    parser.add_argument("--max-lag", type=int, default=GP_DEFAULTS.max_lag)
     parser.add_argument("--controls", type=int, default=3)
     parser.add_argument("--store", default="experiments")
     args = parser.parse_args(argv)
@@ -89,6 +93,7 @@ def _run_search_cli(argv: list[str]) -> None:
         workers=args.workers,
         train_ratio=args.train_ratio,
         validation_ratio=args.validation_ratio,
+        max_lag=args.max_lag,
         control_runs=args.controls,
     )
     store = ExperimentStore(args.store)
@@ -143,15 +148,16 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     source.add_argument("--csv", help="CSV draw history; reads provenance manifest when present")
     source.add_argument("--synthetic", type=int, metavar="DRAWS")
     parser.add_argument("--source-url")
-    parser.add_argument("--population", type=int, default=32)
-    parser.add_argument("--generations", type=int, default=10)
-    parser.add_argument("--crossover", type=float, default=0.65)
-    parser.add_argument("--mutation", type=float, default=0.25)
-    parser.add_argument("--max-depth", type=int, default=6)
-    parser.add_argument("--seed", type=int, default=12345)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--train-ratio", type=float, default=0.6)
-    parser.add_argument("--validation-ratio", type=float, default=0.2)
+    parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)
+    parser.add_argument("--generations", type=int, default=GP_DEFAULTS.generations)
+    parser.add_argument("--crossover", type=float, default=GP_DEFAULTS.crossover_probability)
+    parser.add_argument("--mutation", type=float, default=GP_DEFAULTS.mutation_probability)
+    parser.add_argument("--max-depth", type=int, default=GP_DEFAULTS.max_depth)
+    parser.add_argument("--seed", type=int, default=GP_DEFAULTS.seed)
+    parser.add_argument("--workers", type=int, default=GP_DEFAULTS.workers)
+    parser.add_argument("--train-ratio", type=float, default=GP_DEFAULTS.train_ratio)
+    parser.add_argument("--validation-ratio", type=float, default=GP_DEFAULTS.validation_ratio)
+    parser.add_argument("--max-lag", type=int, default=GP_DEFAULTS.max_lag)
     parser.add_argument("--controls", type=int, default=20)
     parser.add_argument("--min-activation", type=float, default=0.1)
     parser.add_argument("--hidden-states", type=int, default=3)
@@ -176,6 +182,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
         workers=args.workers,
         train_ratio=args.train_ratio,
         validation_ratio=args.validation_ratio,
+        max_lag=args.max_lag,
         control_runs=args.controls,
         min_activation_rate=args.min_activation,
         hidden_states=args.hidden_states,
@@ -215,12 +222,19 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
-    parser.add_argument("--population", type=int, default=32)
-    parser.add_argument("--generations", type=int, default=10)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--max-depth", type=int, default=5)
+    parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)
+    parser.add_argument("--generations", type=int, default=GP_DEFAULTS.generations)
+    parser.add_argument("--crossover", type=float, default=GP_DEFAULTS.crossover_probability)
+    parser.add_argument("--mutation", type=float, default=GP_DEFAULTS.mutation_probability)
+    parser.add_argument("--workers", type=int, default=GP_DEFAULTS.workers)
+    parser.add_argument("--max-depth", type=int, default=GP_DEFAULTS.max_depth)
+    parser.add_argument("--train-ratio", type=float, default=GP_DEFAULTS.train_ratio)
+    parser.add_argument("--validation-ratio", type=float, default=GP_DEFAULTS.validation_ratio)
+    parser.add_argument("--max-lag", type=int, default=GP_DEFAULTS.max_lag)
     parser.add_argument("--controls", type=int, default=3)
-    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--min-activation", type=float, default=0.1)
+    parser.add_argument("--hidden-states", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=GP_DEFAULTS.seed)
     args = parser.parse_args(argv)
     if args.stop:
         print(f"Stop requested: {request_stop(args.checkpoint)}")
@@ -229,9 +243,16 @@ def _run_research_cli(argv: list[str]) -> None:
     config = IntermittentConfig(
         population_size=args.population,
         generations=args.generations,
+        crossover_probability=args.crossover,
+        mutation_probability=args.mutation,
         workers=args.workers,
         max_depth=args.max_depth,
+        train_ratio=args.train_ratio,
+        validation_ratio=args.validation_ratio,
+        max_lag=args.max_lag,
         control_runs=args.controls,
+        min_activation_rate=args.min_activation,
+        hidden_states=args.hidden_states,
         seed=args.seed,
         feature_profile=args.feature_profile,
         elite_seeding_enabled=args.elite_seeding,
