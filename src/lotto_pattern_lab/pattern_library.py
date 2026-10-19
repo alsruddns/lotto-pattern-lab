@@ -702,6 +702,23 @@ class PatternLibrary:
             )
             return [{**json.loads(row["payload"]), "current_status": row["status"]} for row in rows]
 
+    def research_pattern_counts(self, research_id: str) -> dict[str, int]:
+        """Return unique patterns and lineage children first registered by a research run."""
+        with self._connect() as connection:
+            pattern_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM patterns WHERE origin_research_id=?",
+                (research_id,),
+            ).fetchone()
+            child_row = connection.execute(
+                "SELECT COUNT(DISTINCT child_pattern_id) AS count FROM pattern_lineage "
+                "WHERE research_id=?",
+                (research_id,),
+            ).fetchone()
+        return {
+            "new_pattern_count": int(pattern_row["count"]),
+            "child_pattern_count": int(child_row["count"]),
+        }
+
     def list_exact_matches(self) -> list[dict[str, Any]]:
         matches = []
         with self._connect() as connection:
@@ -789,7 +806,25 @@ def register_experiment_exact_matches(
                 }
                 library.record_observation(pattern_id, round_number, "retrospective", observation)
                 discovered.append(
-                    {"pattern_id": pattern_id, "round_number": round_number, "created": was_created}
+                    {
+                        "pattern_id": pattern_id,
+                        "round_number": round_number,
+                        "created": was_created,
+                        "research_id": result.get("research_id"),
+                        "experiment_id": result.get("experiment_id"),
+                        "model": model_name,
+                        "candidate_rank": candidate_rank,
+                        "rule_index": rule_index,
+                        "winning_numbers": sorted(event.get("winning_numbers", [])),
+                        "predicted_numbers": sorted(event.get("predicted_numbers", [])),
+                        "formulas": list(rule_formulas),
+                        "activation_condition": str(candidate["activation_condition"]),
+                        "feature_profile": configuration.get("feature_profile", "legacy"),
+                        "data_round_range": dataset.get("round_range"),
+                        "data_verification_status": dataset.get("verification_status"),
+                        "prediction_created_before_draw": False,
+                        "validation_status": "retrospective_search_fit",
+                    }
                 )
     return discovered
 
@@ -906,6 +941,7 @@ def register_experiment_candidates(
                         "candidate_rank": candidate_rank,
                         "rule_index": rule_index + 1,
                         "created": created,
+                        "parent_pattern_ids": [str(item) for item in parent_ids],
                         **library.get_pattern_summary(pattern_id),
                     }
                 )

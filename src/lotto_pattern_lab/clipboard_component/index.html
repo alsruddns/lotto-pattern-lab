@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      button { border: 1px solid #888; border-radius: 7px; background: white; padding: 10px 16px; font-size: 14px; cursor: pointer; }
+      button:hover { background: #f1f4f8; }
+      button:disabled { opacity: .65; cursor: wait; }
+    </style>
+  </head>
+  <body>
+    <button id="copy" type="button">보고서 복사</button>
+    <script>
+      const button = document.getElementById("copy");
+      let markdown = "";
+      let label = "보고서 복사";
+      function send(value) {
+        window.parent.postMessage({
+          isStreamlitMessage: true,
+          type: "streamlit:setComponentValue",
+          value,
+          dataType: "json"
+        }, "*");
+      }
+      window.addEventListener("message", (event) => {
+        if (!event.data || event.data.type !== "streamlit:render") return;
+        markdown = event.data.args.markdown || "";
+        label = event.data.args.label || label;
+        if (!button.dataset.copied) button.textContent = label;
+      });
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(markdown);
+          } else {
+            const field = document.createElement("textarea");
+            field.value = markdown;
+            field.style.position = "fixed";
+            field.style.opacity = "0";
+            document.body.appendChild(field);
+            field.focus();
+            field.select();
+            const copied = document.execCommand("copy");
+            field.remove();
+            if (!copied) throw new Error("브라우저가 클립보드 복사를 허용하지 않았습니다.");
+          }
+          button.dataset.copied = "true";
+          button.textContent = "복사 완료 ✓";
+          send({ status: "copied", request_id: String(Date.now()) });
+        } catch (error) {
+          button.dataset.copied = "false";
+          button.textContent = label;
+          send({ status: "error", message: String(error), request_id: String(Date.now()) });
+        } finally {
+          button.disabled = false;
+        }
+      });
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:componentReady",
+        apiVersion: 1
+      }, "*");
+      window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:setFrameHeight",
+        height: 50
+      }, "*");
+    </script>
+  </body>
+</html>

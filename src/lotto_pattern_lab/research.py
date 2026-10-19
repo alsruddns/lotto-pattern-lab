@@ -23,6 +23,12 @@ from .pattern_library import (
     register_experiment_candidates,
     register_experiment_exact_matches,
 )
+from .research_rounds import (
+    ResearchRoundStore,
+    empty_dashboard_summary,
+    rebuild_dashboard_summary,
+    summarize_experiment,
+)
 from .storage import ExperimentStore
 from .storage_management import run_automatic_checkpoint_cleanup
 
@@ -114,6 +120,7 @@ def run_research_schedule(
     config_payload = asdict(config)
     store = ExperimentStore(experiment_directory)
     library = PatternLibrary(pattern_database)
+    round_store = ResearchRoundStore(pattern_database)
     if resume:
         state = load_checkpoint(checkpoint)
         if not state.get("research_id"):
@@ -196,6 +203,7 @@ def run_research_schedule(
             "created_at": datetime.now(UTC).isoformat(),
             "dataset_sha256": data_hash,
             "dataset_source_kind": dataset.source_kind,
+            "dataset_verification_status": dataset.verification_status,
             "dataset_round_range": [
                 dataset.records[0].round_number,
                 dataset.records[-1].round_number,
@@ -223,6 +231,31 @@ def run_research_schedule(
     state["config"] = config_payload
     state["resumable"] = True
     state.setdefault("completed_experiments", [])
+    round_number = round_store.ensure_round(
+        str(state["research_id"]),
+        {
+            "created_at": state.get("created_at"),
+            "checkpoint_path": str(checkpoint),
+            "status": state.get("status", "queued"),
+        },
+        checkpoint.parent,
+        store.directory,
+    )
+    state["research_round"] = round_number
+    if "dashboard_summary" not in state:
+        prior_experiments = []
+        for reference in state.get("completed_experiments", []):
+            experiment_id = reference.get("experiment_id")
+            if not experiment_id:
+                continue
+            try:
+                prior_experiments.append(store.load(str(experiment_id), expand_details=False))
+            except (OSError, ValueError):
+                continue
+        state["dashboard_summary"] = rebuild_dashboard_summary(
+            prior_experiments,
+            failed_experiment_count=len(state.get("failed_runs", [])),
+        )
     state["rng_resume"] = {
         "mode": "per_attempt_seed",
         "base_seed": config.seed,
@@ -246,6 +279,7 @@ def run_research_schedule(
     state["resume_count"] += int(resume)
     state["last_updated_at"] = datetime.now(UTC).isoformat()
     _atomic_json(checkpoint, state)
+    round_store.update(str(state["research_id"]), _round_metadata(state))
     if stop_path.exists():
         try:
             stop_time = datetime.fromisoformat(stop_path.read_text(encoding="utf-8").strip())
@@ -330,6 +364,46 @@ def run_research_schedule(
                 library.record_elite_use(used_pattern_ids, state["research_id"], data_hash)
             registered = register_experiment_candidates(result, library)
             exact_matches = register_experiment_exact_matches(result, library)
+            result["pattern_library_candidates"] = registered
+            result["full_set_match_discoveries"] = exact_matches
+            store.save(result)
+            compact_summary = summarize_experiment(result, registered, exact_matches)
+            dashboard_summary = state["dashboard_summary"]
+            dashboard_summary["completed_experiment_count"] += 1
+            for key in (
+                "candidate_count",
+                "inherited_pattern_count",
+                "exact_match_count",
+            ):
+                dashboard_summary[key] += compact_summary[key]
+            if dashboard_summary.get("registration_metrics_available", True):
+                dashboard_summary["new_pattern_count"] += compact_summary["new_pattern_count"]
+                dashboard_summary["duplicate_pattern_count"] += compact_summary[
+                    "duplicate_pattern_count"
+                ]
+                dashboard_summary["child_pattern_count"] += compact_summary[
+                    "child_pattern_count"
+                ]
+            else:
+                pattern_counts = library.research_pattern_counts(str(state["research_id"]))
+                dashboard_summary["new_pattern_count"] = pattern_counts["new_pattern_count"]
+                dashboard_summary["child_pattern_count"] = pattern_counts["child_pattern_count"]
+                dashboard_summary["duplicate_pattern_count"] = None
+            dashboard_summary["model_metrics"]["one_number"].append(
+                compact_summary["models"]["one_number"]
+            )
+            dashboard_summary["model_metrics"]["six_number_set"].append(
+                compact_summary["models"]["six_number_set"]
+            )
+            dashboard_summary["experiment_summaries"].append(compact_summary)
+            for model_key, metrics in compact_summary["paired"].items():
+                dashboard_summary["paired_metrics"].setdefault(model_key, []).append(metrics)
+            for key, values in compact_summary["hits"].items():
+                totals = dashboard_summary["hit_totals"].setdefault(
+                    key, {"3_plus": 0, "4_plus": 0, "5_plus": 0, "6_exact": 0}
+                )
+                for metric, value in values.items():
+                    totals[metric] += int(value)
             state["completed_runs"] += 1
             state["last_experiment_id"] = result["experiment_id"]
             state["completed_experiments"].append(
@@ -364,6 +438,7 @@ def run_research_schedule(
                     "error": str(error),
                 }
             )
+            state["dashboard_summary"]["failed_experiment_count"] = len(state["failed_runs"])
             state.pop("in_progress", None)
             if consecutive_failures >= 3:
                 state["status"] = "failed"
@@ -371,6 +446,7 @@ def run_research_schedule(
                 break
         state["last_updated_at"] = datetime.now(UTC).isoformat()
         _atomic_json(checkpoint, state)
+        round_store.update(str(state["research_id"]), _round_metadata(state))
         if max_runs is not None and state["completed_runs"] >= max_runs:
             state["status"] = "completed"
             state["stop_reason"] = "run_count_reached"
@@ -383,9 +459,51 @@ def run_research_schedule(
         state["status"] = "paused"
         state["pause_reason"] = "time_budget_reached_before_boundary_completion"
     state["last_updated_at"] = datetime.now(UTC).isoformat()
-    state["elapsed_seconds"] = time.monotonic() - started
+    elapsed_this_session = time.monotonic() - started
+    state["elapsed_seconds"] = elapsed_this_session
+    state["total_elapsed_seconds"] = (
+        float(state.get("total_elapsed_seconds", 0.0)) + elapsed_this_session
+    )
     _atomic_json(checkpoint, state)
+    round_store.update(str(state["research_id"]), _round_metadata(state))
     run_automatic_checkpoint_cleanup()
     if state.get("pause_reason") == "stop_requested_at_experiment_boundary":
         stop_path.unlink(missing_ok=True)
     return state
+
+
+def _round_metadata(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "research_round": state.get("research_round"),
+        "status": state.get("status"),
+        "created_at": state.get("created_at"),
+        "started_at": state.get("started_at"),
+        "last_updated_at": state.get("last_updated_at"),
+        "total_elapsed_seconds": state.get("total_elapsed_seconds", state.get("elapsed_seconds")),
+        "checkpoint_path": state.get("checkpoint_path"),
+        "dataset_sha256": state.get("dataset_sha256"),
+        "dataset_source_kind": state.get("dataset_source_kind"),
+        "dataset_verification_status": state.get("dataset_verification_status"),
+        "dataset_round_range": state.get("dataset_round_range"),
+        "config": state.get("config", {}),
+        "engines": state.get("engines", []),
+        "completed_runs": state.get("completed_runs", 0),
+        "failed_runs": len(state.get("failed_runs", [])),
+        "completed_experiment_ids": [
+            item.get("experiment_id")
+            for item in state.get("completed_experiments", [])
+            if item.get("experiment_id")
+        ],
+        "failed_run_summary": [
+            {key: item.get(key) for key in ("seed", "error_type", "error", "failed_at")}
+            for item in state.get("failed_runs", [])[-20:]
+        ],
+        "dashboard_summary": state.get("dashboard_summary", empty_dashboard_summary()),
+        "elite_seeding": {
+            key: value
+            for key, value in (state.get("elite_seeding") or {}).items()
+            if key not in {"selected_patterns", "skipped"}
+        },
+        "next_seed": state.get("rng_resume", {}).get("next_seed"),
+        "discovered_exact_matches": state.get("discovered_exact_matches", []),
+    }

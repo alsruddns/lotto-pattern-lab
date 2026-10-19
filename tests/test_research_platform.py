@@ -36,6 +36,7 @@ from lotto_pattern_lab.research_features import (
     build_research_features_for_target,
     research_feature_names,
 )
+from lotto_pattern_lab.research_rounds import ResearchRoundStore
 from lotto_pattern_lab.storage import ExperimentStore
 
 
@@ -333,6 +334,7 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
         max_runs=1,
     )
     assert first["status"] == "completed"
+    assert first["research_round"] == 1
     assert first["completed_runs"] == 1
     assert first["attempts"] == 1
     assert first["dataset_sha256"]
@@ -369,8 +371,14 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     assert second["completed_runs"] == 2
     assert second["attempts"] == 2
     assert second["resume_count"] == 1
+    assert second["research_round"] == first["research_round"]
     assert second["last_experiment_id"] != first["last_experiment_id"]
     assert [item["seed"] for item in second["completed_experiments"]] == [31, 32]
+    registry = ResearchRoundStore(tmp_path / "patterns.sqlite")
+    assert registry.get(first["research_id"])["research_round"] == 1
+    assert (
+        registry.get(first["research_id"])["dashboard_summary"]["completed_experiment_count"] == 2
+    )
     assert second["rng_resume"]["next_seed"] == 33
     assert len(PatternLibrary(tmp_path / "patterns.sqlite").list_patterns()) >= 4
 
@@ -446,6 +454,16 @@ def test_research_dashboard_streamlit_page_executes() -> None:
     app = AppTest.from_file(page).run(timeout=30)
     assert not app.exception, [exception.message for exception in app.exception]
     assert app.title[0].value.startswith("지속적")
+
+
+def test_research_round_dashboard_streamlit_page_executes() -> None:
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("5_*.py")
+    )
+    app = AppTest.from_file(page).run(timeout=30)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.title[0].value == "연구 회차 대시보드"
 
 
 def test_periodicity_report_finds_a_repeat_and_labels_diagnostic_only() -> None:
