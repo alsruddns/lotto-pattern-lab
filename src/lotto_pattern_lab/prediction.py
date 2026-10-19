@@ -10,13 +10,38 @@ import secrets
 import tempfile
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
 from .dataset import DrawDataset
 from .features import build_features_for_target, feature_names
-from .gp_engine import _cube, _predict, _safe_div, _safe_mod, _square
+from .gp_engine import (
+    _bit_and,
+    _bit_or,
+    _bit_xor,
+    _concat_digits,
+    _cube,
+    _digit_sum,
+    _digital_root,
+    _factor_count,
+    _fibonacci_index,
+    _is_prime,
+    _predict,
+    _reverse_digits,
+    _rotate_left,
+    _rotate_right,
+    _safe_div,
+    _safe_mod,
+    _shift_left,
+    _shift_right,
+    _square,
+)
+from .research_features import (
+    ResearchFeatureConfig,
+    build_research_features_for_target,
+    research_feature_names,
+)
 
 MODEL_VERSION = "lotto-pattern-lab/0.1.0"
 RULE_COUNT = 2
@@ -31,6 +56,20 @@ _OPERATIONS: dict[str, tuple[Callable[..., float], int]] = {
     "max2": (max, 2),
     "square": (_square, 1),
     "cube": (_cube, 1),
+    "bit_xor": (_bit_xor, 2),
+    "bit_and": (_bit_and, 2),
+    "bit_or": (_bit_or, 2),
+    "shift_left": (_shift_left, 2),
+    "shift_right": (_shift_right, 2),
+    "rotate_left": (_rotate_left, 2),
+    "rotate_right": (_rotate_right, 2),
+    "concat_digits": (_concat_digits, 2),
+    "digit_sum": (_digit_sum, 1),
+    "reverse_digits": (_reverse_digits, 1),
+    "digital_root": (_digital_root, 1),
+    "is_prime": (_is_prime, 1),
+    "factor_count": (_factor_count, 1),
+    "fibonacci_index": (_fibonacci_index, 1),
 }
 
 
@@ -184,6 +223,7 @@ def create_recommendation(
     data_file_sha256: str | None = None,
     random_seed: int | None = None,
     official_latest_round: int | None = None,
+    target_date: date | None = None,
 ) -> dict[str, Any]:
     """Execute one saved model using only contiguous draws before the target round."""
     if (
@@ -193,8 +233,18 @@ def create_recommendation(
         raise ValueError("Recommendation requires a completed intermittent experiment.")
     config = experiment.get("config", {})
     max_lag = int(config.get("max_lag", 10))
-    features = build_features_for_target(dataset, target_round, max_lag)
-    mapping = feature_names(max_lag)
+    feature_profile = str(config.get("feature_profile", "legacy"))
+    if feature_profile == "calendar_round":
+        feature_config = ResearchFeatureConfig(include_calendar=True, include_round_digits=True)
+        features = build_research_features_for_target(
+            dataset, target_round, target_date, max_lag, feature_config
+        )
+        mapping = feature_names(max_lag) + research_feature_names(feature_config)
+    elif feature_profile == "legacy":
+        features = build_features_for_target(dataset, target_round, max_lag)
+        mapping = feature_names(max_lag)
+    else:
+        raise ValueError(f"Unsupported saved feature profile: {feature_profile}")
     if len(features) != len(mapping):
         raise ValueError("Generated feature vector does not match the saved engine feature layout.")
     prior_records = [record for record in dataset.records if record.round_number < target_round]
@@ -259,6 +309,7 @@ def create_recommendation(
         "input_through_round": latest_input_round,
         "experiment_id": experiment["experiment_id"],
         "experiment_config": config,
+        "target_date": target_date.isoformat() if target_date else None,
         "model_type": model_type,
         "model_version": MODEL_VERSION,
         "activation_condition": gate_formula,

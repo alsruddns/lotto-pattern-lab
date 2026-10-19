@@ -251,6 +251,9 @@ def test_official_data_csv_manifest_detects_content_changes(tmp_path) -> None:
     loaded = load_csv(csv_path)
     assert loaded.verification_status == "official_verified"
     assert loaded.records[0].draw_date == date(2017, 5, 6)
+    history_path = tmp_path / "official.csv.history.jsonl"
+    assert history_path.is_file()
+    assert json.loads(history_path.read_text(encoding="utf-8").splitlines()[0])["new_sha256"]
 
     csv_path.write_text(
         csv_path.read_text(encoding="utf-8").replace("753", "755", 1), encoding="utf-8"

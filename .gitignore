@@ -16,5 +16,11 @@ predictions/
 artifacts/
 models/
 data/raw/
+data/processed/
+data/database/
+checkpoints/
+*.sqlite
+*.db
+*.history.jsonl
 *.pkl
 *.joblib

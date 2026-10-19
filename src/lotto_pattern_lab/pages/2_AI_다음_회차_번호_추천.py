@@ -3,12 +3,14 @@
 import hashlib
 import json
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
 
 from lotto_pattern_lab.dataset import load_csv
 from lotto_pattern_lab.official_data import _fetch_latest_round
+from lotto_pattern_lab.pattern_library import PatternLibrary, register_prospective_comparison
 from lotto_pattern_lab.prediction import (
     compare_recommendation,
     create_recommendation,
@@ -36,6 +38,10 @@ with st.sidebar:
     )
     uploaded = st.file_uploader("CSV 파일", type=("csv",)) if source == "CSV 파일 업로드" else None
     target = st.number_input("추천 대상 회차", min_value=2, value=1247, step=1)
+    target_date = st.date_input(
+        "\uc608\uc815 \ucd94\ucc28\uc77c \u0028\ub0a0\uc9dc \ud2b9\uc9d5 \ubaa8\ub378\uc6a9\u0029",
+        value=date.today(),
+    )
     experiment_id = (
         st.selectbox("기존 완료 실험", experiment_ids, index=default_index)
         if experiment_ids
@@ -103,6 +109,7 @@ if st.button(
             data_file_sha256=hashlib.sha256(data_bytes).hexdigest() if data_bytes else None,
             random_seed=int(seed),
             official_latest_round=official_latest,
+            target_date=target_date,
         )
         saved_path = save_recommendation(recommendation, prediction_dir)
         st.session_state["active_recommendation_id"] = recommendation["recommendation_id"]
@@ -172,6 +179,11 @@ if recommendation:
         st.json(comparison)
         if st.button("비교 결과를 별도 기록으로 저장"):
             st.success(f"비교 기록: {save_comparison(comparison)}")
+            pattern_id = register_prospective_comparison(
+                recommendation, comparison, PatternLibrary()
+            )
+            if pattern_id:
+                st.info(f"고정된 후보 패턴의 사전 검증 이력을 추가했습니다: {pattern_id}")
 
 st.subheader("저장된 추천 이력")
 if history:

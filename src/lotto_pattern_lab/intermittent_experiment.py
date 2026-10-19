@@ -10,9 +10,9 @@ from datetime import UTC, datetime
 import numpy as np
 
 from .backtest import DataSplits, chronological_split
-from .dataset import DrawDataset, make_random_dataset
+from .dataset import DrawDataset, DrawRecord, make_random_dataset
 from .experiment import dataset_metadata
-from .features import build_examples
+from .features import build_examples, feature_names
 from .hidden_states import causal_state_probabilities, fit_gaussian_hmm, online_change_points
 from .intermittent import (
     IntermittentCandidate,
@@ -20,10 +20,30 @@ from .intermittent import (
     IntermittentSearchResult,
     run_intermittent_search,
 )
+from .pattern_library import (
+    PatternLibrary,
+    register_experiment_candidates,
+    register_experiment_exact_matches,
+)
+from .research_features import (
+    ResearchFeatureConfig,
+    build_research_examples,
+    research_feature_names,
+)
 from .storage import ExperimentStore
 
 
 def _candidate_dict(candidate: IntermittentCandidate) -> dict[str, object]:
+    match_distribution = {str(number): 0 for number in range(7)}
+    for event in candidate.activation_events:
+        if event["active"]:
+            hit_count = int(event["hit_count"])
+            match_distribution[str(hit_count)] += 1
+    distribution_by_split = {
+        "training": candidate.training_match_distribution,
+        "validation": candidate.validation_match_distribution,
+        "independent_test": candidate.test_match_distribution,
+    }
     return {
         "activation_condition": candidate.activation_condition,
         "formulas": list(candidate.formulas),
@@ -38,6 +58,26 @@ def _candidate_dict(candidate: IntermittentCandidate) -> dict[str, object]:
         "training_hit_count": candidate.training_hit_count,
         "validation_hit_count": candidate.validation_hit_count,
         "test_hit_count": candidate.test_hit_count,
+        "training_full_set_matches": candidate.training_full_set_matches,
+        "validation_full_set_matches": candidate.validation_full_set_matches,
+        "test_full_set_matches": candidate.test_full_set_matches,
+        "match_distribution": match_distribution,
+        "match_distribution_by_split": {
+            split: {str(number): count for number, count in enumerate(values or ())}
+            for split, values in distribution_by_split.items()
+        },
+        "at_least_3_hits_by_split": {
+            split: sum(values[3:]) if values else None
+            for split, values in distribution_by_split.items()
+        },
+        "at_least_4_hits_by_split": {
+            split: sum(values[4:]) if values else None
+            for split, values in distribution_by_split.items()
+        },
+        "at_least_5_hits_by_split": {
+            split: sum(values[5:]) if values else None
+            for split, values in distribution_by_split.items()
+        },
         "training_score": candidate.training_score,
         "validation_score": candidate.validation_score,
         "test_score": candidate.test_score,
@@ -62,7 +102,14 @@ def _search_dict(result: IntermittentSearchResult) -> dict[str, object]:
 
 
 def _splits_for(dataset: DrawDataset, config: IntermittentConfig) -> tuple[tuple, DataSplits]:
-    examples = build_examples(dataset, config.max_lag)
+    if config.feature_profile == "calendar_round":
+        examples = build_research_examples(
+            dataset,
+            config.max_lag,
+            ResearchFeatureConfig(include_calendar=True, include_round_digits=True),
+        )
+    else:
+        examples = build_examples(dataset, config.max_lag)
     return examples, chronological_split(examples, config.train_ratio, config.validation_ratio)
 
 
@@ -140,6 +187,7 @@ def run_intermittent_experiment(
     config: IntermittentConfig,
     store: ExperimentStore,
     progress: Callable[[dict[str, object]], None] | None = None,
+    pattern_library: PatternLibrary | None = None,
 ) -> dict[str, object]:
     """Run one- and six-number gated GP models and identical random-data searches."""
     experiment_id = str(uuid.uuid4())
@@ -149,7 +197,11 @@ def run_intermittent_experiment(
     events: list[dict[str, object]] = []
 
     def record_progress(event: dict[str, int | float | str]) -> None:
-        entry = {**event, "timestamp": datetime.now(UTC).isoformat()}
+        entry = {
+            **event,
+            "timestamp": datetime.now(UTC).isoformat(),
+            "experiment_id": experiment_id,
+        }
         events.append(entry)
         if progress:
             progress(entry)
@@ -194,6 +246,17 @@ def run_intermittent_experiment(
         control_dataset = make_random_dataset(
             len(dataset.records), data_seed, first_round=dataset.records[0].round_number
         )
+        if config.feature_profile == "calendar_round":
+            control_dataset = DrawDataset(
+                tuple(
+                    DrawRecord(random_record.round_number, random_record.draw, actual.draw_date)
+                    for random_record, actual in zip(
+                        control_dataset.records, dataset.records, strict=True
+                    )
+                ),
+                "synthetic",
+                f"Random 6/45 control with official date covariates (seed={data_seed}).",
+            )
         control_examples, control_splits = _splits_for(control_dataset, config)
         control_config = IntermittentConfig(
             **{**asdict(config), "seed": config.seed + 10_007 + control_index}
@@ -247,6 +310,17 @@ def run_intermittent_experiment(
         "runtime_seconds": time.perf_counter() - timer,
         "dataset": dataset_metadata(dataset),
         "config": asdict(config),
+        "feature_variables": {
+            f"x{index}": name
+            for index, name in enumerate(
+                feature_names(config.max_lag)
+                + (
+                    research_feature_names(ResearchFeatureConfig())
+                    if config.feature_profile == "calendar_round"
+                    else ()
+                )
+            )
+        },
         "seed": config.seed,
         "splits": {
             "train_rounds": [splits.train[0].round_number, splits.train[-1].round_number],
@@ -287,4 +361,12 @@ def run_intermittent_experiment(
         "progress": events,
     }
     store.save(output)
+    if pattern_library is not None:
+        output["pattern_library_candidates"] = register_experiment_candidates(
+            output, pattern_library
+        )
+        output["full_set_match_discoveries"] = register_experiment_exact_matches(
+            output, pattern_library
+        )
+        store.save(output)
     return output

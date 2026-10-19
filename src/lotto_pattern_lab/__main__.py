@@ -13,7 +13,9 @@ from .gp_engine import SearchConfig
 from .intermittent import IntermittentConfig
 from .intermittent_experiment import run_intermittent_experiment
 from .official_data import FIRST_SUPPORTED_ROUND, fetch_official_dataset
+from .pattern_library import PatternLibrary
 from .patterns import summarize_draw
+from .research import SUPPORTED_ENGINES, request_stop, run_research_schedule
 from .storage import ExperimentStore
 
 
@@ -26,6 +28,9 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "intermittent":
         _run_intermittent_cli(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "research":
+        _run_research_cli(sys.argv[2:])
         return
     _run_draw_cli(sys.argv[1:])
 
@@ -150,6 +155,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     parser.add_argument("--controls", type=int, default=20)
     parser.add_argument("--min-activation", type=float, default=0.1)
     parser.add_argument("--hidden-states", type=int, default=3)
+    parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
     parser.add_argument("--store", default="experiments")
     args = parser.parse_args(argv)
 
@@ -171,6 +177,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
         control_runs=args.controls,
         min_activation_rate=args.min_activation,
         hidden_states=args.hidden_states,
+        feature_profile=args.feature_profile,
     )
 
     def report(event: dict[str, object]) -> None:
@@ -182,7 +189,67 @@ def _run_intermittent_cli(argv: list[str]) -> None:
             flush=True,
         )
 
-    result = run_intermittent_experiment(dataset, config, ExperimentStore(args.store), report)
+    result = run_intermittent_experiment(
+        dataset, config, ExperimentStore(args.store), report, PatternLibrary()
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def _run_research_cli(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        description="Run checkpointed, repeated local pattern research experiments."
+    )
+    parser.add_argument("--csv", default="data/official/draws.csv")
+    parser.add_argument("--duration-minutes", type=float, default=30)
+    parser.add_argument("--checkpoint", default="checkpoints/research.json")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--stop", action="store_true", help="request a stop at the next trial boundary"
+    )
+    parser.add_argument("--max-runs", type=int)
+    parser.add_argument("--engine", action="append", choices=SUPPORTED_ENGINES)
+    parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
+    parser.add_argument("--population", type=int, default=32)
+    parser.add_argument("--generations", type=int, default=10)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--max-depth", type=int, default=5)
+    parser.add_argument("--controls", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=12345)
+    args = parser.parse_args(argv)
+    if args.stop:
+        print(f"Stop requested: {request_stop(args.checkpoint)}")
+        return
+    dataset = load_csv(args.csv)
+    config = IntermittentConfig(
+        population_size=args.population,
+        generations=args.generations,
+        workers=args.workers,
+        max_depth=args.max_depth,
+        control_runs=args.controls,
+        seed=args.seed,
+        feature_profile=args.feature_profile,
+    )
+
+    def report(event: dict[str, object]) -> None:
+        detail = event.get("event", {})
+        evaluated = config.population_size * (int(detail.get("generation", 0)) + 1)
+        print(
+            f"[{event.get('engine')}] run={event.get('run_index')} "
+            f"generation={detail.get('generation')}/{detail.get('generations')} "
+            f"candidates-evaluated≈{evaluated}",
+            flush=True,
+        )
+
+    result = run_research_schedule(
+        dataset,
+        config,
+        duration_seconds=args.duration_minutes * 60,
+        checkpoint_path=args.checkpoint,
+        resume=args.resume,
+        max_runs=args.max_runs,
+        engines=tuple(args.engine or SUPPORTED_ENGINES),
+        progress=report,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

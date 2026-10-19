@@ -37,6 +37,7 @@ class IntermittentConfig:
     min_activation_rate: float = 0.1
     top_candidates: int = 10
     hidden_states: int = 3
+    feature_profile: str = "legacy"
 
     def __post_init__(self) -> None:
         if self.population_size < 8 or self.generations < 1:
@@ -55,6 +56,8 @@ class IntermittentConfig:
             )
         if not 2 <= self.hidden_states <= 5:
             raise ValueError("Hypothetical hidden state count must be between 2 and 5.")
+        if self.feature_profile not in {"legacy", "calendar_round"}:
+            raise ValueError("Feature profile must be legacy or calendar_round.")
         if self.train_ratio <= 0 or self.validation_ratio <= 0:
             raise ValueError("Train and validation ratios must be positive.")
         if self.train_ratio + self.validation_ratio >= 1:
@@ -85,6 +88,12 @@ class IntermittentCandidate:
     active_gaps: tuple[int, ...] = ()
     rule_active_rounds: tuple[tuple[int, ...], ...] = ()
     rule_active_gaps: tuple[tuple[int, ...], ...] = ()
+    training_full_set_matches: int = 0
+    validation_full_set_matches: int = 0
+    test_full_set_matches: int | None = None
+    training_match_distribution: tuple[int, ...] = ()
+    validation_match_distribution: tuple[int, ...] = ()
+    test_match_distribution: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +152,7 @@ def _measure(
     events: list[dict[str, object]] = []
     hits = 0
     exact_matches = 0
+    match_distribution = [0] * 7
     for example in examples:
         rule_index = _gate_rule(gate, example.features)
         active = rule_index > 0
@@ -154,6 +164,7 @@ def _measure(
             active_rounds.append(example.round_number)
             rule_rounds[rule_index - 1].append(example.round_number)
             hits += hit_count
+            match_distribution[hit_count] += 1
             exact_matches += int(set(predictions) == example.winning_numbers)
         events.append(
             {
@@ -161,7 +172,11 @@ def _measure(
                 "active": active,
                 "rule_index": rule_index if active else None,
                 "predicted_numbers": list(predictions),
+                "winning_numbers": sorted(example.winning_numbers),
                 "hit_count": hit_count if active else None,
+                "full_set_match": bool(
+                    active and outputs == 6 and set(predictions) == example.winning_numbers
+                ),
             }
         )
     active_count = len(active_rounds)
@@ -180,6 +195,7 @@ def _measure(
         "hit_rate": hit_rate,
         "hit_count": hits,
         "exact_matches": exact_matches,
+        "match_distribution": match_distribution,
         "score": score,
         "active_rounds": active_rounds,
         "events": events,
@@ -289,6 +305,22 @@ def _make_candidate(
         ),
         rule_active_gaps=tuple(
             tuple(int(gap) for gap in gaps) for gaps in all_metrics["rule_gaps"]
+        ),
+        training_full_set_matches=sum(bool(event["full_set_match"]) for event in train["events"]),
+        validation_full_set_matches=sum(
+            bool(event["full_set_match"]) for event in validation["events"]
+        ),
+        test_full_set_matches=(
+            sum(bool(event["full_set_match"]) for event in test["events"])
+            if test is not None
+            else None
+        ),
+        training_match_distribution=tuple(int(value) for value in train["match_distribution"]),
+        validation_match_distribution=tuple(
+            int(value) for value in validation["match_distribution"]
+        ),
+        test_match_distribution=(
+            tuple(int(value) for value in test["match_distribution"]) if test is not None else None
         ),
     )
 

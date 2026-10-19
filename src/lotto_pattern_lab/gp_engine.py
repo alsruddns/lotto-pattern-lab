@@ -40,6 +40,119 @@ def _cube(value: float) -> float:
     return _bounded(max(-100.0, min(100.0, value)) ** 3)
 
 
+def _safe_integer(value: float) -> int:
+    """Convert to a bounded signed 32-bit integer for structure operations."""
+    if not math.isfinite(value):
+        return 0
+    return max(-(2**31), min(2**31 - 1, int(value)))
+
+
+def _bit_xor(left: float, right: float) -> float:
+    return float((_safe_integer(left) & 0xFFFFFFFF) ^ (_safe_integer(right) & 0xFFFFFFFF))
+
+
+def _bit_and(left: float, right: float) -> float:
+    return float((_safe_integer(left) & 0xFFFFFFFF) & (_safe_integer(right) & 0xFFFFFFFF))
+
+
+def _bit_or(left: float, right: float) -> float:
+    return float((_safe_integer(left) & 0xFFFFFFFF) | (_safe_integer(right) & 0xFFFFFFFF))
+
+
+def _shift_left(value: float, places: float) -> float:
+    shift = max(0, min(31, _safe_integer(places)))
+    return float(((_safe_integer(value) & 0xFFFFFFFF) << shift) & 0xFFFFFFFF)
+
+
+def _shift_right(value: float, places: float) -> float:
+    shift = max(0, min(31, _safe_integer(places)))
+    return float((_safe_integer(value) & 0xFFFFFFFF) >> shift)
+
+
+def _rotate_left(value: float, places: float) -> float:
+    shift = _safe_integer(places) % 32
+    integer = _safe_integer(value) & 0xFFFFFFFF
+    if shift == 0:
+        return float(integer)
+    return float(((integer << shift) | (integer >> (32 - shift))) & 0xFFFFFFFF)
+
+
+def _rotate_right(value: float, places: float) -> float:
+    shift = _safe_integer(places) % 32
+    integer = _safe_integer(value) & 0xFFFFFFFF
+    if shift == 0:
+        return float(integer)
+    return float(((integer >> shift) | (integer << (32 - shift))) & 0xFFFFFFFF)
+
+
+def _concat_digits(left: float, right: float) -> float:
+    first = abs(_safe_integer(left)) % 1_000_000
+    second = abs(_safe_integer(right))
+    width = len(str(second))
+    return float((first * (10**width) + second) % (2**32))
+
+
+def _digit_sum(value: float) -> float:
+    return float(sum(int(character) for character in str(abs(_safe_integer(value)))))
+
+
+def _reverse_digits(value: float) -> float:
+    return float(int(str(abs(_safe_integer(value)))[::-1]))
+
+
+def _digital_root(value: float) -> float:
+    integer = abs(_safe_integer(value))
+    return float(0 if integer == 0 else 1 + (integer - 1) % 9)
+
+
+def _is_prime(value: float) -> float:
+    """Deterministic Miller-Rabin primality test for the supported 32-bit range."""
+    number = abs(_safe_integer(value))
+    if number < 2:
+        return 0.0
+    for prime in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if number == prime:
+            return 1.0
+        if number % prime == 0:
+            return 0.0
+    odd_part = number - 1
+    power = 0
+    while odd_part % 2 == 0:
+        odd_part //= 2
+        power += 1
+    for witness in (2, 3, 5, 7, 11):
+        residue = pow(witness, odd_part, number)
+        if residue in (1, number - 1):
+            continue
+        if not any(pow(residue, 2**step, number) == number - 1 for step in range(power - 1)):
+            return 0.0
+    return 1.0
+
+
+def _factor_count(value: float) -> float:
+    """Count divisors up to one million; larger inputs are explicitly clipped."""
+    number = min(abs(_safe_integer(value)), 1_000_000)
+    if number == 0:
+        return 0.0
+    count = 0
+    divisor = 1
+    while divisor * divisor <= number:
+        if number % divisor == 0:
+            count += 1 if divisor * divisor == number else 2
+        divisor += 1
+    return float(count)
+
+
+def _fibonacci_index(value: float) -> float:
+    """Return the exact Fibonacci index, or zero when the bounded integer is not Fibonacci."""
+    number = abs(_safe_integer(value))
+    previous, current, index = 0, 1, 0
+    while previous < number:
+        previous, current = current, previous + current
+        index += 1
+    return float(index if previous == number else 0)
+
+
 def _ephemeral_constant() -> float:
     return random.uniform(-10.0, 10.0)
 
@@ -57,6 +170,20 @@ def _make_primitive_set(feature_count: int) -> gp.PrimitiveSet:
     pset.addPrimitive(max, 2, name="max2")
     pset.addPrimitive(_square, 1, name="square")
     pset.addPrimitive(_cube, 1, name="cube")
+    pset.addPrimitive(_bit_xor, 2, name="bit_xor")
+    pset.addPrimitive(_bit_and, 2, name="bit_and")
+    pset.addPrimitive(_bit_or, 2, name="bit_or")
+    pset.addPrimitive(_shift_left, 2, name="shift_left")
+    pset.addPrimitive(_shift_right, 2, name="shift_right")
+    pset.addPrimitive(_rotate_left, 2, name="rotate_left")
+    pset.addPrimitive(_rotate_right, 2, name="rotate_right")
+    pset.addPrimitive(_concat_digits, 2, name="concat_digits")
+    pset.addPrimitive(_digit_sum, 1, name="digit_sum")
+    pset.addPrimitive(_reverse_digits, 1, name="reverse_digits")
+    pset.addPrimitive(_digital_root, 1, name="digital_root")
+    pset.addPrimitive(_is_prime, 1, name="is_prime")
+    pset.addPrimitive(_factor_count, 1, name="factor_count")
+    pset.addPrimitive(_fibonacci_index, 1, name="fibonacci_index")
     pset.addEphemeralConstant("constant", _ephemeral_constant)
     return pset
 

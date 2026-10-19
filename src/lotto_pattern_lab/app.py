@@ -21,6 +21,7 @@ from lotto_pattern_lab.official_data import (
     FIRST_SUPPORTED_ROUND,
     fetch_official_dataset,
 )
+from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.storage import ExperimentStore
 
 st.set_page_config(page_title="Lotto Pattern Lab", layout="wide")
@@ -133,6 +134,11 @@ if base_dataset is not None:
     status_text = status_labels.get(
         base_dataset.verification_status, base_dataset.verification_status
     )
+    feature_profile = st.selectbox(
+        "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
+        ("legacy", "calendar_round"),
+        help="\uae30\uc874\u0020\ud2b9\uc9d5\u0020\ud504\ub85c\ud30c\uc77c\uc785\ub2c8\ub2e4\u002e\u0020\ub0a0\uc9dc\u0020\ud2b9\uc9d5\uc740\u0020\ubaa8\ub4e0\u0020\ud68c\ucc28\uc5d0\u0020\uacf5\uc2dd\u0020\ucd94\ucc28\uc77c\uc774\u0020\uc788\uc744\u0020\ub54c\ub9cc\u0020\uc0ac\uc6a9\ud569\ub2c8\ub2e4\u002e",
+    )
     st.caption(
         f"데이터 상태: {status_text} · "
         f"기본 연구 범위: 2017-05-06(753회) 이후 · 현재 {low_round}~{high_round}회"
@@ -164,6 +170,11 @@ if base_dataset is not None:
             end_date = st.date_input(
                 "종료일", value=latest_date, min_value=first_date, max_value=latest_date
             )
+    if feature_profile == "calendar_round" and any(
+        record.draw_date is None for record in base_dataset.records
+    ):
+        st.warning("Calendar features need dates on every draw. Use the official verified dataset.")
+
     try:
         selected_dataset = filter_dataset(
             base_dataset,
@@ -244,9 +255,12 @@ if run_clicked and selected_dataset is not None:
                 control_runs=int(controls),
                 min_activation_rate=min_activation,
                 hidden_states=hidden_states,
+                feature_profile=feature_profile,
             )
             with st.spinner("간헐적 후보와 동일 조건의 무작위 대조군을 탐색합니다."):
-                result = run_intermittent_experiment(selected_dataset, config, store, update)
+                result = run_intermittent_experiment(
+                    selected_dataset, config, store, update, PatternLibrary()
+                )
             progress_bar.progress(1.0, text="완료")
             st.success(f"간헐적 탐색 완료: {result['experiment_id']}")
         else:

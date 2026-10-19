@@ -58,3 +58,36 @@ CLI에서도 같은 간헐적 엔진을 실행할 수 있습니다.
 .\.venv\Scripts\python.exe -m ruff check .
 .\.venv\Scripts\python.exe -m pytest
 ```
+
+
+## 지속 연구·다중 패턴 확장
+
+- calendar_round 프로파일은 공식 검증 추첨일에서 연·월·일·요일·연중 일수·주차·날짜 수 변환과 회차 자릿수 특징을 추가합니다. 추첨일이 없거나 검증되지 않은 실데이터에는 날짜 특징을 적용하지 않습니다. 다음 회차 예측에는 사용자가 예정 추첨일을 입력해야 합니다.
+- DEAP의 수식 문법에는 32비트 범위로 제한한 XOR/AND/OR/시프트, 자릿수 합·역순·디지털 루트, 소수 판정, 약수 개수, 피보나치 인덱스 연산을 추가했습니다. 공식 실행은 허용된 연산자 파서만 사용합니다.
+- 6개 모델 이벤트에는 실제 집합과 일치 여부, 회차별 0~6개 적중 분포, 학습·검증·독립 테스트 구간별 3개 이상/4개 이상/5개 이상/6개 완전 일치를 기록합니다.
+- data/database/patterns.sqlite는 발견 후보, 정규화 지문, 상태 변경 이력, 회차별 검증을 저장합니다. 과거 탐색 중 완전 일치는 retrospective_search_fit으로 분류하고 사전 예측 근거로 사용하지 않습니다. 이전 JSON에 실제 당첨번호가 빠져 있으면 저장된 이벤트 회차와 선택 데이터만 대조해 복원하며 원본 JSON은 변경하지 않습니다.
+- 공식 CSV를 갱신할 때 *.history.jsonl에 이전/신규 데이터 해시와 회차 범위를 기록합니다. CSV 및 manifest는 임시 파일에서 작성한 뒤 원자적으로 교체합니다.
+- 지속 연구 대시보드 또는 CLI의 intermittent_gp 엔진으로 반복 탐색합니다. 현재 등록된 자동 탐색 엔진은 DEAP 간헐적 GP 한 종류입니다. 자기상관·FFT는 전체 시계열에 대한 탐색적 진단으로 제공되며, 예측 모델로 취급하지 않습니다.
+
+Windows PowerShell 명령:
+
+    .\.venv\Scripts\python.exe -m lotto_pattern_lab intermittent --csv data/official/draws.csv --feature-profile calendar_round --population 32 --generations 10 --workers 4 --controls 3
+
+    .\.venv\Scripts\python.exe -m lotto_pattern_lab research --csv data/official/draws.csv --duration-minutes 30 --population 32 --generations 10 --workers 4 --controls 3 --checkpoint checkpoints/research.json
+
+    .\.venv\Scripts\python.exe -m lotto_pattern_lab research --stop --checkpoint checkpoints/research.json
+
+    .\.venv\Scripts\python.exe -m lotto_pattern_lab research --csv data/official/draws.csv --duration-minutes 30 --population 32 --generations 10 --workers 4 --controls 3 --checkpoint checkpoints/research.json --resume
+
+체크포인트는 데이터 해시·조건·시드·진행 세대·실패 기록을 보존합니다. GP 개체군을 세대 중간에서 복구하지는 않으며, 재개할 때 다음 시드의 완전한 실험부터 시작합니다. 중단 요청은 현재 실험을 저장할 때까지 기다립니다. 긴 설정에서 한 실험 자체가 오래 걸리면 중단도 그만큼 지연됩니다.
+
+PySR/Julia 백엔드, 완전한 재귀식·무제한 비정형 문법, 세대 중간 복원, 독립 Fourier 기반 규칙 진화는 아직 구현되지 않았습니다. 대조군 반복 수가 적으면 경험적 p값은 해상도가 낮고 잠정 결과로만 해석해야 합니다.
+
+
+### 선택형 PySR 준비 상태
+
+기존 .venv에 Julia 런타임을 자동 설치하지 않도록 PySR는 선택 의존성으로 분리했습니다. 별도로 설치하려면 다음 명령을 실행합니다.
+
+    .\.venv\Scripts\python.exe -m pip install -e ".[symbolic]"
+
+확인 시점에 PySR 저장소의 현재 프로젝트 메타데이터는 Python 3.10 이상을 선언하고 juliacall을 의존성으로 사용하므로 Python 3.13은 메타데이터 범위에 포함됩니다. 하지만 이 PC의 Julia 설치·초기화와 PySR 실제 탐색은 실행하지 않았으므로 Windows 11 런타임 호환성이 검증 완료된 상태는 아닙니다. 앱 시작 시 PySR를 import하지 않으며, 선택 백엔드 오류는 DEAP 기능과 분리해 표시합니다. [PySR 프로젝트 메타데이터](https://github.com/astroautomata/PySR/blob/master/pyproject.toml), [JuliaCall 의존성 안내](https://github.com/JuliaPy/PythonCall.jl/blob/main/docs/src/juliacall.md)

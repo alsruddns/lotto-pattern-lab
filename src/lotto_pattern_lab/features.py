@@ -46,6 +46,11 @@ def build_examples(dataset: DrawDataset, max_lag: int = MAX_LAG) -> tuple[Exampl
     if not 1 <= max_lag <= MAX_LAG:
         raise ValueError(f"max_lag must be between 1 and {MAX_LAG}.")
     records = dataset.records
+    if any(
+        right.round_number != left.round_number + 1
+        for left, right in zip(records, records[1:], strict=False)
+    ):
+        raise ValueError("Research requires contiguous rounds; missing draws cannot count as lags.")
     examples: list[Example] = []
     set_features = [_set_features(record) for record in records]
     for target_index in range(max_lag, len(records)):

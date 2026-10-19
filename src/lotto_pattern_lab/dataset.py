@@ -3,7 +3,9 @@
 import csv
 import hashlib
 import json
+import os
 import random
+import tempfile
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -35,6 +37,9 @@ class DrawDataset:
             raise ValueError("Round numbers must be positive integers.")
         if rounds != sorted(set(rounds)):
             raise ValueError("Rounds must be unique and in ascending order.")
+        dated = [record.draw_date for record in self.records if record.draw_date is not None]
+        if any(left >= right for left, right in zip(dated, dated[1:], strict=False)):
+            raise ValueError("Draw dates must be strictly increasing when present.")
         if self.source_kind not in {
             "csv_unverified",
             "csv_locally_validated",
@@ -105,22 +110,55 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
     return DrawDataset(tuple(records), source_kind, description, source_url)
 
 
+def dataset_integrity_report(dataset: DrawDataset) -> dict[str, object]:
+    """Report round continuity, date coverage, and current source verification state."""
+    rounds = [record.round_number for record in dataset.records]
+    known_rounds = set(rounds)
+    missing = [number for number in range(rounds[0], rounds[-1] + 1) if number not in known_rounds]
+    dated_count = sum(record.draw_date is not None for record in dataset.records)
+    return {
+        "round_range": [rounds[0], rounds[-1]],
+        "draw_count": len(rounds),
+        "duplicate_rounds": [],
+        "missing_rounds": missing,
+        "rounds_contiguous": not missing,
+        "dated_draw_count": dated_count,
+        "all_draws_dated": dated_count == len(rounds),
+        "source_kind": dataset.source_kind,
+        "verification_status": dataset.verification_status,
+    }
+
+
 def save_official_csv(dataset: DrawDataset, path: str | Path) -> tuple[Path, Path]:
     """Save verified official records plus a checksum and provenance sidecar."""
     if dataset.source_kind != "official_verified" or not dataset.verified_at:
         raise ValueError("Only a freshly fetched official dataset can be saved as verified.")
     csv_path = Path(path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("w", encoding="utf-8", newline="") as output:
-        writer = csv.writer(output)
-        writer.writerow(("round", "date", "n1", "n2", "n3", "n4", "n5", "n6"))
-        for record in dataset.records:
-            if record.draw_date is None:
-                raise ValueError("Official verified draw is missing its draw date.")
-            writer.writerow(
-                (record.round_number, record.draw_date.isoformat(), *record.draw.numbers)
-            )
-    digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    old_digest = hashlib.sha256(csv_path.read_bytes()).hexdigest() if csv_path.exists() else None
+    old_range = None
+    old_manifest_path = Path(f"{csv_path}.manifest.json")
+    if old_manifest_path.exists():
+        old_manifest = json.loads(old_manifest_path.read_text(encoding="utf-8"))
+        old_range = [old_manifest.get("start_round"), old_manifest.get("end_round")]
+    descriptor, temporary_csv = tempfile.mkstemp(
+        prefix=f"{csv_path.stem}_", suffix=".tmp", dir=csv_path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            writer = csv.writer(output)
+            writer.writerow(("round", "date", "n1", "n2", "n3", "n4", "n5", "n6"))
+            for record in dataset.records:
+                if record.draw_date is None:
+                    raise ValueError("Official verified draw is missing its draw date.")
+                writer.writerow(
+                    (record.round_number, record.draw_date.isoformat(), *record.draw.numbers)
+                )
+        digest = hashlib.sha256(Path(temporary_csv).read_bytes()).hexdigest()
+        os.replace(temporary_csv, csv_path)
+    finally:
+        if os.path.exists(temporary_csv):
+            os.unlink(temporary_csv)
     manifest_path = Path(f"{csv_path}.manifest.json")
     manifest = {
         "source_kind": dataset.source_kind,
@@ -135,9 +173,39 @@ def save_official_csv(dataset: DrawDataset, path: str | Path) -> tuple[Path, Pat
         "draw_count": len(dataset.records),
         "sha256": digest,
     }
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    descriptor, temporary_manifest = tempfile.mkstemp(
+        prefix="draw_manifest_", suffix=".tmp", dir=manifest_path.parent
     )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(manifest, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        os.replace(temporary_manifest, manifest_path)
+    finally:
+        if os.path.exists(temporary_manifest):
+            os.unlink(temporary_manifest)
+    history_path = Path(f"{csv_path}.history.jsonl")
+    previous_history = history_path.read_text(encoding="utf-8") if history_path.exists() else ""
+    history_entry = {
+        "updated_at": dataset.verified_at,
+        "source_url": dataset.source_url,
+        "old_sha256": old_digest,
+        "new_sha256": digest,
+        "old_round_range": old_range,
+        "new_round_range": [dataset.records[0].round_number, dataset.records[-1].round_number],
+        "draw_count": len(dataset.records),
+    }
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="draw_history_", suffix=".tmp", dir=history_path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(previous_history)
+            output.write(json.dumps(history_entry, ensure_ascii=False) + "\n")
+        os.replace(temporary, history_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return csv_path, manifest_path
 
 
