@@ -8,6 +8,14 @@ from lotto_pattern_lab.feature_schema import feature_mapping
 from lotto_pattern_lab.hit_audit import audit_research_round, build_hit_audit_markdown
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
+from lotto_pattern_lab.presentation import (
+    format_count,
+    format_decimal,
+    format_duration,
+    format_percent,
+    format_probability,
+    pretty_formula,
+)
 from lotto_pattern_lab.report_clipboard import report_copy_button
 from lotto_pattern_lab.research import load_checkpoint
 from lotto_pattern_lab.research_rounds import (
@@ -26,21 +34,20 @@ st.title("연구 회차 대시보드")
 st.caption("연구 ID는 UUID로 유지하고, 연구 회차는 생성 순서에 따라 별도로 관리합니다.")
 
 SCORE_COLUMN_CONFIG = {
-    "평균 평가 점수": st.column_config.NumberColumn(
+    "평균 평가 점수": st.column_config.TextColumn(
         "평균 평가 점수",
         help=(
             "실험별 모델 평가 점수의 평균입니다. 적중률(맞힌 번호/활성 예측 수)과 다른 지표입니다."
         ),
-        format="%.3f",
     ),
-    "최고 평가 점수": st.column_config.NumberColumn(
-        "최고 평가 점수", help="해당 구간의 실험별 평가 점수 중 최댓값입니다.", format="%.3f"
+    "최고 평가 점수": st.column_config.TextColumn(
+        "최고 평가 점수", help="해당 구간의 실험별 평가 점수 중 최댓값입니다."
     ),
-    "중앙값 평가 점수": st.column_config.NumberColumn(
-        "중앙값 평가 점수", help="해당 구간의 실험별 평가 점수 중앙값입니다.", format="%.3f"
+    "중앙값 평가 점수": st.column_config.TextColumn(
+        "중앙값 평가 점수", help="해당 구간의 실험별 평가 점수 중앙값입니다."
     ),
-    "평가 실험 수": st.column_config.NumberColumn(
-        "평가 실험 수", help="통계에 포함한 실험 수입니다.", format="%d"
+    "평가 실험 수": st.column_config.TextColumn(
+        "평가 실험 수", help="통계에 포함한 실험 수입니다."
     ),
 }
 
@@ -217,7 +224,7 @@ else:
                 "연구 회차": f"연구 {item['research_round']}회차",
                 "연구 ID": item["research_id"],
                 "실행 일시": item.get("started_at") or item.get("created_at"),
-                "연구 시간(초)": item.get("total_elapsed_seconds"),
+                "연구 시간": format_duration(item.get("total_elapsed_seconds")),
                 "상태": item.get("status", "미수집"),
                 "탐색 엔진": ", ".join(item.get("engines", [])) or "미수집",
                 "특징 프로파일": config.get("feature_profile", "미수집"),
@@ -244,7 +251,7 @@ else:
         "연구 회차": "연구가 시작된 순서입니다.",
         "연구 ID": "연구를 식별하는 UUID입니다.",
         "실행 일시": "연구를 시작한 시각입니다.",
-        "연구 시간(초)": "누적 연구 실행 시간입니다.",
+        "연구 시간": "누적 연구 실행 시간입니다. 시·분·초로 표시합니다.",
         "상태": "연구의 마지막 저장 상태입니다.",
         "탐색 엔진": "해당 연구에서 사용한 탐색 엔진입니다.",
         "특징 프로파일": "모델 입력 특징의 구성 버전입니다.",
@@ -259,7 +266,6 @@ else:
         "독립 테스트 요약": "독립 테스트 평가 점수의 모델별 평균입니다.",
     }
     numeric_labels = {
-        "연구 시간(초)",
         "완료 실험",
         "실패 실험",
     }
@@ -303,10 +309,14 @@ else:
     model_metrics = model_metric_stats(summary)
     headline = st.columns(5)
     headline[0].metric("연구 시간", _duration(selected.get("total_elapsed_seconds")))
-    headline[1].metric("완료 실험", summary.get("completed_experiment_count", 0))
-    headline[2].metric("실패·중단", summary.get("failed_experiment_count", 0))
-    headline[3].metric("검사 후보 수", summary.get("candidate_count", "미수집"))
-    headline[4].metric("신규 패턴", summary.get("new_pattern_count", "미수집"))
+    headline[1].metric(
+        "완료 실험", format_count(summary.get("completed_experiment_count", 0))
+    )
+    headline[2].metric(
+        "실패·중단", format_count(summary.get("failed_experiment_count", 0))
+    )
+    headline[3].metric("검사 후보 수", format_count(summary.get("candidate_count")))
+    headline[4].metric("신규 패턴", format_count(summary.get("new_pattern_count")))
     second = st.columns(5)
     second[0].metric("중복 패턴", summary.get("duplicate_pattern_count", "미수집"))
     second[1].metric("계승 수식", summary.get("inherited_pattern_count", "미수집"))
@@ -385,10 +395,10 @@ else:
                 {
                     "모델": label,
                     "구간": phase,
-                    "평균 평가 점수": values.get("mean"),
-                    "최고 평가 점수": values.get("best"),
-                    "중앙값 평가 점수": values.get("median"),
-                    "평가 실험 수": values.get("count"),
+                    "평균 평가 점수": format_decimal(values.get("mean"), suffix="점"),
+                    "최고 평가 점수": format_decimal(values.get("best"), suffix="점"),
+                    "중앙값 평가 점수": format_decimal(values.get("median"), suffix="점"),
+                    "평가 실험 수": format_count(values.get("count")),
                 }
             )
     st.dataframe(
@@ -474,7 +484,7 @@ else:
                     "활성 예측에서 맞힌 번호 수를 활성 예측 회차 수로 나눈 값입니다. "
                     "6개 집합 모델은 회차당 최대 6입니다."
                 ),
-                format="%.3f",
+                format="%.4f",
             ),
             "반복 평가 3+ / 4+ / 5+ / 6개": st.column_config.TextColumn(
                 "반복 평가 3+ / 4+ / 5+ / 6개",
@@ -584,17 +594,56 @@ else:
         pvalue_rows.append(
             {
                 "모델": label,
-                "경험적 p값 평균": sum(values) / len(values) if values else None,
-                "중앙값": median(values) if values else None,
-                "범위": [min(values), max(values)] if values else None,
-                "계산 실험 수": len(values),
-                "대조 반복/실험": control_runs,
-                "p값 최소 해상도": 1 / (1 + control_runs)
+                "경험적 p값 평균": format_probability(
+                    sum(values) / len(values) if values else None
+                ),
+                "중앙값": format_probability(median(values) if values else None),
+                "범위": (
+                    f"{format_probability(min(values))} – {format_probability(max(values))}"
+                    if values
+                    else "미수집"
+                ),
+                "계산 실험 수": format_count(len(values)),
+                "대조 반복/실험": format_count(control_runs),
+                "p값 최소 해상도": format_probability(1 / (1 + control_runs))
                 if isinstance(control_runs, int)
-                else None,
+                else "미수집",
             }
         )
-    st.dataframe(pvalue_rows, hide_index=True, width="stretch")
+    st.dataframe(
+        pvalue_rows,
+        column_config={
+            "모델": st.column_config.TextColumn(
+                "모델", help="무작위 대조를 수행한 예측 모델입니다."
+            ),
+            "경험적 p값 평균": st.column_config.TextColumn(
+                "경험적 p값 평균",
+                help=(
+                    "무작위 대조에서 관측한 p값의 평균입니다. "
+                    "낮은 대조 횟수는 해상도가 거칩니다."
+                ),
+            ),
+            "중앙값": st.column_config.TextColumn(
+                "p값 중앙값", help="무작위 대조 p값의 중앙값입니다."
+            ),
+            "범위": st.column_config.TextColumn(
+                "p값 범위", help="계산된 p값의 최솟값과 최댓값입니다."
+            ),
+            "계산 실험 수": st.column_config.TextColumn(
+                "계산 실험 수", help="유효 p값이 계산된 실험 수입니다."
+            ),
+            "대조 반복/실험": st.column_config.TextColumn(
+                "대조 반복/실험",
+                help="실험 하나에서 수행한 무작위 대조 횟수입니다.",
+            ),
+            "p값 최소 해상도": st.column_config.TextColumn(
+                "p값 최소 해상도",
+                help="대조 반복 수로 제한되는 가장 작은 경험적 p값입니다.",
+            ),
+        },
+        hide_index=True,
+        width="stretch",
+    )
     st.caption(
         "각 실험은 대조 반복이 적어 p값 해상도가 거칩니다. 서로 겹치는 회차와 데이터 분할을 "
         "사용한 실험이므로 p값 69개를 독립 표본처럼 해석하지 않습니다."
@@ -744,16 +793,16 @@ else:
             {
                 "모델": model_names.get(item.get("model"), item.get("model", "미수집")),
                 "후보 순위": item.get("rank"),
-                "검증 평가 점수": item.get("validation_score"),
-                "독립 테스트 평가 점수": item.get("independent_test_score"),
-                "검증 활성률(%)": (
-                    100 * item["validation_activation_rate"]
-                    if item.get("validation_activation_rate") is not None
-                    else None
+                "검증 평가 점수": format_decimal(item.get("validation_score"), suffix="점"),
+                "독립 테스트 평가 점수": format_decimal(
+                    item.get("independent_test_score"), suffix="점"
                 ),
+                "검증 활성률": format_percent(item.get("validation_activation_rate")),
                 "수식 복잡도": item.get("complexity"),
                 "활성화 조건": item.get("activation_condition"),
-                "출력 수식": item.get("formulas"),
+                "출력 수식": [
+                    pretty_formula(str(formula)) for formula in item.get("formulas", [])
+                ],
             }
             for item in candidates[:10]
         ]
@@ -766,20 +815,17 @@ else:
                 "후보 순위": st.column_config.NumberColumn(
                     "후보 순위", help="검증 결과를 바탕으로 정렬한 후보의 순위입니다.", format="%d"
                 ),
-                "검증 평가 점수": st.column_config.NumberColumn(
+                "검증 평가 점수": st.column_config.TextColumn(
                     "검증 평가 점수",
                     help="검증 구간에서 후보를 비교하는 점수입니다. 적중률과 별도 지표입니다.",
-                    format="%.3f",
                 ),
-                "독립 테스트 평가 점수": st.column_config.NumberColumn(
+                "독립 테스트 평가 점수": st.column_config.TextColumn(
                     "독립 테스트 평가 점수",
                     help="검증 구간에서 선택을 마친 뒤 독립 테스트 구간에서 계산한 점수입니다.",
-                    format="%.3f",
                 ),
-                "검증 활성률(%)": st.column_config.NumberColumn(
-                    "검증 활성률(%)",
+                "검증 활성률": st.column_config.TextColumn(
+                    "검증 활성률",
                     help="검증 구간 중 예측 규칙이 활성화된 회차의 비율입니다.",
-                    format="%.1f",
                 ),
                 "수식 복잡도": st.column_config.NumberColumn(
                     "수식 복잡도", help="활성화 조건과 출력 공식의 복잡도 지표입니다.", format="%d"
@@ -798,7 +844,7 @@ else:
                 "후보 순위",
                 "검증 평가 점수",
                 "독립 테스트 평가 점수",
-                "검증 활성률(%)",
+                "검증 활성률",
                 "수식 복잡도",
                 "활성화 조건",
                 "출력 수식",
@@ -832,6 +878,7 @@ else:
                 st.markdown("**출력 수식**")
                 for index, formula in enumerate(chosen.get("formulas", []), start=1):
                     st.caption(f"번호 출력 {index}")
+                    st.markdown(f"읽기 쉬운 표기: `{pretty_formula(str(formula))}`")
                     st.code(str(formula), language="text", wrap_lines=True)
                 feature_rows = _feature_rows(
                     list(chosen.get("formulas", []))
