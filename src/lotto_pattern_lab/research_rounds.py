@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .paths import project_path
+from .presentation import (
+    format_count,
+    format_decimal,
+    format_duration,
+    format_percent,
+    format_probability,
+    pretty_formula,
+)
 from .storage import ExperimentStore
 
 SUMMARY_SCHEMA_VERSION = 2
@@ -929,12 +937,15 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
     if config.get("train_ratio") is not None and config.get("validation_ratio") is not None:
         test_ratio = 1 - config["train_ratio"] - config["validation_ratio"]
     lines = [
-        "# Lotto Pattern Lab 연구 결과",
+        "# 로또 패턴 연구 결과 보고서",
+        "",
+        "이 보고서는 과거 데이터에 대한 탐색 결과입니다. "
+        "평가 점수는 번호 적중률과 다른 지표이며, 어떤 결과도 다음 추첨을 보장하지 않습니다.",
         "",
         f"- 연구 회차: {round_record.get('research_round', '미수집')}회차",
         f"- 연구 ID: {round_record.get('research_id', '미수집')}",
         f"- 상태: {round_record.get('status', '미수집')}",
-        f"- 연구 시간(초): {_display(round_record.get('total_elapsed_seconds'))}",
+        f"- 연구 시간: {format_duration(round_record.get('total_elapsed_seconds'))}",
         "",
         "## 데이터와 설정",
         f"- 데이터 해시: {_display(round_record.get('dataset_sha256'))}",
@@ -973,6 +984,8 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         "(회고적 적합이며 사전 예측으로 간주하지 않음)",
         "",
         "## 모델별 성능",
+        "평가 점수는 학습·검증·독립 테스트 구간별 모델 점수입니다. "
+        "적중 현황은 활성 예측의 맞힌 번호 수를 따로 집계합니다.",
     ]
     for key, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
         lines.append(f"### {label}")
@@ -984,9 +997,10 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
             values = metrics.get(key, {}).get(metric, {})
             lines.append(
                 f"- {name} 점수 평균/중앙값/최고: "
-                f"{_display(values.get('mean'))} / {_display(values.get('median'))} / "
-                f"{_display(values.get('best'))} "
-                f"(실험 수 {_display(values.get('count'))})"
+                f"{format_decimal(values.get('mean'), suffix='점')} / "
+                f"{format_decimal(values.get('median'), suffix='점')} / "
+                f"{format_decimal(values.get('best'), suffix='점')} "
+                f"(실험 수 {format_count(values.get('count'))})"
             )
         model_rows = models.get(key, [])
         for split, split_label in (
@@ -997,11 +1011,16 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
             active = [row.get(f"{split}_activation_count") for row in model_rows]
             targets = [row.get(f"{split}_target_round_count") for row in model_rows]
             hits = [row.get(f"{split}_hit_count") for row in model_rows]
+            active_count = format_count(
+                sum(x for x in active if isinstance(x, int)) if active else None
+            )
+            target_count = format_count(
+                sum(x for x in targets if isinstance(x, int)) if targets else None
+            )
+            hit_count = format_count(sum(x for x in hits if isinstance(x, int)) if hits else None)
             lines.append(
                 f"- {split_label} 활성/전체 대상 회차 및 적중 번호 합계: "
-                f"{_display(sum(x for x in active if isinstance(x, int)) if active else None)} / "
-                f"{_display(sum(x for x in targets if isinstance(x, int)) if targets else None)} / "
-                f"{_display(sum(x for x in hits if isinstance(x, int)) if hits else None)}"
+                f"{active_count} / {target_count} / {hit_count}"
             )
     lines.extend(["", "## 무작위 대조 및 초기화 비교"])
     control_runs = config.get("control_runs")
@@ -1011,10 +1030,12 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         stats = _stats(values)
         resolution = 1 / (1 + control_runs) if isinstance(control_runs, int) else None
         lines.append(
-            f"- {label} 경험적 p값 평균/중앙값/범위: {_display(stats['mean'])} / "
-            f"{_display(stats['median'])} / "
+            f"- {label} 경험적 p값 평균/중앙값/범위: "
+            f"{format_probability(stats['mean'])} / "
+            f"{format_probability(stats['median'])} / "
             f"{_display((min(values), max(values)) if values else None)} "
-            f"(계산 실험 {stats['count']}, 반복별 해상도 {_display(resolution)})"
+            f"(계산 실험 {format_count(stats['count'])}, "
+            f"반복별 해상도 {format_probability(resolution)})"
         )
     paired_summary = paired_comparison_summary(summary)
     paired_count = paired_summary.get("one_number", {}).get("validation_count")
@@ -1054,16 +1075,18 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
     lines.extend(["", "## 적중 현황 (선택 모델의 학습/검증/독립 테스트 집계)"])
     for key, values in summary.get("hit_totals", {}).items():
         lines.append(
-            f"- {key}: 3+ {values['3_plus']}, 4+ {values['4_plus']}, "
-            f"5+ {values['5_plus']}, 6개 {values['6_exact']}"
+            f"- {key}: 3+ {format_count(values['3_plus'])}, "
+            f"4+ {format_count(values['4_plus'])}, "
+            f"5+ {format_count(values['5_plus'])}, 6개 {format_count(values['6_exact'])}"
         )
     lines.append("- 위 적중 횟수는 모델·실험·평가 구간별 활성 예측을 모두 합한 반복 평가 수입니다.")
     for model, phases in summary.get("unique_hit_totals", {}).items():
         for phase, counts in phases.items():
             lines.append(
-                f"- 고유 회차 {model}/{phase}: 3+ {counts.get('3_plus', 0)}, "
-                f"4+ {counts.get('4_plus', 0)}, 5+ {counts.get('5_plus', 0)}, "
-                f"6개 {counts.get('6_exact', 0)}"
+                f"- 고유 회차 {model}/{phase}: 3+ {format_count(counts.get('3_plus', 0))}, "
+                f"4+ {format_count(counts.get('4_plus', 0))}, "
+                f"5+ {format_count(counts.get('5_plus', 0))}, "
+                f"6개 {format_count(counts.get('6_exact', 0))}"
             )
     lines.append(
         "- 완전 일치는 활성 6개 집합 예측의 번호 집합이 당첨 6개 번호와 모두 같은 경우로 셉니다. "
@@ -1144,15 +1167,22 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         reverse=True,
     )
     for index, candidate in enumerate(candidates[: 10 if detailed else 5], start=1):
+        model_label = {
+            "one_number": "한 번호 모델",
+            "six_number_set": "6개 집합 모델",
+        }.get(candidate.get("model"), str(candidate.get("model", "모델 미수집")))
         lines.append(
-            f"{index}. {candidate.get('model')} rank {candidate.get('rank')} — "
-            f"검증 {_display(candidate.get('validation_score'))}, 독립 테스트 "
-            f"{_display(candidate.get('independent_test_score'))}, "
-            f"활성률 {_display(candidate.get('validation_activation_rate'))}, "
-            f"복잡도 {_display(candidate.get('complexity'))}"
+            f"{index}. {model_label} · 후보 {candidate.get('rank')} — "
+            f"검증 {format_decimal(candidate.get('validation_score'), suffix='점')}, "
+            f"독립 테스트 {format_decimal(candidate.get('independent_test_score'), suffix='점')}, "
+            f"활성률 {format_percent(candidate.get('validation_activation_rate'))}, "
+            f"복잡도 {format_count(candidate.get('complexity'))}"
         )
         lines.append(f"   - 조건: `{_display(candidate.get('activation_condition'))}`")
-        lines.append(f"   - 수식: `{'; '.join(candidate.get('formulas') or [])}`")
+        formulae = candidate.get("formulas") or []
+        readable_formulas = "; ".join(pretty_formula(item) for item in formulae)
+        lines.append(f"   - 읽기 쉬운 수식: `{readable_formulas}`")
+        lines.append(f"   - 원본 수식: `{'; '.join(formulae)}`")
         lines.append("   - 독립 테스트 점수는 후보 선정에 사용되지 않았습니다.")
     if not candidates:
         lines.append("- 후보 상세: 미수집")

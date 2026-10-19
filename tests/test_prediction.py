@@ -12,11 +12,15 @@ from lotto_pattern_lab.features import build_features_for_target, feature_names
 from lotto_pattern_lab.gp_engine import _make_primitive_set, _predict
 from lotto_pattern_lab.prediction import (
     FormulaError,
+    audit_candidate_history,
     compare_recommendation,
+    create_pysr_recommendation,
     create_recommendation,
     evaluate_formula,
     evaluate_gate,
+    evaluate_pysr_formula,
     load_recommendation,
+    pysr_replay_readiness,
     save_comparison,
     save_recommendation,
     summarize_prediction_history,
@@ -99,6 +103,60 @@ def test_formula_parser_rejects_python_execution_and_maps_feature_names() -> Non
         evaluate_formula("x999", values, names)
 
 
+def test_pysr_formula_executor_uses_safe_arithmetic_and_unavailable_candidates_fail() -> None:
+    assert evaluate_pysr_formula("square(x0) + abs(x1) / 2", (3.0, -4.0), ("a", "b")) == 11
+    with pytest.raises(FormulaError):
+        evaluate_pysr_formula("__import__('os')", (1.0,), ("a",))
+
+
+def test_pysr_experiment_without_saved_replay_contract_needs_verification() -> None:
+    result = pysr_replay_readiness(
+        {"engine": "pysr_symbolic_regression", "status": "completed", "candidates": []}
+    )
+
+    assert result["status"] == "verification_required"
+    assert "버전" in result["reason"]
+
+
+def test_pysr_recommendation_reexecutes_saved_target_formulas() -> None:
+    from lotto_pattern_lab.feature_schema import feature_mapping
+
+    dataset = _dataset(first_round=1237, length=12)
+    feature_names_by_id = feature_mapping("legacy", 10)
+    candidates = [
+        {
+            "target": f"main_position_{position}",
+            "formula": f"{position + 10}",
+            "fingerprint": f"fingerprint-{position}",
+            "classification": "RETAINED",
+            "evaluation": {"validation": {"mae": 0.5}},
+        }
+        for position in range(1, 7)
+    ]
+    experiment = {
+        "experiment_id": "pysr-test",
+        "status": "completed",
+        "engine": "pysr_symbolic_regression",
+        "engine_version": "pysr-engine-v1",
+        "config": {"target": "main_positions", "feature_profile": "legacy", "max_lag": 10},
+        "feature_mapping": feature_names_by_id,
+        "dataset_sha256": "saved-dataset-hash",
+        "candidates": candidates,
+    }
+    assert pysr_replay_readiness(experiment)["status"] == "verified"
+
+    result = create_pysr_recommendation(
+        experiment,
+        dataset,
+        dataset.records[-1].round_number + 1,
+        official_latest_round=dataset.records[-1].round_number,
+    )
+
+    assert result["recommended_numbers"] == [11, 12, 13, 14, 15, 16]
+    assert result["replay_status"] == "verified_saved_formula_reexecution"
+    assert result["feature_schema"]["mapping"] == feature_names_by_id
+
+
 def test_gate_modulo_three_branches_match_existing_engine_policy() -> None:
     assert evaluate_gate(1.99)["branch"] == "rule_1"
     assert evaluate_gate(2.99)["branch"] == "rule_2"
@@ -134,6 +192,8 @@ def test_recommendation_runs_selected_rules_and_reuses_duplicate_policy() -> Non
     assert recommendation["selected_rule"] == 2
     assert recommendation["recommended_numbers"] == [2, 3, 4, 5, 6, 7]
     assert recommendation["feature_mapping"]["x0"] == "round_scaled"
+    assert len(recommendation["formula_fingerprint"]) == 64
+    assert recommendation["feature_schema"]["profile"] == "legacy"
     assert len(set(recommendation["recommended_numbers"])) == 6
     assert all(
         item["duplicate_adjustments"] == list(range(2, 2 + index))
@@ -200,12 +260,13 @@ def test_recommendation_is_immutable_and_actual_comparison_is_separate(tmp_path)
     before = saved_path.read_bytes()
     loaded = json.loads(saved_path.read_text(encoding="utf-8"))
     actual = Draw.from_numbers((2, 7, 13, 22, 35, 44))
-    comparison = compare_recommendation(loaded, actual.numbers)
+    comparison = compare_recommendation(loaded, actual.numbers, actual_bonus=11)
     comparison_path = save_comparison(comparison, tmp_path / "comparisons")
 
     assert load_recommendation(saved_path) == loaded
     assert comparison["ai_hits"] == [2, 7]
     assert comparison["ai_hit_count"] == 2
+    assert comparison["prize_tier"] is None
     assert comparison_path.is_file()
     with pytest.raises(FileExistsError):
         save_recommendation(loaded, tmp_path / "predictions")
@@ -226,6 +287,19 @@ def test_prediction_history_summarizes_only_saved_pre_draw_records() -> None:
     assert summary["one_number"]["recommendations"] == 1
     assert summary["one_number"]["ai_numbers"] == 1
     assert summary["one_number"]["by_gate_branch"]["rule_1"]["actual_draws"] == 1
+    assert summary["one_number"]["hit_distribution"]["1"] == 1
+
+
+def test_retrospective_candidate_audit_counts_unique_rounds_once() -> None:
+    dataset = _dataset(first_round=1237, length=12)
+
+    result = audit_candidate_history(_experiment(), dataset, "six_number_set", 1)
+
+    assert result["evaluation_rounds"] == 2
+    assert sum(result["hit_distribution"].values()) == 2
+    assert all(
+        event["prediction_type"] == "retrospective_unique_round" for event in result["events"]
+    )
 
 
 def test_recommendation_streamlit_page_executes_without_script_errors() -> None:
