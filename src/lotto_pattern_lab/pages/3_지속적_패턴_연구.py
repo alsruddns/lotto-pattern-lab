@@ -55,7 +55,9 @@ def _worker_active(checkpoint_path: Path) -> bool:
 def _dataset_for_checkpoint(state: dict[str, Any]) -> tuple[Path | None, str | None]:
     candidates = []
     if state.get("dataset_path"):
-        candidates.append(project_path(state["dataset_path"]))
+        recorded_dataset = project_path(state["dataset_path"])
+        if recorded_dataset.is_relative_to(PROJECT_ROOT):
+            candidates.append(recorded_dataset)
     candidates.extend(
         [
             project_path("data/official/draws.csv"),
@@ -121,6 +123,8 @@ def _resume_records(rounds: ResearchRoundStore) -> list[dict[str, Any]]:
         path, alternatives = locate_checkpoint(raw_path)
         if not path.is_file() and alternatives:
             path = alternatives[0]
+        if not path.is_relative_to(PROJECT_ROOT):
+            continue
         if not path.is_file():
             records.append({**record, "_path": path, "_error": f"체크포인트 없음: {path}"})
             continue
@@ -821,6 +825,8 @@ with resume_tab:
     if not resume_items:
         st.info("이어 실행할 수 있는 paused, failed, interrupted 연구가 없습니다.")
         selected_resume = None
+        st.selectbox("재개할 연구", ["재개 가능한 연구 없음"], disabled=True)
+        st.button("이어서 하기", type="primary", disabled=True, key="resume_research_empty")
     else:
         labels = {
             item["research_id"]: (

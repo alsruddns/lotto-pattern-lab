@@ -929,7 +929,10 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
     if config.get("train_ratio") is not None and config.get("validation_ratio") is not None:
         test_ratio = 1 - config["train_ratio"] - config["validation_ratio"]
     lines = [
-        "# Lotto Pattern Lab 연구 결과",
+        "# 로또 패턴 연구 결과 보고서",
+        "",
+        "이 보고서는 과거 데이터에 대한 탐색 결과입니다. "
+        "평가 점수는 번호 적중률과 다른 지표이며, 어떤 결과도 다음 추첨을 보장하지 않습니다.",
         "",
         f"- 연구 회차: {round_record.get('research_round', '미수집')}회차",
         f"- 연구 ID: {round_record.get('research_id', '미수집')}",
@@ -973,6 +976,8 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         "(회고적 적합이며 사전 예측으로 간주하지 않음)",
         "",
         "## 모델별 성능",
+        "평가 점수는 학습·검증·독립 테스트 구간별 모델 점수입니다. "
+        "적중 현황은 활성 예측의 맞힌 번호 수를 따로 집계합니다.",
     ]
     for key, label in (("one_number", "한 번호 모델"), ("six_number_set", "6개 집합 모델")):
         lines.append(f"### {label}")
