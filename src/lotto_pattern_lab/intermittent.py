@@ -1,16 +1,18 @@
 """DEAP search for gated, intermittent one-number and unordered six-number rules."""
 
+import ast
 import math
 import multiprocessing
 import random
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import partial
 
 from deap import base, creator, gp, tools
 
 from .backtest import DataSplits
+from .feature_schema import PRIMITIVE_SET_VERSION, feature_mapping, remap_formula_features
 from .features import Example
 from .gp_engine import _make_primitive_set, _predict
 
@@ -38,6 +40,8 @@ class IntermittentConfig:
     top_candidates: int = 10
     hidden_states: int = 3
     feature_profile: str = "legacy"
+    elite_seeding_enabled: bool = False
+    elite_seed_ratio: float = 0.2
 
     def __post_init__(self) -> None:
         if self.population_size < 8 or self.generations < 1:
@@ -58,6 +62,8 @@ class IntermittentConfig:
             raise ValueError("Hypothetical hidden state count must be between 2 and 5.")
         if self.feature_profile not in {"legacy", "calendar_round"}:
             raise ValueError("Feature profile must be legacy or calendar_round.")
+        if not 0 <= self.elite_seed_ratio <= 0.8:
+            raise ValueError("Elite seed ratio must be between 0 and 0.8.")
         if self.train_ratio <= 0 or self.validation_ratio <= 0:
             raise ValueError("Train and validation ratios must be positive.")
         if self.train_ratio + self.validation_ratio >= 1:
@@ -94,6 +100,7 @@ class IntermittentCandidate:
     training_match_distribution: tuple[int, ...] = ()
     validation_match_distribution: tuple[int, ...] = ()
     test_match_distribution: tuple[int, ...] | None = None
+    lineage: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +111,7 @@ class IntermittentSearchResult:
     train_rounds: tuple[int, ...]
     validation_rounds: tuple[int, ...]
     test_rounds: tuple[int, ...]
+    seeding: dict[str, object] = field(default_factory=dict)
 
 
 def _new_tree(pset: gp.PrimitiveSet, max_depth: int) -> gp.PrimitiveTree:
@@ -114,6 +122,180 @@ def _new_tree(pset: gp.PrimitiveSet, max_depth: int) -> gp.PrimitiveTree:
 def _new_individual(pset: gp.PrimitiveSet, outputs: int, max_depth: int):
     tree_count = outputs * _RULE_COUNT + 1
     return creator.IntermittentIndividual([_new_tree(pset, max_depth) for _ in range(tree_count)])
+
+
+def _validate_formula_ast(formula: str, pset: gp.PrimitiveSet) -> None:
+    """Reject formula syntax outside numeric literals and names in this primitive set."""
+    try:
+        root = ast.parse(formula, mode="eval")
+    except SyntaxError as error:
+        raise ValueError("formula syntax is invalid") from error
+    allowed_names = set(pset.arguments) | set(pset.mapping)
+    allowed_node_types = (
+        ast.Expression,
+        ast.Call,
+        ast.Name,
+        ast.Load,
+        ast.Constant,
+        ast.UnaryOp,
+        ast.UAdd,
+        ast.USub,
+    )
+    for node in ast.walk(root):
+        if not isinstance(node, allowed_node_types):
+            raise ValueError("formula syntax is not part of the GP expression grammar")
+        if isinstance(node, ast.Name) and node.id not in allowed_names:
+            raise ValueError(f"name {node.id!r} is not in the current primitive set")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in pset.mapping:
+                raise ValueError("only allow-listed GP primitives can be called")
+            if node.keywords:
+                raise ValueError("keyword arguments are not supported in GP formulas")
+        if isinstance(node, ast.Constant) and type(node.value) not in {int, float}:
+            raise ValueError("only numeric constants are supported in GP formulas")
+
+
+def restore_elite_individual(
+    seed: dict[str, object],
+    pset: gp.PrimitiveSet,
+    outputs: int,
+    config: IntermittentConfig,
+    base_individual=None,
+) -> tuple[list | None, str | None]:
+    """Safely rebuild an allow-listed GP individual from a library pattern payload."""
+    seed_outputs = int(seed.get("outputs_per_event", 0))
+    if seed_outputs != outputs:
+        return None, f"model output count {seed_outputs} does not match {outputs}"
+    primitive_version = str(seed.get("primitive_set_version", PRIMITIVE_SET_VERSION))
+    if primitive_version != PRIMITIVE_SET_VERSION:
+        return None, f"primitive set {primitive_version} is incompatible"
+    source_profile = str(seed.get("feature_profile", "legacy"))
+    source_mapping = seed.get("feature_mapping") or {}
+    target_mapping = feature_mapping(config.feature_profile, config.max_lag)
+    raw_formulas = [str(seed.get("activation_condition", "")), *map(str, seed.get("formulas", ()))]
+    if len(raw_formulas) != outputs + 1:
+        return None, f"expected gate and {outputs} output formulas"
+    rewritten: list[str] = []
+    for formula in raw_formulas:
+        migrated, reason = remap_formula_features(
+            formula, source_mapping, target_mapping, source_profile
+        )
+        if reason:
+            return None, reason
+        try:
+            _validate_formula_ast(str(migrated), pset)
+        except ValueError as error:
+            return None, f"formula is invalid for the current primitive set: {error}"
+        rewritten.append(str(migrated))
+    try:
+        trees = [gp.PrimitiveTree.from_string(formula, pset) for formula in rewritten]
+    except (IndexError, TypeError, ValueError, SyntaxError) as error:
+        return None, f"formula is invalid for the current primitive set: {error}"
+    if any(tree.height > config.max_depth or len(tree) > 35 for tree in trees):
+        return None, "formula exceeds the current tree depth or node limit"
+    rule_index = int(seed.get("rule_index", 1))
+    if rule_index not in {1, 2}:
+        return None, f"invalid rule index {rule_index}"
+    _ensure_individual_types()
+    individual = base_individual or _new_individual(pset, outputs, config.max_depth)
+    individual[0] = trees[0]
+    start = 1 + (rule_index - 1) * outputs
+    individual[start : start + outputs] = trees[1:]
+    pattern_id = str(seed.get("pattern_id", ""))
+    individual.lineage = {
+        "seed_pattern_id": pattern_id,
+        "parent_pattern_ids": [pattern_id] if pattern_id else [],
+        "generation": 0,
+        "operators": [],
+        "original_formulas": raw_formulas,
+        "restored_formulas": rewritten,
+    }
+    return individual, None
+
+
+def _ensure_individual_types() -> None:
+    if not hasattr(creator, "IntermittentFitnessMax"):
+        creator.create("IntermittentFitnessMax", base.Fitness, weights=(1.0,))
+    if not hasattr(creator, "IntermittentIndividual"):
+        creator.create("IntermittentIndividual", list, fitness=creator.IntermittentFitnessMax)
+
+
+def _initial_population(
+    pset: gp.PrimitiveSet,
+    outputs: int,
+    config: IntermittentConfig,
+    elite_seeds: tuple[dict[str, object], ...],
+) -> tuple[list, dict[str, object]]:
+    if not config.elite_seeding_enabled or not elite_seeds:
+        requested = (
+            int(round(config.population_size * config.elite_seed_ratio))
+            if config.elite_seeding_enabled
+            else 0
+        )
+        return (
+            [
+                _new_individual(pset, outputs, config.max_depth)
+                for _ in range(config.population_size)
+            ],
+            {
+                "enabled": config.elite_seeding_enabled,
+                "requested_elite_count": requested,
+                "seeded_count": 0,
+                "new_random_count": config.population_size,
+                "skipped": [],
+                "source_pattern_ids": [],
+            },
+        )
+    requested = int(round(config.population_size * config.elite_seed_ratio))
+    population = [
+        _new_individual(pset, outputs, config.max_depth)
+        for _ in range(config.population_size)
+    ]
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    seen_elite_formulas: set[tuple[int, tuple[str, ...]]] = set()
+    source_ids: list[str] = []
+    for seed in elite_seeds:
+        if len(source_ids) >= requested:
+            break
+        target_index = len(source_ids)
+        individual, reason = restore_elite_individual(
+            seed,
+            pset,
+            outputs,
+            config,
+            base_individual=population[target_index],
+        )
+        pattern_id = str(seed.get("pattern_id", "unknown"))
+        if reason:
+            skipped.append({"pattern_id": pattern_id, "reason": reason})
+            continue
+        seed_rule_index = int(seed.get("rule_index", 1))
+        seed_start = 1 + (seed_rule_index - 1) * outputs
+        seed_key = (
+            seed_rule_index,
+            (str(individual[0]), *map(str, individual[seed_start : seed_start + outputs])),
+        )
+        if seed_key in seen_elite_formulas:
+            skipped.append({"pattern_id": pattern_id, "reason": "duplicate initial formula"})
+            continue
+        seen_elite_formulas.add(seed_key)
+        key = _candidate_key(individual)
+        if key in seen:
+            skipped.append({"pattern_id": pattern_id, "reason": "duplicate initial individual"})
+            continue
+        population[target_index] = individual
+        seen.add(key)
+        source_ids.append(pattern_id)
+    elite_count = len(source_ids)
+    return population, {
+        "enabled": True,
+        "requested_elite_count": requested,
+        "seeded_count": elite_count,
+        "new_random_count": config.population_size - elite_count,
+        "skipped": skipped,
+        "source_pattern_ids": source_ids,
+    }
 
 
 def _gate_rule(function: Callable[..., float], features: tuple[float, ...]) -> int:
@@ -234,7 +416,39 @@ def _worker_init(
     _WORKER_MIN_COVERAGE = min_activation_rate
 
 
-def _mate_individuals(first, second, max_depth: int, max_nodes: int):
+def _lineage_after_operator(
+    first, second, generation: int, operator_name: str
+) -> dict[str, object]:
+    first_lineage = getattr(first, "lineage", {})
+    second_lineage = getattr(second, "lineage", {})
+    parents = sorted(
+        set(first_lineage.get("parent_pattern_ids", ()))
+        | set(second_lineage.get("parent_pattern_ids", ()))
+    )
+    if not parents:
+        return {}
+    operators = sorted(
+        set(first_lineage.get("operators", ()))
+        | set(second_lineage.get("operators", ()))
+        | {operator_name}
+    )
+    return {
+        "seed_pattern_id": first_lineage.get("seed_pattern_id")
+        or second_lineage.get("seed_pattern_id"),
+        "parent_pattern_ids": parents,
+        "generation": generation,
+        "operators": operators,
+        "original_formulas": first_lineage.get("original_formulas")
+        or second_lineage.get("original_formulas", ()),
+        "parent_formulas": [
+            *map(str, first),
+            *([] if first is second else map(str, second)),
+        ],
+    }
+
+
+def _mate_individuals(first, second, max_depth: int, max_nodes: int, generation: int = 0):
+    lineage = _lineage_after_operator(first, second, generation, "crossover")
     for index, (left, right) in enumerate(zip(first, second, strict=True)):
         original_left, original_right = deepcopy(left), deepcopy(right)
         gp.cxOnePoint(left, right)
@@ -242,10 +456,20 @@ def _mate_individuals(first, second, max_depth: int, max_nodes: int):
             first[index] = original_left
         if right.height > max_depth or len(right) > max_nodes:
             second[index] = original_right
+    if lineage:
+        first.lineage = dict(lineage)
+        second.lineage = dict(lineage)
     return first, second
 
 
-def _mutate_individual(individual, pset: gp.PrimitiveSet, max_depth: int, max_nodes: int):
+def _mutate_individual(
+    individual,
+    pset: gp.PrimitiveSet,
+    max_depth: int,
+    max_nodes: int,
+    generation: int = 0,
+):
+    lineage = _lineage_after_operator(individual, individual, generation, "mutation")
     index = random.randrange(len(individual))
     original = deepcopy(individual[index])
     (mutated,) = gp.mutUniform(
@@ -257,6 +481,8 @@ def _mutate_individual(individual, pset: gp.PrimitiveSet, max_depth: int, max_no
         individual[index] = mutated
     else:
         individual[index] = original
+    if lineage:
+        individual.lineage = lineage
     return (individual,)
 
 
@@ -322,6 +548,7 @@ def _make_candidate(
         test_match_distribution=(
             tuple(int(value) for value in test["match_distribution"]) if test is not None else None
         ),
+        lineage=deepcopy(getattr(individual, "lineage", {})),
     )
 
 
@@ -331,6 +558,7 @@ def run_intermittent_search(
     outputs_per_event: int = 1,
     progress: Callable[[dict[str, int | float | str]], None] | None = None,
     run_label: str = "actual",
+    elite_seeds: tuple[dict[str, object], ...] = (),
 ) -> IntermittentSearchResult:
     """Search GP activation and outcome formulas; validation ranks all candidates."""
     if outputs_per_event not in {1, 6}:
@@ -338,10 +566,7 @@ def run_intermittent_search(
     global _WORKER_EXAMPLES, _WORKER_PSET, _WORKER_OUTPUTS, _WORKER_MIN_COVERAGE
     random.seed(config.seed)
     pset = _make_primitive_set(len(splits.train[0].features))
-    if not hasattr(creator, "IntermittentFitnessMax"):
-        creator.create("IntermittentFitnessMax", base.Fitness, weights=(1.0,))
-    if not hasattr(creator, "IntermittentIndividual"):
-        creator.create("IntermittentIndividual", list, fitness=creator.IntermittentFitnessMax)
+    _ensure_individual_types()
     toolbox = base.Toolbox()
     toolbox.register(
         "individual",
@@ -372,7 +597,7 @@ def run_intermittent_search(
         toolbox.register("map", map)
     toolbox.register("evaluate", _fitness)
 
-    population = toolbox.population(n=config.population_size)
+    population, seeding_report = _initial_population(pset, outputs_per_event, config, elite_seeds)
     archive: dict[str, tuple[float, object]] = {}
     try:
         for generation in range(config.generations + 1):
@@ -399,7 +624,10 @@ def run_intermittent_search(
                 objective = validation_score - penalty
                 key = _candidate_key(individual)
                 if key not in archive or objective > archive[key][0]:
-                    archive[key] = (objective, creator.IntermittentIndividual(deepcopy(individual)))
+                    archived = creator.IntermittentIndividual(deepcopy(individual))
+                    if getattr(individual, "lineage", None):
+                        archived.lineage = deepcopy(individual.lineage)
+                    archive[key] = (objective, archived)
             generation_best = max(population, key=lambda individual: individual.fitness.values[0])
             if progress:
                 current = _measure(
@@ -419,6 +647,8 @@ def run_intermittent_search(
                         "validation_coverage": current["activation_rate"],
                         "gate": str(generation_best[0]),
                         "formula": ";".join(map(str, generation_best[1:])),
+                        "elite_seeded_count": seeding_report["seeded_count"],
+                        "elite_requested_count": seeding_report["requested_elite_count"],
                     }
                 )
             if generation == config.generations:
@@ -426,11 +656,11 @@ def run_intermittent_search(
             offspring = list(map(toolbox.clone, toolbox.select(population, len(population))))
             for first, second in zip(offspring[::2], offspring[1::2], strict=False):
                 if random.random() < config.crossover_probability:
-                    toolbox.mate(first, second)
+                    toolbox.mate(first, second, generation=generation + 1)
                     del first.fitness.values, second.fitness.values
             for individual in offspring:
                 if random.random() < config.mutation_probability:
-                    toolbox.mutate(individual)
+                    toolbox.mutate(individual, generation=generation + 1)
                     del individual.fitness.values
             population = offspring
     finally:
@@ -464,6 +694,7 @@ def run_intermittent_search(
         tuple(example.round_number for example in splits.train),
         tuple(example.round_number for example in splits.validation),
         tuple(example.round_number for example in splits.test),
+        seeding_report,
     )
 
 

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -14,6 +15,7 @@ from typing import Any
 
 from .dataset import DrawDataset
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
+from .feature_schema import FEATURE_SCHEMA_VERSION, PRIMITIVE_SET_VERSION
 from .intermittent import IntermittentConfig
 from .paths import locate_checkpoint, project_path
 from .pattern_library import (
@@ -111,6 +113,7 @@ def run_research_schedule(
     data_hash = dataset_digest(dataset)
     config_payload = asdict(config)
     store = ExperimentStore(experiment_directory)
+    library = PatternLibrary(pattern_database)
     if resume:
         state = load_checkpoint(checkpoint)
         if not state.get("research_id"):
@@ -145,13 +148,48 @@ def run_research_schedule(
             )
         if state.get("dataset_sha256") != data_hash:
             raise ValueError("Cannot resume: checkpoint dataset hash differs from selected data.")
-        if state.get("config") != config_payload or tuple(state.get("engines", ())) != engines:
+        stored_config = {**asdict(IntermittentConfig()), **state.get("config", {})}
+        if stored_config != config_payload or tuple(state.get("engines", ())) != engines:
             raise ValueError("Cannot resume: checkpoint configuration or engine list differs.")
+        elite_state = state.get("elite_seeding") or {
+            "enabled": False,
+            "ratio": 0.2,
+            "selected_patterns": [],
+            "source_pattern_ids": [],
+            "skipped": [],
+            "policy": "legacy_unseeded",
+        }
+        if bool(elite_state.get("enabled")) != config.elite_seeding_enabled:
+            raise ValueError("Cannot resume: Elite Seeding setting differs from the checkpoint.")
+        if float(elite_state.get("ratio", 0.2)) != config.elite_seed_ratio:
+            raise ValueError("Cannot resume: Elite Seeding ratio differs from the checkpoint.")
+        state["elite_seeding"] = elite_state
     else:
         if checkpoint.exists():
             raise FileExistsError(f"Checkpoint already exists: {checkpoint}; use resume=True.")
+        research_id = str(uuid.uuid4())
+        if config.elite_seeding_enabled:
+            selected_patterns, skipped_patterns = library.select_elite_candidates(
+                feature_profile=config.feature_profile,
+                max_lag=config.max_lag,
+                max_candidates=math.ceil(config.population_size * config.elite_seed_ratio) * 2,
+            )
+        else:
+            selected_patterns, skipped_patterns = [], []
+        elite_state = {
+            "enabled": config.elite_seeding_enabled,
+            "ratio": config.elite_seed_ratio,
+            "source_pattern_ids": [item["pattern_id"] for item in selected_patterns],
+            "selected_patterns": selected_patterns,
+            "skipped": skipped_patterns,
+            "feature_profile": config.feature_profile,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "primitive_set_version": PRIMITIVE_SET_VERSION,
+            "policy": "validation_stability_complexity_diversity_v1",
+            "independent_test_used_for_selection": False,
+        }
         state = {
-            "research_id": str(uuid.uuid4()),
+            "research_id": research_id,
             "checkpoint_path": str(checkpoint),
             "resumable": True,
             "status": "queued",
@@ -163,6 +201,7 @@ def run_research_schedule(
                 dataset.records[-1].round_number,
             ],
             "config": config_payload,
+            "elite_seeding": elite_state,
             "engines": list(engines),
             "completed_runs": 0,
             "attempts": 0,
@@ -181,6 +220,7 @@ def run_research_schedule(
             ),
         }
     state["checkpoint_path"] = str(checkpoint)
+    state["config"] = config_payload
     state["resumable"] = True
     state.setdefault("completed_experiments", [])
     state["rng_resume"] = {
@@ -218,7 +258,7 @@ def run_research_schedule(
             stop_path.unlink(missing_ok=True)
 
     started = time.monotonic()
-    library = PatternLibrary(pattern_database)
+    elite_seeds = tuple(state.get("elite_seeding", {}).get("selected_patterns", ()))
     for failed in state["failed_runs"]:
         if failed.get("error_type") != "InterruptedProcess" or not failed.get("experiment_id"):
             continue
@@ -274,10 +314,20 @@ def run_research_schedule(
 
         try:
             engine = get_engine(engines[(run_index) % len(engines)])
-            result = engine.run(ResearchRunContext(dataset, run_config, store, report))
+            result = engine.run(ResearchRunContext(dataset, run_config, store, report, elite_seeds))
             result["research_id"] = state["research_id"]
             result["research_attempt"] = state["attempts"]
             store.save(result)
+            seeding = result.get("elite_seeding", {})
+            used_pattern_ids = sorted(
+                {
+                    str(pattern_id)
+                    for model_key in ("one_number_search", "six_number_set_search")
+                    for pattern_id in seeding.get(model_key, {}).get("source_pattern_ids", [])
+                }
+            )
+            if used_pattern_ids:
+                library.record_elite_use(used_pattern_ids, state["research_id"], data_hash)
             registered = register_experiment_candidates(result, library)
             exact_matches = register_experiment_exact_matches(result, library)
             state["completed_runs"] += 1

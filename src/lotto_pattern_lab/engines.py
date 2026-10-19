@@ -16,6 +16,7 @@ class ResearchRunContext:
     config: IntermittentConfig
     store: ExperimentStore
     progress: Callable[[dict[str, Any]], None] | None = None
+    elite_seeds: tuple[dict[str, object], ...] = ()
 
 
 class ResearchEngine(Protocol):
@@ -36,7 +37,11 @@ class IntermittentGPEngine:
 
     def run(self, context: ResearchRunContext) -> dict[str, Any]:
         return run_intermittent_experiment(
-            context.dataset, context.config, context.store, context.progress
+            context.dataset,
+            context.config,
+            context.store,
+            context.progress,
+            elite_seeds=context.elite_seeds,
         )
 
 

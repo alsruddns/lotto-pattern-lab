@@ -12,6 +12,12 @@ import numpy as np
 from .backtest import DataSplits, chronological_split
 from .dataset import DrawDataset, DrawRecord, make_random_dataset
 from .experiment import dataset_metadata
+from .feature_schema import (
+    CODE_VERSION,
+    FEATURE_SCHEMA_VERSION,
+    PRIMITIVE_SET_VERSION,
+    feature_mapping,
+)
 from .features import build_examples, feature_names
 from .hidden_states import causal_state_probabilities, fit_gaussian_hmm, online_change_points
 from .intermittent import (
@@ -83,6 +89,7 @@ def _candidate_dict(candidate: IntermittentCandidate) -> dict[str, object]:
         "test_score": candidate.test_score,
         "complexity": candidate.complexity,
         "height": candidate.height,
+        "lineage": candidate.lineage,
         "activation_events": list(candidate.activation_events),
         "active_gaps": list(candidate.active_gaps),
         "rule_active_rounds": [list(rounds) for rounds in candidate.rule_active_rounds],
@@ -188,6 +195,7 @@ def run_intermittent_experiment(
     store: ExperimentStore,
     progress: Callable[[dict[str, object]], None] | None = None,
     pattern_library: PatternLibrary | None = None,
+    elite_seeds: tuple[dict[str, object], ...] = (),
 ) -> dict[str, object]:
     """Run one- and six-number gated GP models and identical random-data searches."""
     experiment_id = str(uuid.uuid4())
@@ -218,7 +226,12 @@ def run_intermittent_experiment(
         )
 
     one_number = run_intermittent_search(
-        splits, config, outputs_per_event=1, progress=record_progress, run_label="actual_one_number"
+        splits,
+        config,
+        outputs_per_event=1,
+        progress=record_progress,
+        run_label="actual_one_number",
+        elite_seeds=elite_seeds,
     )
     set_model = run_intermittent_search(
         splits,
@@ -226,7 +239,41 @@ def run_intermittent_experiment(
         outputs_per_event=6,
         progress=record_progress,
         run_label="actual_six_number_set",
+        elite_seeds=elite_seeds,
     )
+    paired_unseeded = None
+    paired_unseeded_runtime = None
+    if one_number.seeding["seeded_count"] or set_model.seeding["seeded_count"]:
+        paired_started = time.perf_counter()
+        comparison_config = IntermittentConfig(
+            **{
+                **asdict(config),
+                "elite_seeding_enabled": False,
+                "elite_seed_ratio": 0.0,
+            }
+        )
+        comparison_one = run_intermittent_search(
+            splits,
+            comparison_config,
+            outputs_per_event=1,
+            progress=record_progress,
+            run_label="paired_unseeded_one_number",
+        )
+        comparison_set = run_intermittent_search(
+            splits,
+            IntermittentConfig(**{**asdict(comparison_config), "seed": config.seed + 1}),
+            outputs_per_event=6,
+            progress=record_progress,
+            run_label="paired_unseeded_six_number_set",
+        )
+        paired_unseeded = {
+            "same_dataset_and_splits": True,
+            "same_population_and_generations": True,
+            "initialization": "100% new random candidates",
+            "one_number_model": _search_dict(comparison_one),
+            "six_number_set_model": _search_dict(comparison_set),
+        }
+        paired_unseeded_runtime = time.perf_counter() - paired_started
     state_rows, state_by_round = _hypothetical_states(splits, config)
     change_points = [row for row in state_rows if row["online_change_point"]]
     one_dict = _search_dict(one_number)
@@ -259,7 +306,12 @@ def run_intermittent_experiment(
             )
         control_examples, control_splits = _splits_for(control_dataset, config)
         control_config = IntermittentConfig(
-            **{**asdict(config), "seed": config.seed + 10_007 + control_index}
+            **{
+                **asdict(config),
+                "seed": config.seed + 10_007 + control_index,
+                "elite_seeding_enabled": False,
+                "elite_seed_ratio": 0.0,
+            }
         )
         control_one = run_intermittent_search(
             control_splits,
@@ -310,6 +362,38 @@ def run_intermittent_experiment(
         "runtime_seconds": time.perf_counter() - timer,
         "dataset": dataset_metadata(dataset),
         "config": asdict(config),
+        "feature_schema": {
+            "feature_profile": config.feature_profile,
+            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "primitive_set_version": PRIMITIVE_SET_VERSION,
+            "feature_mapping": feature_mapping(config.feature_profile, config.max_lag),
+            "code_version": CODE_VERSION,
+        },
+        "elite_seeding": {
+            "enabled": config.elite_seeding_enabled,
+            "ratio": config.elite_seed_ratio,
+            "source_pattern_ids": sorted(
+                set(one_number.seeding.get("source_pattern_ids", ()))
+                | set(set_model.seeding.get("source_pattern_ids", ()))
+            ),
+            "one_number_search": one_number.seeding,
+            "six_number_set_search": set_model.seeding,
+            "random_controls": "unseeded controls; cumulative search history is not matched",
+            "control_comparability": "limited" if elite_seeds else "no elite seeds used",
+        },
+        "paired_unseeded_comparison": (
+            {
+                **paired_unseeded,
+                "runtime_seconds": paired_unseeded_runtime,
+                "comparison_seed": config.seed,
+                "interpretation": (
+                    "paired same-data GP initialization comparison; random-data controls do not "
+                    "replay cumulative history"
+                ),
+            }
+            if paired_unseeded is not None
+            else None
+        ),
         "feature_variables": {
             f"x{index}": name
             for index, name in enumerate(
@@ -355,9 +439,13 @@ def run_intermittent_experiment(
             ),
         },
         "p_value_resolution": 1 / (1 + len(random_controls)) if random_controls else None,
-        "inference_status": "tentative"
-        if len(random_controls) < 99
-        else "empirical_controls_adequate",
+        "inference_status": (
+            "exploratory_elite_control_limited"
+            if elite_seeds
+            else "tentative"
+            if len(random_controls) < 99
+            else "empirical_controls_adequate"
+        ),
         "progress": events,
     }
     store.save(output)

@@ -4,7 +4,6 @@ import argparse
 import json
 import sys
 from datetime import date
-from pathlib import Path
 
 from .dataset import load_csv, make_random_dataset, save_official_csv
 from .draw import Draw
@@ -157,6 +156,8 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     parser.add_argument("--min-activation", type=float, default=0.1)
     parser.add_argument("--hidden-states", type=int, default=3)
     parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
+    parser.add_argument("--elite-seeding", action="store_true")
+    parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
     parser.add_argument("--store", default="experiments")
     args = parser.parse_args(argv)
 
@@ -179,6 +180,8 @@ def _run_intermittent_cli(argv: list[str]) -> None:
         min_activation_rate=args.min_activation,
         hidden_states=args.hidden_states,
         feature_profile=args.feature_profile,
+        elite_seeding_enabled=args.elite_seeding,
+        elite_seed_ratio=args.elite_seed_ratio,
     )
 
     def report(event: dict[str, object]) -> None:
@@ -210,6 +213,8 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--engine", action="append", choices=SUPPORTED_ENGINES)
     parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
+    parser.add_argument("--elite-seeding", action="store_true")
+    parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
     parser.add_argument("--population", type=int, default=32)
     parser.add_argument("--generations", type=int, default=10)
     parser.add_argument("--workers", type=int, default=4)
@@ -229,6 +234,8 @@ def _run_research_cli(argv: list[str]) -> None:
         control_runs=args.controls,
         seed=args.seed,
         feature_profile=args.feature_profile,
+        elite_seeding_enabled=args.elite_seeding,
+        elite_seed_ratio=args.elite_seed_ratio,
     )
 
     def report(event: dict[str, object]) -> None:
