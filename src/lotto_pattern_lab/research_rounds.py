@@ -174,6 +174,7 @@ class ResearchRoundStore:
             "dataset_round_range",
             "config",
             "engines",
+            "pysr_config",
             "completed_runs",
             "completed_experiment_ids",
             "experiment_ids",
@@ -391,7 +392,22 @@ def summarize_experiment(
         "status": result.get("status"),
         "seed": result.get("seed", config.get("seed")),
         "runtime_seconds": result.get("runtime_seconds"),
-        "candidate_count": _progress_count(result) * int(config.get("population_size", 0)),
+        "candidate_count": int(
+            result.get("candidate_count")
+            or (_progress_count(result) * int(config.get("population_size", 0)))
+        ),
+        "engine": result.get("engine", "intermittent_gp"),
+        "engine_metrics": result.get("metrics"),
+        "numeric_random_controls": result.get("numeric_random_controls"),
+        "six_number_set_metrics": result.get("six_number_set_metrics"),
+        "evaluation_cache": result.get("evaluation_cache"),
+        "quality_classification_counts": {
+            status: sum(
+                candidate.get("classification") == status
+                for candidate in result.get("candidates", [])
+            )
+            for status in ("PROMISING", "NEEDS_REVIEW", "REDUNDANT", "LOW_VALUE", "INVALID")
+        },
         "new_pattern_count": (
             sum(bool(item.get("created")) for item in registered)
             if registration_metrics_available
@@ -1053,6 +1069,66 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         "- 완전 일치는 활성 6개 집합 예측의 번호 집합이 당첨 6개 번호와 모두 같은 경우로 셉니다. "
         "3+/4+/5+/6 기준은 활성 평가 회차를 분모로 합니다. 반복 평가와 고유 로또 회차는 구분합니다."
     )
+    pysr_trials = [
+        item
+        for item in summary.get("experiment_summaries", [])
+        if item.get("engine") == "pysr_symbolic_regression"
+    ]
+    if pysr_trials:
+        lines.extend(["", "## PySR 기호 회귀 결과"])
+        lines.append(f"- PySR 실험 수: {len(pysr_trials)}")
+        cache_reused = sum(
+            (item.get("evaluation_cache") or {}).get("reused", 0) for item in pysr_trials
+        )
+        cache_computed = sum(
+            (item.get("evaluation_cache") or {}).get("computed", 0) for item in pysr_trials
+        )
+        lines.append(
+            f"- 평가 캐시 재사용 / 신규 계산: {cache_reused} / {cache_computed}"
+        )
+        lines.append(
+            "- 캐시는 PySR 탐색 이후 동일 조건의 수식 점수 계산을 재사용합니다. "
+            "PySR 내부 개체군의 적합도 계산은 생략하지 않습니다."
+        )
+        for trial in pysr_trials[: 20 if detailed else 5]:
+            lines.append(
+                f"- 실험 `{trial.get('experiment_id')}` 검사 후보 "
+                f"{_display(trial.get('candidate_count'))}; 품질 분류 "
+                f"{_display(trial.get('quality_classification_counts'))}"
+            )
+            for target, phases in (trial.get("engine_metrics") or {}).items():
+                validation = phases.get("validation", {})
+                test = phases.get("independent_test", {})
+                lines.append(
+                    f"  - {target}: 검증 MAE {_display(validation.get('mae'))}, "
+                    f"독립 테스트 MAE {_display(test.get('mae'))}"
+                )
+                controls = trial.get("numeric_random_controls") or {}
+                if target in controls:
+                    control_validation = controls["validation"]
+                    lines.append(
+                        f"    - 검증 무작위 대조 적중률 "
+                        f"{_display(control_validation.get('random_control_hit_rate'))}, "
+                        f"반복 {control_validation.get('random_control_replicates')}, "
+                        f"경험적 p { _display(control_validation.get('empirical_p_value')) }"
+                    )
+            set_metrics = trial.get("six_number_set_metrics") or {}
+            for phase, phase_label in (("validation", "검증"), ("independent_test", "독립 테스트")):
+                counts = set_metrics.get(phase)
+                if counts:
+                    lines.append(
+                        f"  - 6개 집합 {phase_label}: 평균 적중 "
+                        f"{_display(counts.get('mean_hits'))}, "
+                        f"3+/4+/5+/6개 {counts.get('three_plus')}/"
+                        f"{counts.get('four_plus')}/{counts.get('five_plus')}/"
+                        f"{counts.get('six_exact')} (분모 {counts.get('target_round_count')})"
+                    )
+                    lines.append(
+                        f"    - 무작위 대조 평균 적중 "
+                        f"{_display(counts.get('random_control_mean_hits'))}, "
+                        f"반복 {counts.get('random_control_replicates')}, "
+                        f"경험적 p { _display(counts.get('empirical_p_value')) }"
+                    )
     lines.extend(["", "## 상위 후보 (검증 기반 정렬)"])
     candidates = [
         candidate

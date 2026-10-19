@@ -22,6 +22,7 @@ from lotto_pattern_lab.gp_config import GPConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
+from lotto_pattern_lab.pysr_backend import PySRConfig, optional_backend_status
 from lotto_pattern_lab.research import (
     _round_metadata,
     dataset_digest,
@@ -203,6 +204,7 @@ def _research_command(
     config: IntermittentConfig,
     duration_minutes: float,
     engines: tuple[str, ...] = ("intermittent_gp",),
+    pysr_config: PySRConfig | None = None,
     resume: bool = False,
     research_id: str | None = None,
 ) -> list[str]:
@@ -254,6 +256,29 @@ def _research_command(
         command.extend(("--engine", engine))
     if config.elite_seeding_enabled:
         command.append("--elite-seeding")
+    if pysr_config is not None:
+        command.extend(
+            (
+                "--pysr-target", pysr_config.target,
+                "--pysr-timeout", str(pysr_config.timeout_seconds),
+                "--pysr-iterations", str(pysr_config.niterations),
+                "--pysr-population", str(pysr_config.population_size),
+                "--pysr-populations", str(pysr_config.populations),
+                "--pysr-maxsize", str(pysr_config.maxsize),
+                "--pysr-maxdepth", str(pysr_config.maxdepth),
+                "--pysr-workers", str(pysr_config.workers),
+                "--pysr-train-ratio", str(pysr_config.train_ratio),
+                "--pysr-validation-ratio", str(pysr_config.validation_ratio),
+                "--pysr-controls", str(pysr_config.random_control_replicates),
+                "--pysr-guesses-json", json.dumps(list(pysr_config.guesses)),
+            )
+        )
+        for operator in pysr_config.binary_operators:
+            command.extend(("--pysr-binary-operator", operator))
+        for operator in pysr_config.unary_operators:
+            command.extend(("--pysr-unary-operator", operator))
+        if pysr_config.warm_start:
+            command.append("--pysr-warm-start")
     if resume:
         command.append("--resume")
     return command
@@ -297,6 +322,16 @@ with new_tab:
         st.error(f"기준 데이터를 읽지 못했습니다: {error}")
 
     with st.form("new_research_form"):
+        engine_choice = st.selectbox(
+            "탐색 엔진",
+            ("GP 유전 프로그래밍", "PySR 기호 회귀", "GP + PySR 비교 연구"),
+            key="new_research_engine",
+        )
+        engines = {
+            "GP 유전 프로그래밍": ("intermittent_gp",),
+            "PySR 기호 회귀": ("pysr_symbolic_regression",),
+            "GP + PySR 비교 연구": ("intermittent_gp", "pysr_symbolic_regression"),
+        }[engine_choice]
         profile = st.selectbox(
             "특징 프로파일", ("legacy", "calendar_round", "bonus_lag_v1"), key="new_profile"
         )
@@ -351,6 +386,83 @@ with new_tab:
         elite_ratio = st.slider(
             "기존 패턴 계승 비율", 0.0, 0.8, 0.2, 0.05, key="new_elite_seed_ratio"
         )
+        pysr_defaults = PySRConfig(feature_profile=profile)
+        pysr_targets = ("main_positions", "one_number") + (
+            ("bonus",) if profile in {"bonus_lag_v1", "calendar_round"} else ()
+        )
+        pysr_target = st.selectbox(
+            "PySR 탐색 목표", pysr_targets,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_target",
+        )
+        pysr_binary_operators = st.multiselect(
+            "PySR 이항 연산자", ("+", "-", "*", "/"), default=["+", "-", "*", "/"],
+            disabled="pysr_symbolic_regression" not in engines,
+            key="new_pysr_binary_operators",
+        )
+        pysr_unary_operators = st.multiselect(
+            "PySR 단항 연산자", ("square", "abs"), default=["square", "abs"],
+            disabled="pysr_symbolic_regression" not in engines,
+            key="new_pysr_unary_operators",
+        )
+        pysr_guesses_text = st.text_area(
+            "초기 추정 수식 (한 줄에 하나, 변수 x0, x1, ...)",
+            disabled="pysr_symbolic_regression" not in engines,
+            key="new_pysr_guesses",
+        )
+        pysr_warm_start = st.checkbox(
+            "실패 시 동일 난수 시드의 PySR 저장 상태에서 재개",
+            value=False,
+            disabled="pysr_symbolic_regression" not in engines,
+            help=(
+                "PySR의 저장된 hall-of-fame 상태를 from_file로 불러옵니다. "
+                "재개에는 해당 실행 폴더의 정상 PySR 체크포인트가 필요합니다."
+            ),
+            key="new_pysr_warm_start",
+        )
+        pysr_timeout = st.number_input(
+            "PySR 탐색 시간(초, 위치별 상한)", 1.0, 3600.0, 60.0, 1.0,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_timeout",
+        )
+        pysr_train_ratio = st.slider(
+            "PySR 학습 비율", 0.1, 0.8, 0.6, 0.05,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_train_ratio",
+        )
+        pysr_validation_ratio = st.slider(
+            "PySR 검증 비율", 0.05, 0.7, 0.2, 0.05,
+            disabled="pysr_symbolic_regression" not in engines,
+            key="new_pysr_validation_ratio",
+        )
+        col1, col2, col3 = st.columns(3)
+        pysr_iterations = col1.number_input(
+            "PySR 반복", 1, 10000, pysr_defaults.niterations,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_iterations",
+        )
+        pysr_population = col2.number_input(
+            "PySR 모집단", 8, 512, pysr_defaults.population_size,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_population",
+        )
+        pysr_populations = col3.number_input(
+            "PySR 모집단 수", 1, 32, pysr_defaults.populations,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_populations",
+        )
+        col1, col2, col3 = st.columns(3)
+        pysr_maxsize = col1.number_input(
+            "PySR 최대 복잡도", 4, 100, pysr_defaults.maxsize,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_maxsize",
+        )
+        pysr_maxdepth = col2.number_input(
+            "PySR 최대 깊이", 1, 100, pysr_defaults.maxdepth,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_maxdepth",
+        )
+        pysr_workers = col3.number_input(
+            "PySR CPU 워커", 1, 4, pysr_defaults.workers,
+            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_workers",
+        )
+        pysr_controls = st.number_input(
+            "PySR 무작위 대조 반복", 0, 100, pysr_defaults.random_control_replicates,
+            disabled="pysr_symbolic_regression" not in engines,
+            key="new_pysr_controls",
+        )
         submitted = st.form_submit_button("새 연구 시작", type="primary")
 
     effective_config = None
@@ -377,6 +489,42 @@ with new_tab:
     except ValueError as error:
         config_error = str(error)
         st.error(f"GP 설정을 확인하세요: {error}")
+    pysr_config = None
+    pysr_status = optional_backend_status()
+    if "pysr_symbolic_regression" in engines:
+        try:
+            pysr_config = PySRConfig(
+                target=pysr_target,
+                feature_profile=profile,
+                train_ratio=float(pysr_train_ratio),
+                validation_ratio=float(pysr_validation_ratio),
+                max_lag=int(max_lag),
+                timeout_seconds=float(pysr_timeout),
+                niterations=int(pysr_iterations),
+                population_size=int(pysr_population),
+                populations=int(pysr_populations),
+                maxsize=int(pysr_maxsize),
+                maxdepth=int(pysr_maxdepth),
+                workers=int(pysr_workers),
+                seed=int(seed),
+                binary_operators=tuple(pysr_binary_operators),
+                unary_operators=tuple(pysr_unary_operators),
+                guesses=tuple(
+                    line.strip()
+                    for line in pysr_guesses_text.splitlines()
+                    if line.strip()
+                ),
+                warm_start=bool(pysr_warm_start),
+                random_control_replicates=int(pysr_controls),
+            )
+            if not pysr_status["installed"]:
+                st.warning(
+                    "PySR is not installed in this Streamlit Python environment. "
+                    f"Install with: {pysr_status['install_command']}"
+                )
+        except ValueError as error:
+            config_error = str(error)
+            st.error(f"PySR 설정을 확인하세요: {error}")
     if new_dataset is not None and effective_config is not None:
         invalid_profile = (
             (profile == "calendar_round" and not new_integrity["all_draws_dated"])
@@ -387,7 +535,7 @@ with new_tab:
             st.error("선택한 특징 프로파일에 필요한 데이터 필드 또는 연속 회차가 없습니다.")
         st.subheader("시작 전 적용 설정")
         setting_rows = [
-            {"설정": "탐색 엔진", "값": "intermittent_gp"},
+            {"설정": "탐색 엔진", "값": ", ".join(engines)},
             {"설정": "특징 프로파일", "값": profile},
             {"설정": "프로파일 스키마", "값": feature_schema_version(profile)},
             {"설정": "연구 시간(분)", "값": duration_minutes},
@@ -416,6 +564,51 @@ with new_tab:
                 "값": f"{csv_path.name} / {new_dataset.verification_status}",
             },
         ]
+        if pysr_config is not None:
+            setting_rows.extend(
+                [
+                    {"설정": "PySR 목표", "값": pysr_config.target},
+                    {
+                        "설정": "PySR 반복·모집단·복잡도·깊이",
+                        "값": (
+                            f"{pysr_config.niterations} / {pysr_config.population_size} × "
+                            f"{pysr_config.populations} / {pysr_config.maxsize} / "
+                            f"{pysr_config.maxdepth}"
+                        ),
+                    },
+                    {
+                        "설정": "PySR 연산자 / 워커 / 시간",
+                        "값": (
+                            f"{pysr_config.binary_operators}, {pysr_config.unary_operators} / "
+                            f"{pysr_config.workers} / {pysr_config.timeout_seconds}s per target"
+                        ),
+                    },
+                    {
+                        "설정": "PySR 검증 분할",
+                        "값": (
+                            f"train {pysr_config.train_ratio:.0%} / "
+                            f"validation {pysr_config.validation_ratio:.0%} / "
+                            f"test {1-pysr_config.train_ratio-pysr_config.validation_ratio:.0%}"
+                        ),
+                    },
+                    {
+                        "설정": "PySR 무작위 대조 반복",
+                        "값": pysr_config.random_control_replicates,
+                    },
+                    {
+                        "설정": "초기 수식 수 / Julia 상태",
+                        "값": (
+                            f"{len(pysr_config.guesses)} / "
+                            f"{'설치됨' if pysr_status['installed'] else '미설치'}"
+                        ),
+                    },
+                ]
+            )
+        if len(engines) > 1:
+            st.info(
+                "비교 연구는 공통 난수 시드 흐름에서 엔진별 실험을 번갈아 실행합니다. "
+                "동일 후보의 paired 실험으로 해석하지 말고 각 엔진의 실행 시간을 별도로 확인하세요."
+            )
         st.dataframe(
             [{"설정": row["설정"], "값": str(row["값"])} for row in setting_rows],
             hide_index=True,
@@ -435,7 +628,10 @@ with new_tab:
         invalid_profile = True
 
     if submitted:
-        if new_dataset is None or effective_config is None or invalid_profile:
+        invalid_backend = (
+            "pysr_symbolic_regression" in engines and not pysr_status["installed"]
+        )
+        if new_dataset is None or effective_config is None or invalid_profile or invalid_backend:
             st.error("데이터 또는 설정 검증을 통과하지 못해 연구를 시작하지 않았습니다.")
         else:
             checkpoint_path = checkpoint_dir / (
@@ -457,7 +653,8 @@ with new_tab:
                         new_dataset.records[-1].round_number,
                     ],
                     "config": asdict(effective_config),
-                    "engines": ["intermittent_gp"],
+                    "engines": list(engines),
+                    "pysr_config": asdict(pysr_config) if pysr_config is not None else None,
                     "completed_runs": 0,
                     "target_duration_seconds": float(duration_minutes) * 60,
                     "completed_experiment_ids": [],
@@ -470,6 +667,8 @@ with new_tab:
                 checkpoint_path=checkpoint_path,
                 config=effective_config,
                 duration_minutes=float(duration_minutes),
+                engines=engines,
+                pysr_config=pysr_config,
                 research_id=research_id,
             )
             try:
@@ -555,9 +754,22 @@ with resume_tab:
         config_payload = {**state.get("config", {})}
         try:
             resume_config = IntermittentConfig(**config_payload)
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError):
             resume_config = None
-            st.error(f"저장된 연구 설정을 복원할 수 없습니다: {error}")
+        saved_pysr_config = state.get("pysr_config")
+        if isinstance(saved_pysr_config, dict):
+            saved_pysr_config = dict(saved_pysr_config)
+            for key in ("binary_operators", "unary_operators", "guesses"):
+                if key in saved_pysr_config:
+                    saved_pysr_config[key] = tuple(saved_pysr_config[key])
+            try:
+                resume_pysr_config = PySRConfig(**saved_pysr_config)
+            except (TypeError, ValueError):
+                resume_pysr_config = None
+        else:
+            resume_pysr_config = None
+        if "pysr_symbolic_regression" in state.get("engines", []) and resume_pysr_config is None:
+            st.error("저장된 PySR 설정을 복원할 수 없습니다.")
         if active:
             st.warning("같은 연구의 워커가 실행 중이므로 중복 재개를 막았습니다.")
         launch_path = Path(f"{path}.launch")
@@ -568,6 +780,10 @@ with resume_tab:
             and not selected_resume.get("_error")
             and selected_resume.get("_data_path") is not None
             and resume_config is not None
+            and (
+                "pysr_symbolic_regression" not in state.get("engines", [])
+                or resume_pysr_config is not None
+            )
             and status != "completed"
             and remaining is not None
             and remaining > 0
@@ -591,6 +807,7 @@ with resume_tab:
                 config=resume_config,
                 duration_minutes=remaining / 60,
                 engines=tuple(state.get("engines", ("intermittent_gp",))),
+                pysr_config=resume_pysr_config,
                 resume=True,
             )
             try:

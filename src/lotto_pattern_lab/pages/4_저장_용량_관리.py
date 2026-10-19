@@ -1,21 +1,46 @@
 """Korean storage inventory and explicit, preview-first maintenance controls."""
 
+import zipfile
+
 import streamlit as st
 
 from lotto_pattern_lab.storage_management import (
     DEFAULT_QUOTA_BYTES,
     checkpoint_cleanup_plan,
     compress_experiment,
+    compress_pysr_artifacts,
+    create_storage_backup,
     execute_checkpoint_cleanup,
     experiment_compression_plan,
     load_storage_settings,
+    pysr_artifact_compression_plan,
     save_storage_settings,
     storage_inventory,
     storage_over_quota,
+    verify_storage_backup,
 )
 
 st.set_page_config(page_title="저장 용량 관리", layout="wide")
 st.title("시스템 설정 · 저장 용량 관리")
+st.subheader("백업 및 복구 검증")
+st.caption("백업은 관리 대상 파일의 원본을 변경하지 않고 ZIP과 SHA-256 manifest를 생성합니다.")
+if st.button("연구 산출물 백업 생성"):
+    try:
+        backup = create_storage_backup()
+        st.success(
+            f"백업 검증 완료: {backup['file_count']}개 파일, "
+            f"{backup['backup_bytes'] / 1024**2:.2f} MiB → {backup['path']}"
+        )
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        st.error(f"백업 실패: {error}")
+backup_path = st.text_input("검증할 백업 ZIP 경로")
+if st.button("백업 무결성 검사", disabled=not backup_path.strip()):
+    try:
+        verification = verify_storage_backup(backup_path.strip())
+        st.success(f"SHA-256 검사 완료: {verification['verified_files']}개 파일")
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        st.error(f"백업 검사 실패: {error}")
+
 st.caption(
     "실험 원본과 추천 기록은 자동 삭제하지 않습니다. 기존 실험 JSON의 압축과 체크포인트 정리는 "
     "대상 및 예상 확보 용량을 확인하고 각각 실행을 승인해야 합니다."
@@ -45,6 +70,39 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
 )
+st.subheader("파일 유형별 사용량")
+st.dataframe(
+    [
+        {
+            "확장자": extension,
+            "파일 수": data["file_count"],
+            "용량 (MiB)": round(data["bytes"] / 1024**2, 3),
+        }
+        for extension, data in sorted(
+            inventory["file_types"].items(), key=lambda item: item[1]["bytes"], reverse=True
+        )
+    ],
+    use_container_width=True,
+    hide_index=True,
+)
+if inventory["research_usage"]:
+    st.subheader("연구 ID별 원본 JSON 사용량")
+    st.dataframe(
+        [
+            {
+                "연구 ID": research_id,
+                "파일 수": data["file_count"],
+                "용량 (MiB)": round(data["bytes"] / 1024**2, 3),
+            }
+            for research_id, data in sorted(
+                inventory["research_usage"].items(),
+                key=lambda item: item[1]["bytes"],
+                reverse=True,
+            )
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 st.subheader("보존 및 경고 설정")
 quota_gib = st.number_input(
@@ -126,6 +184,31 @@ else:
 if experiment_plan["protected"]:
     with st.expander("압축 후보에서 제외된 파일"):
         st.dataframe(experiment_plan["protected"], use_container_width=True, hide_index=True)
+
+pysr_plan = pysr_artifact_compression_plan()
+st.subheader("PySR 결과물 압축 미리보기")
+st.caption(
+    "완료 연구의 hall-of-fame CSV만 압축합니다. 현재·복구 가능 연구와 "
+    "PySR 모델 checkpoint.pkl은 보존합니다."
+)
+if pysr_plan["candidates"]:
+    st.dataframe(pysr_plan["candidates"], use_container_width=True, hide_index=True)
+    st.write(f"예상 절감량: {pysr_plan['expected_bytes_freed'] / 1024:.1f} KiB")
+    approve_pysr_archive = st.checkbox(
+        "완료된 PySR CSV의 gzip 보관에 동의합니다.", key="approve_pysr_archive"
+    )
+    if st.button("완료 PySR CSV 압축", disabled=not approve_pysr_archive):
+        outcome = compress_pysr_artifacts()
+        st.success(
+            f"{len(outcome['compressed'])}개 압축, "
+            f"{outcome['bytes_freed'] / 1024:.1f} KiB 절감"
+        )
+        st.rerun()
+else:
+    st.info("압축 대상인 완료 PySR CSV가 없습니다.")
+if pysr_plan["protected"]:
+    with st.expander("보호된 PySR 결과물"):
+        st.dataframe(pysr_plan["protected"], use_container_width=True, hide_index=True)
 
 st.subheader("체크포인트 정리 미리보기")
 checkpoint_plan = checkpoint_cleanup_plan(keep=int(keep_count))

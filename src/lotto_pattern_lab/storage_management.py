@@ -4,6 +4,9 @@ import gzip
 import hashlib
 import json
 import os
+import sqlite3
+import tempfile
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -11,7 +14,15 @@ from typing import Any
 from .paths import PROJECT_ROOT, project_path
 from .storage import _atomic_bytes, _atomic_json, _serialize_result
 
-MANAGED_DIRS = ("experiments", "checkpoints", "artifacts", "predictions", "logs")
+MANAGED_DIRS = (
+    "experiments",
+    "checkpoints",
+    "artifacts",
+    "predictions",
+    "logs",
+    "data/database",
+    "pysr_runs",
+)
 DEFAULT_QUOTA_BYTES = 10 * 1024**3
 DEFAULT_CHECKPOINT_KEEP = 5
 EXPERIMENT_COMPRESSION_THRESHOLD = 1_000_000
@@ -48,26 +59,150 @@ def save_storage_settings(settings: dict[str, Any], path: str | Path = SETTINGS_
 def storage_inventory(root: str | Path = ".") -> dict[str, Any]:
     base = project_path(root)
     folders: list[dict[str, Any]] = []
+    file_types: dict[str, dict[str, int]] = {}
+    research_usage: dict[str, dict[str, int]] = {}
     for name in MANAGED_DIRS:
         folder = base / name
         files = [path for path in folder.rglob("*") if path.is_file()] if folder.exists() else []
+        folder_bytes = 0
+        for path in files:
+            size = path.stat().st_size
+            folder_bytes += size
+            extension = ".".join(path.name.split(".")[1:]) or "[no extension]"
+            bucket = file_types.setdefault(extension, {"file_count": 0, "bytes": 0})
+            bucket["file_count"] += 1
+            bucket["bytes"] += size
+            if path.suffix.lower() == ".json" and not path.name.endswith(".details.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                research_id = payload.get("research_id") or payload.get("research_round_id")
+                if research_id:
+                    record = research_usage.setdefault(
+                        str(research_id), {"file_count": 0, "bytes": 0}
+                    )
+                    record["file_count"] += 1
+                    record["bytes"] += size
         folders.append(
             {
                 "folder": name,
                 "exists": folder.exists(),
                 "file_count": len(files),
-                "bytes": sum(path.stat().st_size for path in files),
+                "bytes": folder_bytes,
             }
         )
     return {
         "folders": folders,
         "total_bytes": sum(folder["bytes"] for folder in folders),
+        "file_types": file_types,
+        "research_usage": research_usage,
         "scanned_at": datetime.now(UTC).isoformat(),
     }
 
 
 def storage_over_quota(inventory: dict[str, Any], quota_bytes: int) -> bool:
     return int(inventory.get("total_bytes", 0)) > quota_bytes
+
+
+def create_storage_backup(
+    destination_directory: str | Path = "backups", root: str | Path = "."
+) -> dict[str, Any]:
+    """Create an atomic, checksum-indexed backup of managed research files."""
+    base = project_path(root)
+    target_directory = project_path(destination_directory)
+    target_directory.mkdir(parents=True, exist_ok=True)
+    files = [
+        path
+        for name in MANAGED_DIRS
+        for folder in [base / name]
+        if folder.exists()
+        for path in folder.rglob("*")
+        if path.is_file()
+        and not path.name.endswith((".tmp", ".lock", "-wal", "-shm"))
+    ]
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+    destination = target_directory / f"research_backup_{timestamp}.zip"
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.stem}_", suffix=".tmp", dir=target_directory
+    )
+    os.close(handle)
+    temporary = Path(temporary_name)
+    manifest: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(
+            temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as archive:
+            for source in files:
+                relative = source.relative_to(base).as_posix()
+                if source.suffix.lower() in {".sqlite", ".db"}:
+                    snapshot_path = temporary.with_name(f"{temporary.name}_{source.name}")
+                    source_connection = sqlite3.connect(source, timeout=30)
+                    snapshot_connection = sqlite3.connect(snapshot_path)
+                    try:
+                        source_connection.backup(snapshot_connection)
+                    finally:
+                        snapshot_connection.close()
+                        source_connection.close()
+                    try:
+                        content = snapshot_path.read_bytes()
+                    finally:
+                        snapshot_path.unlink(missing_ok=True)
+                else:
+                    content = source.read_bytes()
+                archive.writestr(relative, content)
+                manifest.append(
+                    {
+                        "path": relative,
+                        "bytes": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                )
+            archive.writestr(
+                "_backup_manifest.json",
+                json.dumps(
+                    {"schema_version": 1, "files": manifest},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        with zipfile.ZipFile(temporary, "r") as archive:
+            _verify_backup_archive(archive)
+        os.replace(temporary, destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return {
+        "path": str(destination),
+        "file_count": len(manifest),
+        "source_bytes": sum(item["bytes"] for item in manifest),
+        "backup_bytes": destination.stat().st_size,
+    }
+
+
+def _verify_backup_archive(archive: zipfile.ZipFile) -> dict[str, Any]:
+    try:
+        manifest = json.loads(archive.read("_backup_manifest.json").decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Backup manifest is missing or invalid.") from error
+    checked = 0
+    for item in manifest.get("files", []):
+        name = str(item.get("path", ""))
+        if not name or name.startswith("/") or ".." in Path(name).parts:
+            raise ValueError("Backup contains an unsafe file path.")
+        content = archive.read(name)
+        if len(content) != int(item["bytes"]):
+            raise ValueError(f"Backup size verification failed for {name}.")
+        if hashlib.sha256(content).hexdigest() != item["sha256"]:
+            raise ValueError(f"Backup checksum verification failed for {name}.")
+        checked += 1
+    return {"valid": checked == len(manifest.get("files", [])), "verified_files": checked}
+
+
+def verify_storage_backup(path: str | Path) -> dict[str, Any]:
+    backup = project_path(path)
+    with zipfile.ZipFile(backup, "r") as archive:
+        return _verify_backup_archive(archive)
 
 
 def _pid_is_alive(pid: Any) -> bool:
@@ -173,6 +308,112 @@ def experiment_compression_plan(
         "protected": protected,
         "expected_bytes_freed": sum(item["expected_bytes_freed"] for item in candidates),
         "threshold_bytes": threshold,
+    }
+
+
+def pysr_artifact_compression_plan(
+    directory: str | Path = "artifacts/pysr_runs",
+    checkpoint_directory: str | Path = "checkpoints",
+) -> dict[str, Any]:
+    """Preview compressible PySR equation exports; protect model checkpoints and active runs."""
+    folder = project_path(directory)
+    checkpoint_root = project_path(checkpoint_directory)
+    statuses: dict[str, str] = {}
+    for checkpoint_path in checkpoint_root.glob("research*.json"):
+        state = _read_checkpoint(checkpoint_path)
+        if state and state.get("research_id"):
+            statuses[str(state["research_id"])] = str(state.get("status", "unknown"))
+    candidates: list[dict[str, Any]] = []
+    protected: list[dict[str, Any]] = []
+    if not folder.exists():
+        return {"candidates": candidates, "protected": protected, "expected_bytes_freed": 0}
+    for path in folder.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(folder)
+        research_id = relative.parts[0] if len(relative.parts) > 1 else None
+        if path.name not in {"hall_of_fame.csv", "hall_of_fame.csv.bak"}:
+            protected.append({"path": str(path), "reason": "model state or unknown PySR artifact"})
+            continue
+        if research_id is None or statuses.get(research_id) != "completed":
+            protected.append(
+                {
+                    "path": str(path),
+                    "reason": "research is active, recoverable, or has no completed checkpoint",
+                }
+            )
+            continue
+        destination = Path(f"{path}.gz")
+        if destination.exists():
+            protected.append({"path": str(path), "reason": "compressed copy already exists"})
+            continue
+        content = path.read_bytes()
+        compressed = gzip.compress(content, compresslevel=6, mtime=0)
+        candidates.append(
+            {
+                "path": str(path),
+                "compressed_path": str(destination),
+                "original_bytes": len(content),
+                "compressed_bytes": len(compressed),
+                "expected_bytes_freed": max(0, len(content) - len(compressed)),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    return {
+        "candidates": candidates,
+        "protected": protected,
+        "expected_bytes_freed": sum(item["expected_bytes_freed"] for item in candidates),
+    }
+
+
+def compress_pysr_artifacts(
+    directory: str | Path = "artifacts/pysr_runs",
+    checkpoint_directory: str | Path = "checkpoints",
+) -> dict[str, Any]:
+    """Losslessly gzip completed-run equation CSVs after rechecking run state and checksums."""
+    plan = pysr_artifact_compression_plan(directory, checkpoint_directory)
+    checkpoint_root = project_path(checkpoint_directory)
+    outcomes: list[dict[str, Any]] = []
+    for item in plan["candidates"]:
+        source = project_path(item["path"])
+        compressed_path = project_path(item["compressed_path"])
+        research_id = source.relative_to(project_path(directory)).parts[0]
+        current_status = None
+        for checkpoint_path in checkpoint_root.glob("research*.json"):
+            state = _read_checkpoint(checkpoint_path)
+            if state and str(state.get("research_id")) == research_id:
+                current_status = state.get("status")
+                break
+        if current_status != "completed":
+            continue
+        content = source.read_bytes()
+        if hashlib.sha256(content).hexdigest() != item["sha256"]:
+            raise ValueError(f"PySR artifact changed after preview: {source}")
+        compressed = gzip.compress(content, compresslevel=6, mtime=0)
+        _atomic_bytes(compressed_path, compressed)
+        decompressed = gzip.decompress(compressed_path.read_bytes())
+        if hashlib.sha256(decompressed).hexdigest() != item["sha256"]:
+            compressed_path.unlink(missing_ok=True)
+            raise ValueError(f"PySR artifact compression verification failed: {source}")
+        current_status = None
+        for checkpoint_path in checkpoint_root.glob("research*.json"):
+            state = _read_checkpoint(checkpoint_path)
+            if state and str(state.get("research_id")) == research_id:
+                current_status = state.get("status")
+                break
+        if current_status != "completed":
+            continue
+        source.unlink()
+        outcomes.append(
+            {
+                "path": str(source),
+                "compressed_path": str(compressed_path),
+                "bytes_freed": max(0, item["original_bytes"] - item["compressed_bytes"]),
+            }
+        )
+    return {
+        "compressed": outcomes,
+        "bytes_freed": sum(item["bytes_freed"] for item in outcomes),
     }
 
 

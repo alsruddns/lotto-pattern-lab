@@ -8,11 +8,15 @@ from lotto_pattern_lab.storage import ExperimentStore
 from lotto_pattern_lab.storage_management import (
     checkpoint_cleanup_plan,
     compress_experiment,
+    compress_pysr_artifacts,
+    create_storage_backup,
     experiment_compression_plan,
     load_storage_settings,
+    pysr_artifact_compression_plan,
     save_storage_settings,
     storage_inventory,
     storage_over_quota,
+    verify_storage_backup,
 )
 
 
@@ -137,6 +141,67 @@ def test_storage_inventory_and_quota_warning(tmp_path: Path) -> None:
     assert report["folders"][0]["file_count"] == 1
     assert storage_over_quota(report, 16)
     assert not storage_over_quota(report, 17)
+
+
+def test_storage_inventory_counts_sqlite_pysr_artifacts_and_research_usage(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "data" / "database" / "patterns.sqlite"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"db" * 7)
+    pysr_file = tmp_path / "artifacts" / "pysr_runs" / "model.pkl"
+    pysr_file.parent.mkdir(parents=True)
+    pysr_file.write_bytes(b"pysr" * 5)
+    (tmp_path / "experiments").mkdir()
+    (tmp_path / "experiments" / "trial.json").write_text(
+        json.dumps({"research_id": "research-x"}), encoding="utf-8"
+    )
+
+    report = storage_inventory(tmp_path)
+
+    assert report["file_types"]["sqlite"]["bytes"] == 14
+    assert report["file_types"]["pkl"]["bytes"] == 20
+    assert report["research_usage"]["research-x"]["file_count"] == 1
+
+
+def test_storage_backup_creates_and_verifies_hash_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "experiments" / "study.json"
+    source.parent.mkdir()
+    source.write_text(json.dumps({"research_id": "r1", "status": "completed"}), encoding="utf-8")
+
+    result = create_storage_backup(tmp_path / "backups", root=tmp_path)
+
+    assert result["file_count"] == 1
+    assert verify_storage_backup(result["path"]) == {"valid": True, "verified_files": 1}
+    assert source.is_file()
+
+
+def test_pysr_artifact_plan_preserves_recoverable_runs_and_checkpoints(tmp_path: Path) -> None:
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    pysr_root = tmp_path / "artifacts" / "pysr_runs"
+    completed_id = "research-completed"
+    paused_id = "research-paused"
+    for research_id, status in ((completed_id, "completed"), (paused_id, "paused")):
+        (checkpoints / f"research_{research_id}.json").write_text(
+            json.dumps({"research_id": research_id, "status": status}), encoding="utf-8"
+        )
+        run_dir = pysr_root / research_id / "seed-2"
+        run_dir.mkdir(parents=True)
+        (run_dir / "hall_of_fame.csv").write_text("equation,loss\nx0,1\n", encoding="utf-8")
+        (run_dir / "checkpoint.pkl").write_bytes(b"model state")
+
+    plan = pysr_artifact_compression_plan(pysr_root, checkpoints)
+    assert len(plan["candidates"]) == 1
+    assert any("recoverable" in item["reason"] for item in plan["protected"])
+
+    result = compress_pysr_artifacts(pysr_root, checkpoints)
+    completed_dir = pysr_root / completed_id / "seed-2"
+    assert len(result["compressed"]) == 1
+    assert not (completed_dir / "hall_of_fame.csv").exists()
+    assert (completed_dir / "hall_of_fame.csv.gz").is_file()
+    assert (completed_dir / "checkpoint.pkl").read_bytes() == b"model state"
+    assert (pysr_root / paused_id / "seed-2" / "hall_of_fame.csv").is_file()
 
 
 def test_storage_settings_default_safe_and_round_trip(tmp_path: Path) -> None:

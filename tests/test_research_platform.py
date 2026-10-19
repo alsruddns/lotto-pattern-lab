@@ -490,7 +490,7 @@ def test_periodicity_report_finds_a_repeat_and_labels_diagnostic_only() -> None:
 def test_pysr_backend_is_optional_and_does_not_initialize_julia() -> None:
     status = optional_backend_status()
     assert (
-        status["python_version_requirement"] == ">=3.10 (declared by current PySR project metadata)"
+        status["python_version_requirement"] == ">=3.9 (PySR 2.7.x)"
     )
     assert status["runtime_verified"] is False
     if not status["installed"]:

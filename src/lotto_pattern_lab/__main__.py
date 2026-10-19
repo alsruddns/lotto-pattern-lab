@@ -16,7 +16,8 @@ from .official_data import FIRST_SUPPORTED_ROUND, fetch_official_dataset
 from .paths import project_path
 from .pattern_library import PatternLibrary
 from .patterns import summarize_draw
-from .research import SUPPORTED_ENGINES, request_stop, run_research_schedule
+from .pysr_backend import PySRConfig
+from .research import DEFAULT_ENGINES, SUPPORTED_ENGINES, request_stop, run_research_schedule
 from .storage import ExperimentStore
 
 GP_DEFAULTS = GPConfig()
@@ -194,7 +195,6 @@ def _run_intermittent_cli(argv: list[str]) -> None:
         elite_seeding_enabled=args.elite_seeding,
         elite_seed_ratio=args.elite_seed_ratio,
     )
-
     def report(event: dict[str, object]) -> None:
         print(
             f"[{event['run']}] 세대 {event['generation']}/{event['generations']} "
@@ -244,6 +244,25 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument("--min-activation", type=float, default=0.1)
     parser.add_argument("--hidden-states", type=int, default=3)
     parser.add_argument("--seed", type=int, default=GP_DEFAULTS.seed)
+    parser.add_argument(
+        "--pysr-target",
+        choices=("one_number", "main_positions", "bonus"),
+        default="main_positions",
+    )
+    parser.add_argument("--pysr-timeout", type=float, default=60.0)
+    parser.add_argument("--pysr-iterations", type=int, default=20)
+    parser.add_argument("--pysr-population", type=int, default=32)
+    parser.add_argument("--pysr-populations", type=int, default=4)
+    parser.add_argument("--pysr-maxsize", type=int, default=24)
+    parser.add_argument("--pysr-maxdepth", type=int, default=8)
+    parser.add_argument("--pysr-workers", type=int, default=1)
+    parser.add_argument("--pysr-train-ratio", type=float, default=0.6)
+    parser.add_argument("--pysr-validation-ratio", type=float, default=0.2)
+    parser.add_argument("--pysr-binary-operator", action="append")
+    parser.add_argument("--pysr-unary-operator", action="append")
+    parser.add_argument("--pysr-guesses-json", default="[]")
+    parser.add_argument("--pysr-warm-start", action="store_true")
+    parser.add_argument("--pysr-controls", type=int, default=3)
     args = parser.parse_args(argv)
     if args.stop:
         print(f"Stop requested: {request_stop(args.checkpoint)}")
@@ -267,6 +286,26 @@ def _run_research_cli(argv: list[str]) -> None:
         elite_seeding_enabled=args.elite_seeding,
         elite_seed_ratio=args.elite_seed_ratio,
     )
+    pysr_config = PySRConfig(
+        target=args.pysr_target,
+        feature_profile=args.feature_profile,
+        train_ratio=args.pysr_train_ratio,
+        validation_ratio=args.pysr_validation_ratio,
+        max_lag=args.max_lag,
+        timeout_seconds=args.pysr_timeout,
+        niterations=args.pysr_iterations,
+        population_size=args.pysr_population,
+        populations=args.pysr_populations,
+        maxsize=args.pysr_maxsize,
+        maxdepth=args.pysr_maxdepth,
+        workers=args.pysr_workers,
+        seed=args.seed,
+        binary_operators=tuple(args.pysr_binary_operator or PySRConfig().binary_operators),
+        unary_operators=tuple(args.pysr_unary_operator or PySRConfig().unary_operators),
+        guesses=tuple(json.loads(args.pysr_guesses_json)),
+        warm_start=args.pysr_warm_start,
+        random_control_replicates=args.pysr_controls,
+    )
 
     def report(event: dict[str, object]) -> None:
         detail = event.get("event", {})
@@ -287,7 +326,10 @@ def _run_research_cli(argv: list[str]) -> None:
         research_id=args.research_id,
         resume=args.resume,
         max_runs=args.max_runs,
-        engines=tuple(args.engine or SUPPORTED_ENGINES),
+        engines=tuple(args.engine or DEFAULT_ENGINES),
+        pysr_config=pysr_config
+        if "pysr_symbolic_regression" in (args.engine or ())
+        else None,
         progress=report,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

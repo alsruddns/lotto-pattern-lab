@@ -16,6 +16,7 @@ from typing import Any
 from .atomic_io import AtomicWriteError, atomic_write_bytes, interprocess_lock
 from .dataset import DrawDataset
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
+from .evaluation_cache import EvaluationCache
 from .feature_schema import PRIMITIVE_SET_VERSION, feature_schema_version
 from .intermittent import IntermittentConfig
 from .paths import locate_checkpoint, project_path
@@ -24,6 +25,7 @@ from .pattern_library import (
     register_experiment_candidates,
     register_experiment_exact_matches,
 )
+from .pysr_backend import PySRConfig
 from .research_rounds import (
     SUMMARY_SCHEMA_VERSION,
     ResearchRoundStore,
@@ -38,6 +40,7 @@ from .storage_management import run_automatic_checkpoint_cleanup
 SUPPORTED_ENGINES = tuple(
     engine_id for engine_id, engine in ENGINE_REGISTRY.items() if engine.implemented
 )
+DEFAULT_ENGINES = ("intermittent_gp",)
 
 
 def dataset_digest(dataset: DrawDataset) -> str:
@@ -181,7 +184,8 @@ def run_research_schedule(
     pattern_database: str | Path = "data/database/patterns.sqlite",
     resume: bool = False,
     max_runs: int | None = None,
-    engines: tuple[str, ...] = SUPPORTED_ENGINES,
+    engines: tuple[str, ...] = DEFAULT_ENGINES,
+    pysr_config: PySRConfig | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run complete seeded experiments until time, count, or a stop request is reached.
@@ -195,6 +199,8 @@ def run_research_schedule(
         raise ValueError("max_runs must be positive when provided.")
     if not engines or any(engine not in SUPPORTED_ENGINES for engine in engines):
         raise ValueError(f"Supported engines are: {', '.join(SUPPORTED_ENGINES)}")
+    if "pysr_symbolic_regression" in engines and pysr_config is None:
+        raise ValueError("PySR engine requires an explicit PySRConfig.")
     checkpoint = project_path(checkpoint_path)
     run_automatic_checkpoint_cleanup()
     pause_path = pause_request_path(checkpoint)
@@ -242,6 +248,12 @@ def run_research_schedule(
         stored_config = {**asdict(IntermittentConfig()), **state.get("config", {})}
         if stored_config != config_payload or tuple(state.get("engines", ())) != engines:
             raise ValueError("Cannot resume: checkpoint configuration or engine list differs.")
+        stored_pysr_config = state.get("pysr_config")
+        requested_pysr_config = (
+            json.loads(json.dumps(asdict(pysr_config))) if pysr_config is not None else None
+        )
+        if stored_pysr_config != requested_pysr_config:
+            raise ValueError("Cannot resume: PySR configuration differs from the checkpoint.")
         elite_state = state.get("elite_seeding") or {
             "enabled": False,
             "ratio": 0.2,
@@ -297,6 +309,7 @@ def run_research_schedule(
             "target_duration_seconds": float(duration_seconds),
             "elite_seeding": elite_state,
             "engines": list(engines),
+            "pysr_config": asdict(pysr_config) if pysr_config is not None else None,
             "completed_runs": 0,
             "attempts": 0,
             "completed_experiments": [],
@@ -500,7 +513,7 @@ def run_research_schedule(
             if event.get("experiment_id"):
                 state["in_progress"]["experiment_id"] = event["experiment_id"]
             state["current_progress"] = {
-                "engine": "intermittent_gp",
+                "engine": engines[run_index % len(engines)],
                 "research_id": state["research_id"],
                 "run_index": run_index + 1,
                 "event": event,
@@ -519,9 +532,58 @@ def run_research_schedule(
 
         try:
             engine = get_engine(engines[(run_index) % len(engines)])
-            result = engine.run(ResearchRunContext(dataset, run_config, store, report, elite_seeds))
+            trial_pysr_config = (
+                replace(
+                    pysr_config,
+                    seed=run_seed,
+                    run_directory=(
+                        pysr_config.run_directory
+                        or str(
+                            project_path("artifacts/pysr_runs")
+                            / str(state["research_id"])
+                            / (
+                                f"seed-{run_seed}"
+                                if pysr_config.warm_start
+                                else f"seed-{run_seed}-attempt-{state['attempts']}"
+                            )
+                        ),
+                    ),
+                )
+                if pysr_config is not None
+                else None
+            )
+            result = engine.run(
+                ResearchRunContext(
+                    dataset,
+                    run_config,
+                    store,
+                    report,
+                    elite_seeds,
+                    trial_pysr_config,
+                    project_path(pattern_database),
+                )
+            )
             result["research_id"] = state["research_id"]
             result["research_attempt"] = state["attempts"]
+            if result.get("engine") == "pysr_symbolic_regression":
+                cache = EvaluationCache(pattern_database)
+                schema_version = feature_schema_version(
+                    str(result.get("config", {}).get("feature_profile", "legacy"))
+                )
+                result["symbolic_pattern_ids"] = [
+                    cache.register_symbolic_candidate(
+                        candidate,
+                        experiment_id=str(result["experiment_id"]),
+                        research_id=str(state["research_id"]),
+                        dataset_sha256=str(result["dataset_sha256"]),
+                        engine_version=str(result["engine_version"]),
+                        feature_profile=str(
+                            result.get("config", {}).get("feature_profile", "legacy")
+                        ),
+                        feature_schema_version=schema_version,
+                    )
+                    for candidate in result.get("candidates", [])
+                ]
             store.save(result)
             seeding = result.get("elite_seeding", {})
             used_pattern_ids = sorted(
@@ -602,16 +664,17 @@ def run_research_schedule(
             state["last_run_summary"] = {
                 "experiment_id": result["experiment_id"],
                 "runtime_seconds": result["runtime_seconds"],
-                "engine": "intermittent_gp",
+                "engine": result.get("engine", "intermittent_gp"),
                 "exact_matches": len(exact_matches),
                 "patterns_registered": len(registered),
-                "one_number_test_score": result["one_number_model"]["selected"]["test_score"],
-                "six_number_test_score": result["six_number_set_model"]["selected"]["test_score"],
-                "bonus_number_test_score": (
-                    result.get("bonus_number_model", {}).get("selected", {}).get("test_score")
-                    if result.get("bonus_number_model")
-                    else None
-                ),
+                "one_number_test_score": result.get("one_number_model", {})
+                .get("selected", {})
+                .get("test_score"),
+                "six_number_test_score": result.get("six_number_set_model", {})
+                .get("selected", {})
+                .get("test_score"),
+                "engine_metrics": result.get("metrics"),
+                "six_number_set_metrics": result.get("six_number_set_metrics"),
                 "prize_tier_backtest": result.get("prize_tier_backtest"),
             }
             state.pop("in_progress", None)
@@ -708,6 +771,7 @@ def _round_metadata(state: dict[str, Any]) -> dict[str, Any]:
         "dataset_round_range": state.get("dataset_round_range"),
         "config": state.get("config", {}),
         "engines": state.get("engines", []),
+        "pysr_config": state.get("pysr_config"),
         "completed_runs": state.get("completed_runs", 0),
         "failed_runs": _unresolved_failure_count(state),
         "target_duration_seconds": state.get("target_duration_seconds"),
