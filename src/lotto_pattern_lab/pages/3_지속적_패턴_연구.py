@@ -1320,6 +1320,68 @@ else:
     st.info("패턴 라이브러리에 등록된 패턴이 없습니다.")
 
 
+@st.fragment(run_every="5s")
+def render_queue_summary(queue_id: str) -> None:
+    store = ResearchQueueStore(QUEUE_DB)
+    queue = store.queue(queue_id)
+    items = store.list_items(queue_id)
+    current = store.current_item(queue_id)
+    waiting_items = [item for item in items if item["status"] == "waiting"]
+    completed_count = sum(item["status"] == "completed" for item in items)
+    total_seconds = sum(
+        item["duration_seconds"] for item in items if item["status"] not in {"cancelled", "skipped"}
+    )
+    elapsed = 0.0
+    if current and current.get("checkpoint_path"):
+        try:
+            checkpoint = load_checkpoint(current["checkpoint_path"])
+            elapsed = float(checkpoint.get("total_elapsed_seconds", 0))
+            round_label = current.get("research_round") or "\ud68c\ucc28 \ud560\ub2f9 \uc911"
+            status_label = queue_status_labels.get(
+                checkpoint.get("status", current["status"]), current["status"]
+            )
+            st.caption(
+                f"\uc5f0\uad6c {round_label}\ud68c\ucc28 \u00b7 "
+                f"\uc0c1\ud0dc {status_label} \u00b7 "
+                f"\uc644\ub8cc \uc2e4\ud5d8 "
+                f"{len(checkpoint.get('completed_experiments', []))} \u00b7 "
+                f"\uc2e4\ud328 {len(checkpoint.get('failed_experiments', []))} \u00b7 "
+                f"\ub204\uc801 {format_duration(elapsed)} \u00b7 "
+                f"{current['checkpoint_path']}"
+            )
+        except (OSError, ValueError, KeyError) as error:
+            st.warning(
+                f"\uccb4\ud06c\ud3ec\uc778\ud2b8 \uc0c1\ud0dc \ud655\uc778 \ubd88\uac00: {error}"
+            )
+    active_remaining = 0
+    if current and current["status"] == "running":
+        active_remaining = max(0, int(current["duration_seconds"] - elapsed))
+    expected_remaining = sum(item["duration_seconds"] for item in waiting_items) + active_remaining
+    columns = st.columns(7)
+    columns[0].metric(
+        "\uc608\uc57d \uc0c1\ud0dc", queue_status_labels.get(queue["status"], queue["status"])
+    )
+    columns[1].metric(
+        "\ud604\uc7ac \uc608\uc57d", current["position"] + 1 if current else "\uc5c6\uc74c"
+    )
+    columns[2].metric("\ub300\uae30 \uc608\uc57d", len(waiting_items))
+    columns[3].metric("\uc804\uccb4 \uc608\uc57d", len(items))
+    columns[4].metric("\uc644\ub8cc \uc608\uc57d", completed_count)
+    columns[5].metric(
+        "\uc608\uc57d\ub41c \ucd1d \uc5f0\uad6c \uc2dc\uac04", format_duration(total_seconds)
+    )
+    columns[6].metric("\uc608\uc0c1 \ub0a8\uc740 \uc2dc\uac04", format_duration(expected_remaining))
+    if queue.get("last_error"):
+        st.error(f"\ub9c8\uc9c0\ub9c9 \uc624\ub958: {queue['last_error']}")
+    st.caption(
+        "\uc608\uc57d\uc740 SQLite\uc5d0 \uc800\uc7a5\ub418\uace0 "
+        "\ubc31\uadf8\ub77c\uc6b4\ub4dc \uc2a4\ucf00\uc904\ub7ec\uac00 \ud558\ub098\uc529 "
+        "\uc2e4\ud589\ud569\ub2c8\ub2e4. PC\uac00 \uc808\uc804 \ub610\ub294 "
+        "\uc885\ub8cc\ub41c \ub3d9\uc548\uc5d0\ub294 \uc5f0\uad6c\uac00 "
+        "\uc9c4\ud589\ub418\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4."
+    )
+
+
 with queue_tab:
     queue_status_labels = {
         "waiting": "\ub300\uae30 \uc911",
@@ -1354,64 +1416,7 @@ with queue_tab:
     queue_state = queue_store.queue(active_queue_id)
     queue_items = queue_store.list_items(active_queue_id)
     current_queue_item = queue_store.current_item(active_queue_id)
-    waiting_items = [item for item in queue_items if item["status"] == "waiting"]
-    completed_count = sum(item["status"] == "completed" for item in queue_items)
-    total_duration = sum(item["duration_seconds"] for item in waiting_items)
-    reserved_duration = sum(
-        item["duration_seconds"]
-        for item in queue_items
-        if item["status"] not in {"cancelled", "skipped"}
-    )
-    active_elapsed = 0.0
-    if current_queue_item and current_queue_item.get("checkpoint_path"):
-        try:
-            active_elapsed = float(
-                load_checkpoint(current_queue_item["checkpoint_path"]).get(
-                    "total_elapsed_seconds", 0
-                )
-            )
-        except (OSError, ValueError, KeyError):
-            active_elapsed = 0.0
-    active_remaining = 0
-    if current_queue_item and current_queue_item["status"] == "running":
-        active_remaining = max(0, int(current_queue_item["duration_seconds"] - active_elapsed))
-    expected_remaining = total_duration + active_remaining
-    summary_columns = st.columns(7)
-    summary_columns[0].metric("\uc608\uc57d \uc0c1\ud0dc", queue_state["status"])
-    summary_columns[1].metric(
-        "\ud604\uc7ac \uc608\uc57d",
-        current_queue_item["position"] if current_queue_item else "\uc5c6\uc74c",
-    )
-    summary_columns[2].metric("\ub300\uae30 \uc608\uc57d", len(waiting_items))
-    summary_columns[3].metric("\uc804\uccb4 \uc608\uc57d", len(queue_items))
-    summary_columns[4].metric("\uc644\ub8cc \uc608\uc57d", completed_count)
-    summary_columns[5].metric(
-        "\uc608\uc57d\ub41c \ucd1d \uc5f0\uad6c \uc2dc\uac04",
-        format_duration(reserved_duration),
-    )
-    summary_columns[6].metric(
-        "\uc608\uc0c1 \ub0a8\uc740 \uc2dc\uac04", format_duration(expected_remaining)
-    )
-    if queue_state.get("last_error"):
-        st.error(f"마지막 오류: {queue_state['last_error']}")
-    if current_queue_item and current_queue_item.get("checkpoint_path"):
-        try:
-            checkpoint = load_checkpoint(current_queue_item["checkpoint_path"])
-            elapsed = float(checkpoint.get("total_elapsed_seconds", 0))
-            st.caption(
-                f"연구 {current_queue_item.get('research_round') or '회차 할당 중'}회차 ? "
-                f"상태 {checkpoint.get('status', current_queue_item['status'])} ? "
-                f"완료 실험 {len(checkpoint.get('completed_experiments', []))} ? "
-                f"실패 {len(checkpoint.get('failed_experiments', []))} ? "
-                f"누적 {format_duration(elapsed)} · 체크포인트 "
-                f"{current_queue_item['checkpoint_path']}"
-            )
-        except (OSError, ValueError, KeyError) as error:
-            st.warning(f"체크포인트 상태 확인 불가: {error}")
-    st.caption(
-        "예약은 SQLite에 저장되고 백그라운드 스케줄러가 하나씩 실행합니다. "
-        "PC가 절전 또는 종료된 동안에는 연구가 진행되지 않습니다."
-    )
+    render_queue_summary(active_queue_id)
 
     with st.form("queue_add_form"):
         st.markdown("#### 예약 추가")
