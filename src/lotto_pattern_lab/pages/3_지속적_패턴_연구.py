@@ -1,6 +1,5 @@
 """Persistent multi-pattern research dashboard and local worker controls."""
 
-import json
 import os
 import subprocess
 import sys
@@ -11,9 +10,11 @@ import streamlit as st
 
 from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
 from lotto_pattern_lab.pattern_library import PatternLibrary, import_historical_experiment
+from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.periodicity import periodicity_report
 from lotto_pattern_lab.pysr_backend import optional_backend_status
 from lotto_pattern_lab.research import load_checkpoint, request_stop
+from lotto_pattern_lab.storage import ExperimentStore
 
 st.set_page_config(page_title="지속적 패턴 연구", layout="wide")
 st.title("지속적 다중 패턴 연구")
@@ -22,17 +23,17 @@ st.caption(
     "새 엔진은 실제 구현 전까지 선택지에 표시하지 않습니다."
 )
 
-checkpoint_dir = Path("checkpoints")
-checkpoint_dir.mkdir(exist_ok=True)
+checkpoint_dir = project_path("checkpoints")
+checkpoint_dir.mkdir(parents=True, exist_ok=True)
 checkpoint_paths = sorted(
     checkpoint_dir.glob("research*.json"), key=lambda p: p.stat().st_mtime, reverse=True
 )
 with st.sidebar:
     data_source = st.radio("연구 데이터", ("공식 검증 데이터", "로컬 검증 미완료 CSV"))
     csv_path = (
-        Path("data/official/draws.csv")
+        project_path("data/official/draws.csv")
         if data_source == "공식 검증 데이터"
-        else Path("data/raw/lotto_draws_753_1246.csv")
+        else project_path("data/raw/lotto_draws_753_1246.csv")
     )
     workflow = st.radio("작업", ("새 장시간 연구", "저장된 연구 재개"))
     selected_checkpoint = None
@@ -58,16 +59,68 @@ with st.sidebar:
 dataset = None
 integrity = None
 checkpoint = None
-active_checkpoint_path = (
-    Path(st.session_state["active_research_checkpoint"])
-    if st.session_state.get("active_research_checkpoint")
-    else (selected_checkpoint or (checkpoint_paths[0] if checkpoint_paths else None))
-)
+pending_checkpoint = st.session_state.get("pending_research_checkpoint")
+stored_checkpoint = st.session_state.get("active_research_checkpoint")
+active_checkpoint_path = project_path(
+    pending_checkpoint or stored_checkpoint or selected_checkpoint or checkpoint_paths[0]
+) if (pending_checkpoint or stored_checkpoint or selected_checkpoint or checkpoint_paths) else None
+checkpoint_relocated = None
 if active_checkpoint_path is not None:
-    try:
-        checkpoint = load_checkpoint(active_checkpoint_path)
-    except Exception as error:
-        st.error(f"체크포인트를 읽을 수 없습니다: {error}")
+    resolved_path, alternate_paths = locate_checkpoint(active_checkpoint_path)
+    if resolved_path.is_file():
+        active_checkpoint_path = resolved_path
+    elif alternate_paths:
+        checkpoint_relocated = alternate_paths[0]
+        active_checkpoint_path = checkpoint_relocated
+        st.session_state["active_research_checkpoint"] = str(checkpoint_relocated)
+        st.session_state.pop("pending_research_checkpoint", None)
+        st.warning(
+            f"기록된 경로는 찾지 못했지만 같은 이름의 체크포인트를 발견했습니다: "
+            f"{checkpoint_relocated}"
+        )
+    elif pending_checkpoint:
+        pending_pid = st.session_state.get("pending_research_worker_pid")
+        try:
+            os.kill(int(pending_pid), 0)
+            pending_worker_alive = True
+        except (OSError, TypeError, ValueError):
+            pending_worker_alive = False
+        if pending_worker_alive:
+            st.info("연구 프로세스가 시작되었습니다. 첫 체크포인트 저장을 기다리는 중입니다.")
+        else:
+            st.error(
+                f"첫 체크포인트가 생성되기 전에 연구 프로세스가 종료되었습니다. "
+                f"실행 로그를 확인하세요: {checkpoint_dir / 'research_worker.log'}"
+            )
+            st.session_state.pop("pending_research_checkpoint", None)
+        active_checkpoint_path = None
+    else:
+        st.error(
+            f"체크포인트 파일이 실제로 없습니다: {resolved_path}. "
+            "프로젝트의 checkpoints 폴더도 확인했지만 같은 파일을 찾지 못했습니다. "
+            "아래 저장된 체크포인트 목록에서 복구 가능한 실행 기록을 선택할 수 있습니다."
+        )
+        active_checkpoint_path = None
+    if active_checkpoint_path is not None:
+        try:
+            checkpoint = load_checkpoint(active_checkpoint_path)
+            if not checkpoint.get("research_id"):
+                st.error("체크포인트에 연구 ID가 없습니다. 손상 가능성이 있어 자동 수정하지 않았습니다.")
+                checkpoint = None
+            elif checkpoint.get("checkpoint_path") and project_path(
+                checkpoint["checkpoint_path"]
+            ) != active_checkpoint_path:
+                st.error(
+                    f"연구 ID {checkpoint['research_id']}가 다른 체크포인트 경로를 가리킵니다: "
+                    f"{checkpoint['checkpoint_path']}"
+                )
+                checkpoint = None
+            elif pending_checkpoint and active_checkpoint_path == project_path(pending_checkpoint):
+                st.session_state["active_research_checkpoint"] = str(active_checkpoint_path)
+                st.session_state.pop("pending_research_checkpoint", None)
+                st.session_state.pop("pending_research_worker_pid", None)
+        except (OSError, ValueError) as error:
+            st.error(f"체크포인트 JSON을 읽을 수 없습니다: {error}")
 
 if not csv_path.is_file():
     st.error(f"데이터 파일이 없습니다: {csv_path}")
@@ -101,20 +154,39 @@ if checkpoint:
     run_col.metric("완료 실험", state.get("completed_runs", 0))
     match_col.metric("완전 일치 발견", len(state.get("discovered_exact_matches", [])))
     st.caption(
-        f"엔진: {', '.join(state.get('engines', []))} · "
+        f"연구 ID: {state.get('research_id')} · 엔진: {', '.join(state.get('engines', []))} · "
         f"마지막 업데이트: {state.get('last_updated_at', '없음')} · "
         f"재개 방식: 실험 경계에서 다음 시드로 계속"
     )
+    if state.get("completed_experiments"):
+        st.caption(
+            f"복원된 난수 시드 진행: 다음 시드 {state.get('rng_resume', {}).get('next_seed')} · "
+            f"완료 실험 기록 {len(state['completed_experiments'])}건"
+        )
     if state.get("current_progress"):
         st.json(state["current_progress"])
     if state.get("last_run_summary"):
         st.json(state["last_run_summary"])
     if state.get("failed_runs"):
         st.warning(f"실패 또는 중단된 실험: {len(state['failed_runs'])}")
+    current_experiment_id = (
+        state.get("current_progress", {}).get("event", {}).get("experiment_id")
+    )
+    if current_experiment_id and not (project_path("experiments") / f"{current_experiment_id}.json").is_file():
+        st.info(
+            f"현재 진행 기록의 실험 {current_experiment_id}는 완료 실험 JSON으로 저장되지 않았습니다. "
+            "기존 실험 파일은 변경하지 않았으며, 재개 시 체크포인트의 다음 난수 시드부터 계속합니다."
+        )
 else:
     st.info("연구를 시작하면 진행 상황과 재개용 체크포인트가 로컬에 저장됩니다.")
 
 active_worker = False
+if not checkpoint and st.session_state.get("pending_research_worker_pid"):
+    try:
+        os.kill(int(st.session_state["pending_research_worker_pid"]), 0)
+        active_worker = True
+    except (OSError, TypeError, ValueError):
+        active_worker = False
 if checkpoint and checkpoint.get("status") == "running":
     pid = checkpoint.get("worker_pid")
     if pid:
@@ -128,9 +200,8 @@ if checkpoint and checkpoint.get("status") == "running" and not active_worker:
 
 if st.button("기존 완료 실험을 라이브러리에 가져오기", disabled=dataset is None):
     imported = []
-    for experiment_path in Path("experiments").glob("*.json"):
-        with experiment_path.open(encoding="utf-8") as source_file:
-            experiment = json.load(source_file)
+    for experiment_path in project_path("experiments").glob("*.json"):
+        experiment = ExperimentStore(project_path("experiments")).load(experiment_path.stem)
         if (
             experiment.get("status") == "completed"
             and experiment.get("experiment_type") == "intermittent"
@@ -160,7 +231,7 @@ with button_col:
             )
             resume = False
         else:
-            checkpoint_path = Path(selected_checkpoint)
+            checkpoint_path = project_path(selected_checkpoint)
             resume = True
         log_path = checkpoint_dir / "research_worker.log"
         log_file = log_path.open("a", encoding="utf-8")
@@ -195,18 +266,20 @@ with button_col:
         creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
             subprocess, "CREATE_NO_WINDOW", 0
         )
-        subprocess.Popen(
+        process = subprocess.Popen(
             command,
-            cwd=Path.cwd(),
+            cwd=PROJECT_ROOT,
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             creationflags=creation_flags,
             close_fds=True,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
         log_file.close()
-        st.session_state["active_research_checkpoint"] = str(checkpoint_path)
-        st.success(f"연구 작업을 시작했습니다. 체크포인트: {checkpoint_path}")
+        st.session_state["pending_research_checkpoint"] = str(checkpoint_path)
+        st.session_state["pending_research_worker_pid"] = process.pid
+        st.success(f"연구 프로세스를 시작했습니다. 체크포인트 저장을 기다립니다: {checkpoint_path}")
         st.rerun()
 with stop_col:
     if st.button(

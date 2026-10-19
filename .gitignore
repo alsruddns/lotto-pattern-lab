@@ -19,6 +19,9 @@ data/raw/
 data/processed/
 data/database/
 checkpoints/
+logs/
+.storage_settings.json
+*.details.json.gz
 *.sqlite
 *.db
 *.history.jsonl

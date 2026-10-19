@@ -1,7 +1,6 @@
 """다음 회차 추천 연구 화면."""
 
 import hashlib
-import json
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -11,6 +10,7 @@ import streamlit as st
 from lotto_pattern_lab.dataset import load_csv
 from lotto_pattern_lab.official_data import _fetch_latest_round
 from lotto_pattern_lab.pattern_library import PatternLibrary, register_prospective_comparison
+from lotto_pattern_lab.paths import project_path
 from lotto_pattern_lab.prediction import (
     compare_recommendation,
     create_recommendation,
@@ -19,13 +19,14 @@ from lotto_pattern_lab.prediction import (
     save_recommendation,
     summarize_prediction_history,
 )
+from lotto_pattern_lab.storage import ExperimentStore
 
 st.set_page_config(page_title="AI 다음 회차 번호 추천", layout="wide")
 st.title("AI 다음 회차 번호 추천")
 st.warning("저장된 GP 공식을 실행하는 연구용 후보입니다. 당첨 확률이나 당첨을 보장하지 않습니다.")
 
-experiments = Path("experiments")
-prediction_dir = Path("predictions")
+experiments = project_path("experiments")
+prediction_dir = project_path("predictions")
 experiment_paths = sorted(experiments.glob("*.json"))
 experiment_ids = [path.stem for path in experiment_paths]
 default_id = "56f27190-1f2a-4573-9542-b30a2bbc60b4"
@@ -57,12 +58,12 @@ dataset = None
 data_bytes = None
 try:
     if source == "로컬 데이터 753~1246회":
-        csv_path = Path("data/raw/lotto_draws_753_1246.csv")
+        csv_path = project_path("data/raw/lotto_draws_753_1246.csv")
         if csv_path.is_file():
             data_bytes = csv_path.read_bytes()
             dataset = load_csv(csv_path)
     elif source == "공식 데이터 파일":
-        csv_path = Path("data/official/draws.csv")
+        csv_path = project_path("data/official/draws.csv")
         if csv_path.is_file():
             data_bytes = csv_path.read_bytes()
             dataset = load_csv(csv_path)
@@ -94,8 +95,7 @@ if st.button(
     "공식 실행 및 추천 저장", type="primary", disabled=dataset is None or not experiment_id
 ):
     try:
-        with (experiments / f"{experiment_id}.json").open(encoding="utf-8") as source_file:
-            experiment = json.load(source_file)
+        experiment = ExperimentStore(experiments).load(experiment_id)
         try:
             official_latest = _fetch_latest_round()
         except Exception as error:

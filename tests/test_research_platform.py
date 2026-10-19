@@ -328,6 +328,10 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     assert first["completed_runs"] == 1
     assert first["attempts"] == 1
     assert first["dataset_sha256"]
+    assert first["checkpoint_path"] == str(checkpoint.resolve())
+    assert first["rng_resume"] == {"mode": "per_attempt_seed", "base_seed": 31, "next_seed": 32}
+    assert first["completed_experiments"][0]["seed"] == 31
+    assert first["completed_experiments"][0]["experiment_id"] == first["last_experiment_id"]
 
     second = run_research_schedule(
         dataset,
@@ -343,6 +347,8 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     assert second["attempts"] == 2
     assert second["resume_count"] == 1
     assert second["last_experiment_id"] != first["last_experiment_id"]
+    assert [item["seed"] for item in second["completed_experiments"]] == [31, 32]
+    assert second["rng_resume"]["next_seed"] == 33
     assert len(PatternLibrary(tmp_path / "patterns.sqlite").list_patterns()) >= 4
 
     changed = _dated_dataset(40)

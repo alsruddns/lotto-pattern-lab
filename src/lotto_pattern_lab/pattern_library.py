@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import DrawDataset
+from .paths import project_path
 
 _COMMUTATIVE = {"add", "mul", "min2", "max2", "bit_xor", "bit_and", "bit_or"}
 PATTERN_STATUSES = {
@@ -59,7 +60,7 @@ class PatternLibrary:
     """Store patterns once, then append validation and exact-match observations."""
 
     def __init__(self, path: str | Path = "data/database/patterns.sqlite") -> None:
-        self.path = Path(path)
+        self.path = project_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")

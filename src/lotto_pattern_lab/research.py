@@ -15,12 +15,14 @@ from typing import Any
 from .dataset import DrawDataset
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
 from .intermittent import IntermittentConfig
+from .paths import locate_checkpoint, project_path
 from .pattern_library import (
     PatternLibrary,
     register_experiment_candidates,
     register_experiment_exact_matches,
 )
 from .storage import ExperimentStore
+from .storage_management import run_automatic_checkpoint_cleanup
 
 SUPPORTED_ENGINES = tuple(
     engine_id for engine_id, engine in ENGINE_REGISTRY.items() if engine.implemented
@@ -42,12 +44,15 @@ def dataset_digest(dataset: DrawDataset) -> str:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
+    path = project_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             json.dump(value, output, ensure_ascii=False, indent=2, allow_nan=False)
             output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -55,12 +60,22 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as source:
+    checkpoint_path, candidates = locate_checkpoint(path)
+    if not checkpoint_path.is_file() and candidates:
+        raise FileNotFoundError(
+            f"Checkpoint path is incorrect: {checkpoint_path}. "
+            f"A same-named checkpoint exists at {candidates[0]}"
+        )
+    try:
+        source_file = checkpoint_path.open(encoding="utf-8")
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"Checkpoint file does not exist: {checkpoint_path}") from error
+    with source_file as source:
         return json.load(source)
 
 
 def request_stop(checkpoint_path: str | Path) -> Path:
-    stop_path = Path(f"{checkpoint_path}.stop")
+    stop_path = Path(f"{project_path(checkpoint_path)}.stop")
     stop_path.parent.mkdir(parents=True, exist_ok=True)
     stop_path.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
     return stop_path
@@ -90,13 +105,44 @@ def run_research_schedule(
         raise ValueError("max_runs must be positive when provided.")
     if not engines or any(engine not in SUPPORTED_ENGINES for engine in engines):
         raise ValueError(f"Supported engines are: {', '.join(SUPPORTED_ENGINES)}")
-    checkpoint = Path(checkpoint_path)
+    checkpoint = project_path(checkpoint_path)
+    run_automatic_checkpoint_cleanup()
     stop_path = Path(f"{checkpoint}.stop")
     data_hash = dataset_digest(dataset)
     config_payload = asdict(config)
     store = ExperimentStore(experiment_directory)
     if resume:
         state = load_checkpoint(checkpoint)
+        if not state.get("research_id"):
+            raise ValueError(f"Cannot resume: checkpoint has no research_id: {checkpoint}")
+        recorded_path = state.get("checkpoint_path")
+        if recorded_path and project_path(recorded_path) != checkpoint:
+            raise ValueError(
+                "Cannot resume: checkpoint research_id "
+                f"{state['research_id']} points to {recorded_path}, not {checkpoint}."
+            )
+        progress_research_id = state.get("current_progress", {}).get("research_id")
+        if progress_research_id and progress_research_id != state["research_id"]:
+            raise ValueError(
+                "Cannot resume: current progress belongs to research ID "
+                f"{progress_research_id}, but checkpoint ID is {state['research_id']}."
+            )
+        in_progress_research_id = state.get("in_progress", {}).get("research_id")
+        if in_progress_research_id and in_progress_research_id != state["research_id"]:
+            raise ValueError(
+                "Cannot resume: in-progress experiment belongs to research ID "
+                f"{in_progress_research_id}, but checkpoint ID is {state['research_id']}."
+            )
+        mismatched_runs = [
+            item.get("experiment_id")
+            for item in state.get("completed_experiments", [])
+            if item.get("research_id") not in (None, state["research_id"])
+        ]
+        if mismatched_runs:
+            raise ValueError(
+                "Cannot resume: completed experiment history contains records for a different "
+                f"research ID: {mismatched_runs}"
+            )
         if state.get("dataset_sha256") != data_hash:
             raise ValueError("Cannot resume: checkpoint dataset hash differs from selected data.")
         if state.get("config") != config_payload or tuple(state.get("engines", ())) != engines:
@@ -106,6 +152,8 @@ def run_research_schedule(
             raise FileExistsError(f"Checkpoint already exists: {checkpoint}; use resume=True.")
         state = {
             "research_id": str(uuid.uuid4()),
+            "checkpoint_path": str(checkpoint),
+            "resumable": True,
             "status": "queued",
             "created_at": datetime.now(UTC).isoformat(),
             "dataset_sha256": data_hash,
@@ -118,6 +166,12 @@ def run_research_schedule(
             "engines": list(engines),
             "completed_runs": 0,
             "attempts": 0,
+            "completed_experiments": [],
+            "rng_resume": {
+                "mode": "per_attempt_seed",
+                "base_seed": config.seed,
+                "next_seed": config.seed,
+            },
             "failed_runs": [],
             "discovered_exact_matches": [],
             "last_experiment_id": None,
@@ -126,6 +180,14 @@ def run_research_schedule(
                 "resume at next seeded experiment boundary; no mid-generation restore"
             ),
         }
+    state["checkpoint_path"] = str(checkpoint)
+    state["resumable"] = True
+    state.setdefault("completed_experiments", [])
+    state["rng_resume"] = {
+        "mode": "per_attempt_seed",
+        "base_seed": config.seed,
+        "next_seed": config.seed + int(state.get("attempts", 0)),
+    }
     previous_checkpoint_time = state.get("last_updated_at", state.get("created_at"))
     if resume and state.get("in_progress"):
         interrupted = dict(state["in_progress"])
@@ -186,9 +248,11 @@ def run_research_schedule(
         run_index = int(state["attempts"])
         run_config = replace(config, seed=config.seed + run_index)
         state["attempts"] = run_index + 1
+        state["rng_resume"]["next_seed"] = config.seed + state["attempts"]
         state["in_progress"] = {
             "seed": run_config.seed,
             "attempt": state["attempts"],
+            "research_id": state["research_id"],
             "started_at": datetime.now(UTC).isoformat(),
         }
         _atomic_json(checkpoint, state)
@@ -198,6 +262,7 @@ def run_research_schedule(
                 state["in_progress"]["experiment_id"] = event["experiment_id"]
             state["current_progress"] = {
                 "engine": "intermittent_gp",
+                "research_id": state["research_id"],
                 "run_index": run_index + 1,
                 "event": event,
                 "updated_at": datetime.now(UTC).isoformat(),
@@ -210,10 +275,23 @@ def run_research_schedule(
         try:
             engine = get_engine(engines[(run_index) % len(engines)])
             result = engine.run(ResearchRunContext(dataset, run_config, store, report))
+            result["research_id"] = state["research_id"]
+            result["research_attempt"] = state["attempts"]
+            store.save(result)
             registered = register_experiment_candidates(result, library)
             exact_matches = register_experiment_exact_matches(result, library)
             state["completed_runs"] += 1
             state["last_experiment_id"] = result["experiment_id"]
+            state["completed_experiments"].append(
+                {
+                    "attempt": state["attempts"],
+                    "seed": run_config.seed,
+                    "experiment_id": result["experiment_id"],
+                    "research_id": state["research_id"],
+                    "path": str(store.directory / f"{result['experiment_id']}.json"),
+                    "status": "completed",
+                }
+            )
             state["discovered_exact_matches"].extend(exact_matches)
             state["last_run_summary"] = {
                 "experiment_id": result["experiment_id"],
@@ -257,6 +335,7 @@ def run_research_schedule(
     state["last_updated_at"] = datetime.now(UTC).isoformat()
     state["elapsed_seconds"] = time.monotonic() - started
     _atomic_json(checkpoint, state)
+    run_automatic_checkpoint_cleanup()
     if state.get("pause_reason") == "stop_requested_at_experiment_boundary":
         stop_path.unlink(missing_ok=True)
     return state

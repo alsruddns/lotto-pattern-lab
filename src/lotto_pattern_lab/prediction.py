@@ -16,6 +16,7 @@ from typing import Any
 
 from .dataset import DrawDataset
 from .features import build_features_for_target, feature_names
+from .paths import project_path
 from .gp_engine import (
     _bit_and,
     _bit_or,
@@ -357,7 +358,7 @@ def save_recommendation(
     recommendation: dict[str, Any], directory: str | Path = "predictions"
 ) -> Path:
     """Write a new recommendation JSON without replacing any existing prediction."""
-    destination_dir = Path(directory)
+    destination_dir = project_path(directory)
     destination_dir.mkdir(parents=True, exist_ok=True)
     recommendation_id = str(recommendation["recommendation_id"])
     destination = destination_dir / f"{recommendation_id}.json"
@@ -380,7 +381,7 @@ def save_recommendation(
 
 
 def load_recommendation(path: str | Path) -> dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as source:
+    with project_path(path).open(encoding="utf-8") as source:
         return json.load(source)
 
 
@@ -454,7 +455,7 @@ def summarize_prediction_history(
 def save_comparison(
     comparison: dict[str, Any], directory: str | Path = "predictions/comparisons"
 ) -> Path:
-    destination_dir = Path(directory)
+    destination_dir = project_path(directory)
     destination_dir.mkdir(parents=True, exist_ok=True)
     comparison_id = str(uuid.uuid4())
     destination = destination_dir / f"{comparison['recommendation_id']}_{comparison_id}.json"
@@ -465,7 +466,7 @@ def save_comparison(
 
 
 def load_prediction_history(directory: str | Path = "predictions") -> list[dict[str, Any]]:
-    prediction_dir = Path(directory)
+    prediction_dir = project_path(directory)
     if not prediction_dir.exists():
         return []
     history = []

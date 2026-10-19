@@ -23,17 +23,31 @@ from lotto_pattern_lab.official_data import (
 )
 from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.storage import ExperimentStore
+from lotto_pattern_lab.paths import project_path
+from lotto_pattern_lab.storage_management import (
+    load_storage_settings,
+    storage_inventory,
+    storage_over_quota,
+)
 
 st.set_page_config(page_title="Lotto Pattern Lab", layout="wide")
+storage_settings = load_storage_settings()
+storage_state = storage_inventory()
+if storage_over_quota(storage_state, storage_settings["quota_bytes"]):
+    st.warning(
+        f"저장 용량이 설정 한도를 넘었습니다: {storage_state['total_bytes'] / 1024**3:.2f} / "
+        f"{storage_settings['quota_bytes'] / 1024**3:.2f} GiB. "
+        "시스템 설정에서 정리 항목을 검토하세요."
+    )
 st.title("Lotto Pattern Lab 연구실")
 st.caption(
     "간헐적으로 활성화되는 규칙 가능성을 무작위 대조군과 비교합니다. "
     "결과만으로 조작이나 개입을 입증할 수 없습니다."
 )
 
-store = ExperimentStore("experiments")
-official_path = Path("data/official/draws.csv")
-local_draws_path = Path("data/raw/lotto_draws_753_1246.csv")
+store = ExperimentStore(project_path("experiments"))
+official_path = project_path("data/official/draws.csv")
+local_draws_path = project_path("data/raw/lotto_draws_753_1246.csv")
 
 with st.sidebar:
     st.header("데이터")
@@ -321,7 +335,7 @@ else:
     selected_id = st.selectbox(
         "실험 상세 조회", [str(item.get("experiment_id")) for item in experiments]
     )
-    selected = next(item for item in experiments if item.get("experiment_id") == selected_id)
+    selected = store.load(selected_id)
     if selected.get("status") != "completed":
         st.info("이 실험은 아직 완료되지 않았습니다. 마지막 저장 진행 상태를 표시합니다.")
         st.json(selected.get("progress", []))

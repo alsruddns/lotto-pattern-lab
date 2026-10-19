@@ -1,5 +1,7 @@
 """Orchestrate GP search, chronological evaluation, and matched random controls."""
 
+import hashlib
+import json
 import time
 import uuid
 from collections.abc import Callable
@@ -131,7 +133,7 @@ def run_experiment(
 
 
 def dataset_metadata(dataset: DrawDataset) -> dict[str, object]:
-    return {
+    metadata = {
         "source_kind": dataset.source_kind,
         "source_description": dataset.source_description,
         "source_url": dataset.source_url,
@@ -147,6 +149,18 @@ def dataset_metadata(dataset: DrawDataset) -> dict[str, object]:
         else None,
         "draw_count": len(dataset.records),
     }
+    digest_payload = [
+        {
+            "round": record.round_number,
+            "date": record.draw_date.isoformat() if record.draw_date else None,
+            "numbers": record.draw.numbers,
+        }
+        for record in dataset.records
+    ]
+    metadata["dataset_sha256"] = hashlib.sha256(
+        json.dumps(digest_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return metadata
 
 
 def config_to_plain(config: SearchConfig) -> dict[str, int | float]:

@@ -13,6 +13,7 @@ from .gp_engine import SearchConfig
 from .intermittent import IntermittentConfig
 from .intermittent_experiment import run_intermittent_experiment
 from .official_data import FIRST_SUPPORTED_ROUND, fetch_official_dataset
+from .paths import project_path
 from .pattern_library import PatternLibrary
 from .patterns import summarize_draw
 from .research import SUPPORTED_ENGINES, request_stop, run_research_schedule
@@ -75,7 +76,7 @@ def _run_search_cli(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     dataset = (
-        load_csv(args.csv, args.source_url)
+        load_csv(project_path(args.csv), args.source_url)
         if args.csv
         else make_random_dataset(args.synthetic, args.seed)
     )
@@ -127,7 +128,7 @@ def _run_sync_cli(argv: list[str]) -> None:
         delay_seconds=args.delay,
         progress=report,
     )
-    csv_path, manifest_path = save_official_csv(dataset, Path(args.output))
+    csv_path, manifest_path = save_official_csv(dataset, project_path(args.output))
     print(
         f"검증 상태={dataset.verification_status}, "
         f"회차={dataset.records[0].round_number}~{dataset.records[-1].round_number}, "
@@ -160,7 +161,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     dataset = (
-        load_csv(args.csv, args.source_url)
+        load_csv(project_path(args.csv), args.source_url)
         if args.csv
         else make_random_dataset(args.synthetic, args.seed)
     )
@@ -219,7 +220,7 @@ def _run_research_cli(argv: list[str]) -> None:
     if args.stop:
         print(f"Stop requested: {request_stop(args.checkpoint)}")
         return
-    dataset = load_csv(args.csv)
+    dataset = load_csv(project_path(args.csv))
     config = IntermittentConfig(
         population_size=args.population,
         generations=args.generations,
@@ -236,7 +237,7 @@ def _run_research_cli(argv: list[str]) -> None:
         print(
             f"[{event.get('engine')}] run={event.get('run_index')} "
             f"generation={detail.get('generation')}/{detail.get('generations')} "
-            f"candidates-evaluated≈{evaluated}",
+            f"candidates-evaluated~{evaluated}",
             flush=True,
         )
 
