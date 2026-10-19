@@ -4,13 +4,24 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from .features import feature_names
+from .features import bonus_feature_names, feature_names
 from .research_features import research_feature_names
 
 FEATURE_SCHEMA_VERSION = 1
+BONUS_FEATURE_SCHEMA_VERSION = 2
+MAX_SUPPORTED_FEATURE_SCHEMA_VERSION = BONUS_FEATURE_SCHEMA_VERSION
 PRIMITIVE_SET_VERSION = "deap-safe-math-bits-digits-v1"
 CODE_VERSION = "0.1.0"
 _VARIABLE = re.compile(r"\bx(\d+)\b")
+
+
+def feature_schema_version(profile: str) -> int:
+    """Return the stable schema contract version required by a feature profile."""
+    if profile == "bonus_lag_v1":
+        return BONUS_FEATURE_SCHEMA_VERSION
+    if profile in {"legacy", "calendar_round"}:
+        return FEATURE_SCHEMA_VERSION
+    raise ValueError(f"Unknown feature profile: {profile}")
 
 
 def feature_mapping(profile: str, max_lag: int) -> dict[str, dict[str, str]]:
@@ -18,6 +29,8 @@ def feature_mapping(profile: str, max_lag: int) -> dict[str, dict[str, str]]:
     names = list(feature_names(max_lag))
     if profile == "calendar_round":
         names.extend(research_feature_names())
+    elif profile == "bonus_lag_v1":
+        names = list(bonus_feature_names(max_lag))
     elif profile != "legacy":
         raise ValueError(f"Unknown feature profile: {profile}")
     return {
@@ -42,7 +55,7 @@ def _normalize_source_mapping(mapping: Mapping[str, Any], source_profile: str) -
             feature_id = f"lotto.{name}"
         if feature_id and re.fullmatch(r"x\d+", variable):
             normalized[variable] = str(feature_id)
-    if not normalized and source_profile in {"legacy", "calendar_round"}:
+    if not normalized and source_profile in {"legacy", "calendar_round", "bonus_lag_v1"}:
         fallback = feature_mapping(source_profile, 10)
         normalized = {key: item["feature_id"] for key, item in fallback.items()}
     return normalized

@@ -46,8 +46,8 @@ class IntermittentConfig(GPConfig):
             )
         if not 2 <= self.hidden_states <= 5:
             raise ValueError("Hypothetical hidden state count must be between 2 and 5.")
-        if self.feature_profile not in {"legacy", "calendar_round"}:
-            raise ValueError("Feature profile must be legacy or calendar_round.")
+        if self.feature_profile not in {"legacy", "calendar_round", "bonus_lag_v1"}:
+            raise ValueError("Feature profile must be legacy, calendar_round, or bonus_lag_v1.")
         if not 0 <= self.elite_seed_ratio <= 0.8:
             raise ValueError("Elite seed ratio must be between 0 and 0.8.")
 

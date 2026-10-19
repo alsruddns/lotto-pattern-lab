@@ -15,7 +15,7 @@ from typing import Any
 
 from .dataset import DrawDataset
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
-from .feature_schema import FEATURE_SCHEMA_VERSION, PRIMITIVE_SET_VERSION
+from .feature_schema import PRIMITIVE_SET_VERSION, feature_schema_version
 from .intermittent import IntermittentConfig
 from .paths import locate_checkpoint, project_path
 from .pattern_library import (
@@ -192,7 +192,7 @@ def run_research_schedule(
             "selected_patterns": selected_patterns,
             "skipped": skipped_patterns,
             "feature_profile": config.feature_profile,
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "feature_schema_version": feature_schema_version(config.feature_profile),
             "primitive_set_version": PRIMITIVE_SET_VERSION,
             "policy": "validation_stability_complexity_diversity_v1",
             "independent_test_used_for_selection": False,

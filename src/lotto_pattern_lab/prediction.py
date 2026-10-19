@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import DrawDataset
-from .features import build_features_for_target, feature_names
+from .features import build_bonus_features_for_target, build_features_for_target, feature_names
 from .gp_engine import (
     _bit_and,
     _bit_or,
@@ -241,6 +241,11 @@ def create_recommendation(
             dataset, target_round, target_date, max_lag, feature_config
         )
         mapping = feature_names(max_lag) + research_feature_names(feature_config)
+    elif feature_profile == "bonus_lag_v1":
+        features = build_bonus_features_for_target(dataset, target_round, max_lag)
+        mapping = feature_names(max_lag) + tuple(
+            f"lag{lag}_bonus" for lag in range(1, max_lag + 1)
+        )
     elif feature_profile == "legacy":
         features = build_features_for_target(dataset, target_round, max_lag)
         mapping = feature_names(max_lag)

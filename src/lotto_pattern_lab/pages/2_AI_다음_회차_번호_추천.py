@@ -58,7 +58,7 @@ dataset = None
 data_bytes = None
 try:
     if source == "로컬 데이터 753~1246회":
-        csv_path = project_path("data/raw/lotto_draws_753_1246.csv")
+        csv_path = project_path("data/raw/lotto_draws_753_1246_with_bonus.csv")
         if csv_path.is_file():
             data_bytes = csv_path.read_bytes()
             dataset = load_csv(csv_path)

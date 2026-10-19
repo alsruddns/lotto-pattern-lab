@@ -154,6 +154,7 @@ def dataset_metadata(dataset: DrawDataset) -> dict[str, object]:
             "round": record.round_number,
             "date": record.draw_date.isoformat() if record.draw_date else None,
             "numbers": record.draw.numbers,
+            "bonus": record.draw.bonus,
         }
         for record in dataset.records
     ]

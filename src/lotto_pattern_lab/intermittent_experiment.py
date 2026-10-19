@@ -14,11 +14,11 @@ from .dataset import DrawDataset, DrawRecord, make_random_dataset
 from .experiment import dataset_metadata
 from .feature_schema import (
     CODE_VERSION,
-    FEATURE_SCHEMA_VERSION,
     PRIMITIVE_SET_VERSION,
     feature_mapping,
+    feature_schema_version,
 )
-from .features import build_examples, feature_names
+from .features import Example, build_bonus_examples, build_examples, feature_names
 from .hidden_states import causal_state_probabilities, fit_gaussian_hmm, online_change_points
 from .intermittent import (
     IntermittentCandidate,
@@ -114,6 +114,13 @@ def _splits_for(dataset: DrawDataset, config: IntermittentConfig) -> tuple[tuple
             dataset,
             config.max_lag,
             ResearchFeatureConfig(include_calendar=True, include_round_digits=True),
+        )
+    elif config.feature_profile == "bonus_lag_v1":
+        main_examples = build_examples(dataset, config.max_lag)
+        bonus_examples = build_bonus_examples(dataset, config.max_lag)
+        examples = tuple(
+            Example(main.round_number, bonus.features, main.winning_numbers)
+            for main, bonus in zip(main_examples, bonus_examples, strict=True)
         )
     else:
         examples = build_examples(dataset, config.max_lag)
@@ -293,7 +300,10 @@ def run_intermittent_experiment(
     for control_index in range(config.control_runs):
         data_seed = config.seed + 100_003 + control_index
         control_dataset = make_random_dataset(
-            len(dataset.records), data_seed, first_round=dataset.records[0].round_number
+            len(dataset.records),
+            data_seed,
+            first_round=dataset.records[0].round_number,
+            include_bonus=config.feature_profile == "bonus_lag_v1",
         )
         if config.feature_profile == "calendar_round":
             control_dataset = DrawDataset(
@@ -367,7 +377,7 @@ def run_intermittent_experiment(
         "config": asdict(config),
         "feature_schema": {
             "feature_profile": config.feature_profile,
-            "feature_schema_version": FEATURE_SCHEMA_VERSION,
+            "feature_schema_version": feature_schema_version(config.feature_profile),
             "primitive_set_version": PRIMITIVE_SET_VERSION,
             "feature_mapping": feature_mapping(config.feature_profile, config.max_lag),
             "code_version": CODE_VERSION,
@@ -404,6 +414,8 @@ def run_intermittent_experiment(
                 + (
                     research_feature_names(ResearchFeatureConfig())
                     if config.feature_profile == "calendar_round"
+                    else tuple(f"lag{lag}_bonus" for lag in range(1, config.max_lag + 1))
+                    if config.feature_profile == "bonus_lag_v1"
                     else ()
                 )
             )

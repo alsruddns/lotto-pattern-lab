@@ -42,6 +42,34 @@ def feature_names(max_lag: int = MAX_LAG) -> tuple[str, ...]:
     return tuple(names)
 
 
+def bonus_feature_names(max_lag: int = MAX_LAG) -> tuple[str, ...]:
+    """Stable lagged bonus feature names; they never include the target draw bonus."""
+    return (*feature_names(max_lag), *(f"lag{lag}_bonus" for lag in range(1, max_lag + 1)))
+
+
+def build_bonus_examples(dataset: DrawDataset, max_lag: int = MAX_LAG) -> tuple[Example, ...]:
+    """Build a separate bonus-number target using only earlier draws as inputs."""
+    examples = build_examples(dataset, max_lag)
+    bonus_by_round = {record.round_number: record.draw.bonus for record in dataset.records}
+    if any(value is None for value in bonus_by_round.values()):
+        raise ValueError("Bonus-number research requires a bonus value for every draw.")
+    output: list[Example] = []
+    for example in examples:
+        previous_bonuses = [
+            bonus_by_round[example.round_number - lag] for lag in range(1, max_lag + 1)
+        ]
+        if any(value is None for value in previous_bonuses):
+            raise ValueError("Bonus-number research requires complete contiguous bonus history.")
+        output.append(
+            Example(
+                example.round_number,
+                example.features + tuple(float(value) for value in previous_bonuses),
+                frozenset({bonus_by_round[example.round_number]}),
+            )
+        )
+    return tuple(output)
+
+
 def build_examples(dataset: DrawDataset, max_lag: int = MAX_LAG) -> tuple[Example, ...]:
     if not 1 <= max_lag <= MAX_LAG:
         raise ValueError(f"max_lag must be between 1 and {MAX_LAG}.")
@@ -94,3 +122,19 @@ def build_features_for_target(
         values.extend(summaries)
     values.extend(prior[lag - 1][0] - prior[lag][0] for lag in range(1, max_lag))
     return tuple(float(value) for value in values)
+
+
+def build_bonus_features_for_target(
+    dataset: DrawDataset, target_round: int, max_lag: int = MAX_LAG
+) -> tuple[float, ...]:
+    """Build main features plus only the previous rounds' bonuses for a target."""
+    main_features = build_features_for_target(dataset, target_round, max_lag)
+    prior = {
+        record.round_number: record.draw.bonus
+        for record in dataset.records
+        if record.round_number < target_round
+    }
+    needed = [target_round - lag for lag in range(1, max_lag + 1)]
+    if any(round_number not in prior or prior[round_number] is None for round_number in needed):
+        raise ValueError("Bonus target requires complete preceding bonus history.")
+    return main_features + tuple(float(prior[round_number]) for round_number in needed)

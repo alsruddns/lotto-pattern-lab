@@ -60,7 +60,7 @@ class DrawDataset:
 
 
 def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
-    """Load round/draw_no and n1..n6 CSV with locally checked round continuity."""
+    """Load six-number CSVs, with optional bonus and date columns for compatibility."""
     records: list[DrawRecord] = []
     with Path(path).open(encoding="utf-8-sig", newline="") as csv_file:
         reader = csv.DictReader(csv_file)
@@ -70,11 +70,15 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
         required = {round_column, *(f"n{i}" for i in range(1, 7))}
         if not required.issubset(reader.fieldnames):
             raise ValueError("CSV requires round or draw_no plus n1,n2,n3,n4,n5,n6 columns.")
+        bonus_column = next(
+            (name for name in ("bonus", "bonus_no", "bnsWnNo") if name in reader.fieldnames),
+            None,
+        )
         for line_number, row in enumerate(reader, start=2):
             try:
                 round_number = int(row[round_column])
                 numbers = tuple(int(row[f"n{i}"]) for i in range(1, 7))
-                bonus_value = row.get("bonus", "")
+                bonus_value = row.get(bonus_column, "") if bonus_column else ""
                 bonus = int(bonus_value) if bonus_value else None
                 date_value = row.get("date") or row.get("draw_date") or ""
                 draw_date = date.fromisoformat(date_value) if date_value else None
@@ -92,6 +96,21 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
             raise ValueError("CSV content does not match its provenance manifest checksum.")
         if manifest.get("source_kind") != "official_verified":
             raise ValueError("CSV provenance manifest has an unsupported source kind.")
+        date_file_name = manifest.get("date_sidecar")
+        if date_file_name:
+            date_path = Path(path).parent / str(date_file_name)
+            date_digest = hashlib.sha256(date_path.read_bytes()).hexdigest()
+            if date_digest != manifest.get("date_sidecar_sha256"):
+                raise ValueError("Official date sidecar does not match its provenance checksum.")
+            with date_path.open(encoding="utf-8-sig", newline="") as date_file:
+                date_reader = csv.DictReader(date_file)
+                dates = {int(row["round"]): date.fromisoformat(row["date"]) for row in date_reader}
+            if set(dates) != {record.round_number for record in records}:
+                raise ValueError("Official date sidecar does not match the CSV round range.")
+            records = [
+                DrawRecord(record.round_number, record.draw, dates[record.round_number])
+                for record in records
+            ]
         return DrawDataset(
             tuple(records),
             "official_verified",
@@ -116,6 +135,7 @@ def dataset_integrity_report(dataset: DrawDataset) -> dict[str, object]:
     known_rounds = set(rounds)
     missing = [number for number in range(rounds[0], rounds[-1] + 1) if number not in known_rounds]
     dated_count = sum(record.draw_date is not None for record in dataset.records)
+    bonus_count = sum(record.draw.bonus is not None for record in dataset.records)
     return {
         "round_range": [rounds[0], rounds[-1]],
         "draw_count": len(rounds),
@@ -124,6 +144,8 @@ def dataset_integrity_report(dataset: DrawDataset) -> dict[str, object]:
         "rounds_contiguous": not missing,
         "dated_draw_count": dated_count,
         "all_draws_dated": dated_count == len(rounds),
+        "bonus_draw_count": bonus_count,
+        "all_draws_have_bonus": bonus_count == len(rounds),
         "source_kind": dataset.source_kind,
         "verification_status": dataset.verification_status,
     }
@@ -147,12 +169,19 @@ def save_official_csv(dataset: DrawDataset, path: str | Path) -> tuple[Path, Pat
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
             writer = csv.writer(output)
-            writer.writerow(("round", "date", "n1", "n2", "n3", "n4", "n5", "n6"))
+            writer.writerow(
+                ("round", "date", "n1", "n2", "n3", "n4", "n5", "n6", "bonus")
+            )
             for record in dataset.records:
                 if record.draw_date is None:
                     raise ValueError("Official verified draw is missing its draw date.")
                 writer.writerow(
-                    (record.round_number, record.draw_date.isoformat(), *record.draw.numbers)
+                    (
+                        record.round_number,
+                        record.draw_date.isoformat(),
+                        *record.draw.numbers,
+                        record.draw.bonus,
+                    )
                 )
         digest = hashlib.sha256(Path(temporary_csv).read_bytes()).hexdigest()
         os.replace(temporary_csv, csv_path)
@@ -209,15 +238,24 @@ def save_official_csv(dataset: DrawDataset, path: str | Path) -> tuple[Path, Pat
     return csv_path, manifest_path
 
 
-def make_random_dataset(length: int, seed: int, first_round: int = 1) -> DrawDataset:
+def make_random_dataset(
+    length: int, seed: int, first_round: int = 1, include_bonus: bool = False
+) -> DrawDataset:
     """Generate independent six-number sets; this is synthetic control data."""
     if length < 2:
         raise ValueError("Synthetic dataset length must be at least two.")
     rng = random.Random(seed)
-    records = tuple(
-        DrawRecord(first_round + offset, Draw.from_numbers(rng.sample(range(1, 46), 6)))
-        for offset in range(length)
-    )
+    records_list = []
+    for offset in range(length):
+        numbers = rng.sample(range(1, 46), 6)
+        bonus = rng.choice([number for number in range(1, 46) if number not in numbers])
+        records_list.append(
+            DrawRecord(
+                first_round + offset,
+                Draw.from_numbers(numbers, bonus if include_bonus else None),
+            )
+        )
+    records = tuple(records_list)
     return DrawDataset(records, "synthetic", f"Independent random 6/45 draws (seed={seed}).")
 
 

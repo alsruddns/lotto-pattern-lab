@@ -1,0 +1,19 @@
+{
+  "source_kind": "official_verified",
+  "verification_status": "official_verified",
+  "source_description": "All 494 main-number sets and bonus numbers row-by-row reconciled with Donghaeng Lottery official results; official draw dates stored separately.",
+  "source_url": "https://www.dhlottery.co.kr/lt645/selectPstLt645Info.do",
+  "verified_at": "2026-10-19T07:37:08.314836+00:00",
+  "start_round": 753,
+  "end_round": 1246,
+  "draw_count": 494,
+  "sha256": "7c79c52828e98d90086087e3f6c2bb7fa1303507a1cbe8dd1dc62545a69fc2c9",
+  "date_sidecar": "lotto_draws_753_1246_with_bonus_dates.csv",
+  "date_sidecar_sha256": "c3bd537f3bb6babcc083e758dfe1860c64a5dcb5c7d30467244183bcdb563084",
+  "official_fields_checked": [
+    "round",
+    "n1..n6",
+    "bonus",
+    "date"
+  ]
+}

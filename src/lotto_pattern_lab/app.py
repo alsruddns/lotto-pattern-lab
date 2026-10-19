@@ -6,7 +6,12 @@ from pathlib import Path
 
 import streamlit as st
 
+from lotto_pattern_lab.bonus_research import (
+    evaluate_paired_prize_backtest,
+    run_bonus_experiment,
+)
 from lotto_pattern_lab.dataset import (
+    dataset_integrity_report,
     filter_dataset,
     load_csv,
     make_random_dataset,
@@ -49,7 +54,7 @@ st.caption(
 
 store = ExperimentStore(project_path("experiments"))
 official_path = project_path("data/official/draws.csv")
-local_draws_path = project_path("data/raw/lotto_draws_753_1246.csv")
+local_draws_path = project_path("data/raw/lotto_draws_753_1246_with_bonus.csv")
 
 with st.sidebar:
     st.header("데이터")
@@ -189,13 +194,25 @@ if base_dataset is not None:
     )
     feature_profile = st.selectbox(
         "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
-        ("legacy", "calendar_round"),
+        ("legacy", "calendar_round", "bonus_lag_v1"),
         help="\uae30\uc874\u0020\ud2b9\uc9d5\u0020\ud504\ub85c\ud30c\uc77c\uc785\ub2c8\ub2e4\u002e\u0020\ub0a0\uc9dc\u0020\ud2b9\uc9d5\uc740\u0020\ubaa8\ub4e0\u0020\ud68c\ucc28\uc5d0\u0020\uacf5\uc2dd\u0020\ucd94\ucc28\uc77c\uc774\u0020\uc788\uc744\u0020\ub54c\ub9cc\u0020\uc0ac\uc6a9\ud569\ub2c8\ub2e4\u002e",
         key="general_feature_profile",
     )
     st.caption(
         f"데이터 상태: {status_text} · "
         f"기본 연구 범위: 2017-05-06(753회) 이후 · 현재 {low_round}~{high_round}회"
+    )
+    integrity = dataset_integrity_report(base_dataset)
+    dataset_label = (
+        local_draws_path.name
+        if source_mode.startswith("로컬")
+        else base_dataset.source_description
+    )
+    st.info(
+        f"기준 데이터: {dataset_label} · "
+        f"보너스 포함 {integrity['bonus_draw_count']}/{integrity['draw_count']}회 · "
+        f"날짜 포함 {integrity['dated_draw_count']}/{integrity['draw_count']}회 · "
+        f"검증 상태: {integrity['verification_status']}"
     )
     date_values = [
         record.draw_date for record in base_dataset.records if record.draw_date is not None
@@ -242,13 +259,30 @@ if base_dataset is not None:
             f"{selected_dataset.records[-1].round_number}회 · "
             f"{len(selected_dataset.records)}회차 · 보너스 번호 제외"
         )
+        bonus_research_enabled = st.checkbox(
+            "보너스 번호를 별도 GP 연구 대상으로 실행",
+            value=False,
+            disabled=not all(record.draw.bonus is not None for record in selected_dataset.records),
+            help="1등 6개 번호 모델은 유지하고, 별도 실행으로 보너스 번호 정확 일치를 평가합니다.",
+        )
     except ValueError as error:
         st.error(str(error))
 
 run_clicked = st.button(
     "탐색 실행",
     type="primary",
-    disabled=(selected_dataset is None or (source_mode == "CSV 업로드" and uploaded is None)),
+    disabled=(
+        selected_dataset is None
+        or (source_mode == "CSV 업로드" and uploaded is None)
+        or (
+            feature_profile == "bonus_lag_v1"
+            and not all(record.draw.bonus is not None for record in selected_dataset.records)
+        )
+        or (
+            feature_profile == "calendar_round"
+            and any(record.draw_date is None for record in selected_dataset.records)
+        )
+    ),
 )
 if data_error:
     st.warning(data_error)
@@ -336,6 +370,49 @@ if run_clicked and selected_dataset is not None:
                 result = run_experiment(selected_dataset, config, store, update)
             progress_bar.progress(1.0, text="완료")
             st.success(f"실험 완료: {result['experiment_id']}")
+        if bonus_research_enabled:
+            bonus_config = SearchConfig(
+                population_size=int(population),
+                generations=int(generations),
+                crossover_probability=crossover,
+                mutation_probability=mutation,
+                max_depth=max_depth,
+                seed=int(seed) + 500_009,
+                workers=workers,
+                train_ratio=train_ratio,
+                validation_ratio=validation_ratio,
+                max_lag=max_lag,
+                control_runs=int(controls),
+            )
+            with st.spinner("별도 보너스 번호 GP 연구와 무작위 대조군을 실행합니다."):
+                bonus_result = run_bonus_experiment(selected_dataset, bonus_config, store)
+            if result.get("experiment_type") == "intermittent":
+                bonus_result["paired_prize_evaluation"] = evaluate_paired_prize_backtest(
+                    selected_dataset, result, bonus_result
+                )
+                store.save(bonus_result)
+                prizes = bonus_result["paired_prize_evaluation"]
+                st.info(
+                    "공유 독립 테스트 구간 · "
+                    f"1등 6개 완전 일치 {prizes['first_prize_exact_six']['hits']}/"
+                    f"{prizes['first_prize_exact_six']['denominator']} · "
+                    "2등 5개+보너스 일치 "
+                    f"{prizes['second_prize_five_plus_bonus']['hits']}/"
+                    f"{prizes['second_prize_five_plus_bonus']['denominator']}"
+                )
+            else:
+                bonus_result["paired_prize_evaluation"] = None
+                store.save(bonus_result)
+                st.caption(
+                    "보너스 번호는 별도 GP로 평가했습니다. 1등/2등 조합 집계에는 "
+                    "같은 회차 범위의 6개 집합 모델이 필요합니다."
+                )
+            st.success(
+                f"보너스 번호 연구 완료: {bonus_result['experiment_id']} · "
+                f"검증 적중률 {bonus_result['candidate']['validation_accuracy']:.3f} · "
+                f"독립 테스트 {bonus_result['candidate']['test_accuracy']:.3f} · "
+                f"무작위 기준 1/45"
+            )
     except Exception as error:  # surfaced in the UI for data/configuration errors
         st.exception(error)
 
@@ -357,6 +434,21 @@ else:
                     "학습 적합률": candidate.get("training_hit_rate"),
                     "검증 적합률": candidate.get("validation_hit_rate"),
                     "독립 테스트": candidate.get("test_hit_rate"),
+                    "실행 시간(초)": item.get("runtime_seconds"),
+                }
+            )
+            continue
+        if item.get("experiment_type") == "bonus_target":
+            candidate = item.get("candidate", {})
+            summary_rows.append(
+                {
+                    "실험 ID": item.get("experiment_id"),
+                    "대상": "보너스 번호 별도 모델",
+                    "상태": item.get("status"),
+                    "데이터 상태": item.get("dataset", {}).get("verification_status"),
+                    "학습 정확도": candidate.get("training_accuracy"),
+                    "검증 정확도": candidate.get("validation_accuracy"),
+                    "독립 테스트 정확도": candidate.get("test_accuracy"),
                     "실행 시간(초)": item.get("runtime_seconds"),
                 }
             )
@@ -454,6 +546,26 @@ else:
                 }
             )
             st.dataframe(selected["random_controls"], use_container_width=True, hide_index=True)
+    elif selected.get("experiment_type") == "bonus_target":
+        candidate = selected["candidate"]
+        st.subheader("보너스 번호 단일 대상 GP 평가")
+        st.caption(
+            "현재 회차의 보너스는 정답 레이블이며 입력 특징에는 "
+            "이전 회차 보너스만 포함됩니다."
+        )
+        st.code(candidate.get("formula", "미수집"), language="text")
+        st.json(
+            {
+                "학습 정확도": candidate.get("training_accuracy"),
+                "검증 정확도": candidate.get("validation_accuracy"),
+                "독립 테스트 정확도": candidate.get("test_accuracy"),
+                "무작위 기준 정확도": selected.get("random_baseline_accuracy"),
+                "무작위 대조 반복": len(selected.get("random_controls", [])),
+                "경험적 p값": selected.get("random_control_empirical_p_value"),
+                "1등/2등 공유 테스트 평가": selected.get("paired_prize_evaluation"),
+            }
+        )
+        st.json(selected.get("feature_variables", {}))
     else:
         candidate = selected.get("candidate", {})
         st.subheader("검증 구간에서 선택된 공식")

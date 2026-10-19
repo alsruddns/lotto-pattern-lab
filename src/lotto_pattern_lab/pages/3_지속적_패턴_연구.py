@@ -33,11 +33,13 @@ checkpoint_paths = sorted(
 )
 resume_config = {}
 with st.sidebar:
-    data_source = st.radio("연구 데이터", ("공식 검증 데이터", "로컬 검증 미완료 CSV"))
+    data_source = st.radio(
+        "연구 데이터", ("공식 검증 데이터", "보너스 포함 공식 대조 CSV"), index=1
+    )
     csv_path = (
         project_path("data/official/draws.csv")
         if data_source == "공식 검증 데이터"
-        else project_path("data/raw/lotto_draws_753_1246.csv")
+        else project_path("data/raw/lotto_draws_753_1246_with_bonus.csv")
     )
     workflow = st.radio(
         "작업",
@@ -89,10 +91,11 @@ with st.sidebar:
     engine = st.selectbox("탐색 엔진", ("intermittent_gp",))
     feature_profile = st.selectbox(
         "특징 프로파일",
-        ("legacy", "calendar_round"),
-        index=("legacy", "calendar_round").index(
+        ("legacy", "calendar_round", "bonus_lag_v1"),
+        index=("legacy", "calendar_round", "bonus_lag_v1").index(
             resume_config.get("feature_profile", "legacy")
-            if resume_config.get("feature_profile", "legacy") in {"legacy", "calendar_round"}
+            if resume_config.get("feature_profile", "legacy")
+            in {"legacy", "calendar_round", "bonus_lag_v1"}
             else "legacy"
         ),
         disabled=workflow == "저장된 연구 재개",
@@ -471,7 +474,11 @@ with button_col:
         or effective_config is None
         or integrity is None
         or not integrity["rounds_contiguous"]
-        or (feature_profile == "calendar_round" and not integrity["all_draws_dated"])
+                or (feature_profile == "calendar_round" and not integrity["all_draws_dated"])
+                or (
+                    feature_profile == "bonus_lag_v1"
+                    and not integrity["all_draws_have_bonus"]
+                )
         or active_worker
         or (workflow == "저장된 연구 재개" and selected_checkpoint is None),
     ):

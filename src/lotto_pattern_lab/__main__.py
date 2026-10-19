@@ -161,7 +161,11 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     parser.add_argument("--controls", type=int, default=20)
     parser.add_argument("--min-activation", type=float, default=0.1)
     parser.add_argument("--hidden-states", type=int, default=3)
-    parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
+    parser.add_argument(
+        "--feature-profile",
+        choices=("legacy", "calendar_round", "bonus_lag_v1"),
+        default="legacy",
+    )
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
     parser.add_argument("--store", default="experiments")
@@ -219,7 +223,11 @@ def _run_research_cli(argv: list[str]) -> None:
     )
     parser.add_argument("--max-runs", type=int)
     parser.add_argument("--engine", action="append", choices=SUPPORTED_ENGINES)
-    parser.add_argument("--feature-profile", choices=("legacy", "calendar_round"), default="legacy")
+    parser.add_argument(
+        "--feature-profile",
+        choices=("legacy", "calendar_round", "bonus_lag_v1"),
+        default="legacy",
+    )
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
     parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)

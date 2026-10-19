@@ -48,7 +48,8 @@ def fetch_official_draw(round_number: int, timeout: float = 20.0) -> DrawRecord 
     if draw_date < FIRST_SUPPORTED_DATE:
         raise ValueError(f"Official source date {draw_date} is earlier than supported start date.")
     numbers = tuple(int(row[f"tm{index}WnNo"]) for index in range(1, 7))
-    return DrawRecord(returned_round, Draw.from_numbers(numbers), draw_date)
+    bonus = int(row["bnsWnNo"])
+    return DrawRecord(returned_round, Draw.from_numbers(numbers, bonus), draw_date)
 
 
 def fetch_official_dataset(

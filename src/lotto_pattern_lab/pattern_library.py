@@ -14,6 +14,7 @@ from .dataset import DrawDataset
 from .feature_schema import (
     CODE_VERSION,
     FEATURE_SCHEMA_VERSION,
+    MAX_SUPPORTED_FEATURE_SCHEMA_VERSION,
     PRIMITIVE_SET_VERSION,
     feature_mapping,
     remap_formula_features,
@@ -395,7 +396,10 @@ class PatternLibrary:
                 reason = f"pattern status is {pattern.get('current_status')}"
             elif pattern.get("outputs_per_event") not in {1, 6}:
                 reason = "model output type is missing or unsupported"
-            elif int(pattern.get("feature_schema_version", 1)) > FEATURE_SCHEMA_VERSION:
+            elif (
+                int(pattern.get("feature_schema_version", 1))
+                > MAX_SUPPORTED_FEATURE_SCHEMA_VERSION
+            ):
                 reason = "feature schema version is newer than this application"
             elif (
                 pattern.get("primitive_set_version", PRIMITIVE_SET_VERSION) != PRIMITIVE_SET_VERSION
