@@ -19,11 +19,11 @@ import streamlit as st
 from lotto_pattern_lab.atomic_io import LockTimeoutError, interprocess_lock
 from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
 from lotto_pattern_lab.feature_schema import feature_schema_version
-from lotto_pattern_lab.gp_config import GPConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.preflight import run_research_preflight
+from lotto_pattern_lab.presentation import format_count, format_duration
 from lotto_pattern_lab.pysr_backend import PySRConfig, optional_backend_status
 from lotto_pattern_lab.research import (
     _round_metadata,
@@ -33,6 +33,58 @@ from lotto_pattern_lab.research import (
     request_pause,
 )
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
+
+GP_PRESETS = {
+    30: {"population": 32, "generations": 10, "max_depth": 5, "controls": 3},
+    60: {"population": 48, "generations": 15, "max_depth": 5, "controls": 5},
+    120: {"population": 64, "generations": 20, "max_depth": 6, "controls": 5},
+    180: {"population": 80, "generations": 25, "max_depth": 6, "controls": 5},
+    360: {"population": 96, "generations": 30, "max_depth": 6, "controls": 10},
+    480: {"population": 112, "generations": 35, "max_depth": 7, "controls": 10},
+}
+ENGINE_OPTIONS = ("GP ?? ?????", "PySR ?? ??", "GP + PySR ?? ??")
+
+
+def _apply_research_preset() -> None:
+    minutes = int(st.session_state.get("new_duration_minutes", 180))
+    preset = GP_PRESETS[minutes]
+    values = {
+        "new_population_size": preset["population"],
+        "new_generations": preset["generations"],
+        "new_crossover_probability": 0.65,
+        "new_mutation_probability": 0.25,
+        "new_max_depth": preset["max_depth"],
+        "new_workers": 4,
+        "new_train_ratio": 0.60,
+        "new_validation_ratio": 0.20,
+        "new_max_lag": 10,
+        "new_control_runs": preset["controls"],
+        "new_min_activation_rate": 0.10,
+        "new_hidden_states": 3,
+        "new_seed": 12345,
+        "new_elite_seeding_enabled": True,
+        "new_elite_seed_ratio": 0.20,
+    }
+    st.session_state.update(values)
+    profile = st.session_state.get("new_profile", "legacy")
+    pysr_defaults = PySRConfig(feature_profile=profile)
+    is_comparison = st.session_state.get("new_research_engine") == ENGINE_OPTIONS[2]
+    share = 0.5 if is_comparison else 0.8
+    st.session_state["new_pysr_timeout"] = min(3600.0, max(60.0, minutes * 60 * share))
+    st.session_state["new_pysr_iterations"] = min(200, max(20, minutes // 2))
+    st.session_state["new_pysr_population"] = pysr_defaults.population_size
+    st.session_state["new_pysr_populations"] = pysr_defaults.populations
+    st.session_state["new_pysr_maxsize"] = pysr_defaults.maxsize
+    st.session_state["new_pysr_maxdepth"] = pysr_defaults.maxdepth
+    st.session_state["new_pysr_workers"] = pysr_defaults.workers
+    st.session_state["new_pysr_controls"] = pysr_defaults.random_control_replicates
+    st.session_state["new_pysr_target"] = "main_positions"
+    st.session_state["new_pysr_binary_operators"] = ["+", "-", "*", "/"]
+    st.session_state["new_pysr_unary_operators"] = ["square", "abs"]
+    st.session_state["new_pysr_train_ratio"] = 0.60
+    st.session_state["new_pysr_validation_ratio"] = 0.20
+    st.session_state["new_pysr_warm_start"] = False
+
 
 PAUSE_MESSAGE = (
     "일시정지 요청 완료. 현재 진행 중인 실험의 계산과 저장이 끝난 후 자동으로 일시정지됩니다."
@@ -304,10 +356,63 @@ st.caption(
 checkpoint_dir = project_path("checkpoints")
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 rounds = ResearchRoundStore()
+@st.fragment(run_every="5s")
+def render_top_research_status() -> None:
+    st.subheader("연구 진행 현황")
+    monitor_path_text = st.session_state.get("monitor_research_checkpoint")
+    candidates = _resume_records(rounds)
+    active_item = next((item for item in candidates if item.get("_worker_active")), None)
+    if not monitor_path_text and active_item:
+        monitor_path_text = str(active_item["_path"])
+    if not monitor_path_text:
+        st.info("현재 실행 중인 연구가 없습니다. 이 패널은 5초마다 갱신됩니다.")
+        return
+    monitor_path = project_path(monitor_path_text)
+    if not monitor_path.is_relative_to(PROJECT_ROOT) or not monitor_path.is_file():
+        st.warning("개발 환경의 체크포인트를 찾을 수 없습니다.")
+        return
+    try:
+        monitor = load_checkpoint(monitor_path)
+    except (OSError, ValueError) as error:
+        st.error(f"체크포인트를 읽지 못했습니다: {error}")
+        return
+    elapsed = float(monitor.get("total_elapsed_seconds", monitor.get("elapsed_seconds", 0)))
+    target = float(monitor.get("target_duration_seconds", 0))
+    remaining = max(0.0, target - elapsed) if target else None
+    progress = min(1.0, elapsed / target) if target else 0.0
+    current = monitor.get("in_progress", {})
+    engine_names = {
+        "intermittent_gp": "GP",
+        "pysr_symbolic_regression": "PySR",
+    }
+    engines = [engine_names.get(value, value) for value in monitor.get("engines", [])]
+    cols = st.columns(5)
+    cols[0].metric("연구 상태", str(monitor.get("status", "미수집")))
+    cols[1].metric("완료 실험", format_count(monitor.get("completed_runs", 0)))
+    cols[2].metric("실패 실험", format_count(len(monitor.get("failed_runs", []))))
+    cols[3].metric("실행 엔진", ", ".join(engines) or "미수집")
+    cols[4].metric(
+        "누적 / 남은 시간",
+        f"{format_duration(elapsed)} / {format_duration(remaining)}",
+    )
+    st.progress(progress)
+    progress_event = monitor.get("current_progress", {}).get("event", {})
+    detail = ""
+    if isinstance(progress_event, dict):
+        detail = progress_event.get("stage") or progress_event.get("run") or ""
+    st.caption(
+        f"현재 시드: "
+        f"{current.get('seed', monitor.get('rng_resume', {}).get('next_seed', '미수집'))} · "
+        f"마지막 체크포인트: {monitor.get('last_updated_at', '미수집')} · "
+        f"단계: {detail or '실험 경계 대기'} · {monitor_path}"
+    )
+
+
+render_top_research_status()
+
 new_tab, resume_tab = st.tabs(("새 연구 시작", "기존 연구 이어서 하기"))
 
 with new_tab:
-    defaults = GPConfig()
     data_label = st.radio(
         "기준 데이터",
         ("보너스 번호 포함 CSV", "기존 당첨번호 CSV"),
@@ -332,148 +437,230 @@ with new_tab:
         new_integrity = None
         st.error(f"기준 데이터를 읽지 못했습니다: {error}")
 
+    st.session_state.setdefault("new_research_engine", ENGINE_OPTIONS[0])
+    st.session_state.setdefault("new_profile", "legacy")
+    st.session_state.setdefault("new_duration_minutes", 180)
+    if "new_population_size" not in st.session_state:
+        _apply_research_preset()
+    engine_choice = st.selectbox(
+        "탐색 엔진",
+        ENGINE_OPTIONS,
+        key="new_research_engine",
+        help=(
+            "GP는 유전 프로그래밍, PySR은 기호 회귀입니다. "
+            "비교 연구는 두 엔진을 번갈아 실행합니다."
+        ),
+        on_change=_apply_research_preset,
+    )
+    engines = {
+        ENGINE_OPTIONS[0]: ("intermittent_gp",),
+        ENGINE_OPTIONS[1]: ("pysr_symbolic_regression",),
+        ENGINE_OPTIONS[2]: ("intermittent_gp", "pysr_symbolic_regression"),
+    }[engine_choice]
+    profile_names = {
+        "legacy": "기본 특징",
+        "calendar_round": "회차·날짜 특징",
+        "bonus_lag_v1": "보너스 번호 포함 특징",
+    }
+    profile = st.selectbox(
+        "특징 프로파일",
+        ("legacy", "calendar_round", "bonus_lag_v1"),
+        format_func=lambda value: profile_names[value],
+        key="new_profile",
+        help="날짜나 보너스 번호 특징을 쓰려면 데이터에 해당 정보가 있어야 합니다.",
+        on_change=_apply_research_preset,
+    )
+    duration_minutes = st.selectbox(
+        "연구 시간 프리셋",
+        (30, 60, 120, 180, 360, 480),
+        format_func=lambda value: f"{value}분",
+        key="new_duration_minutes",
+        help=(
+            "전체 연구 시간 예산입니다. GP와 PySR 비교는 같은 예산 안에서 "
+            "두 엔진을 번갈아 실행합니다."
+        ),
+        on_change=_apply_research_preset,
+    )
+    st.caption("자동 추천값은 시작점이며 최적 성능이 입증된 설정은 아닙니다.")
+    selected_preset = GP_PRESETS[int(duration_minutes)]
+    st.info(
+        f"GP 권장값: 개체군 {selected_preset['population']}, "
+        f"세대 {selected_preset['generations']}, 최대 깊이 {selected_preset['max_depth']}, "
+        f"무작위 대조 {selected_preset['controls']}회. 공통값: 교차 0.65, 돌연변이 0.25, "
+        "학습/검증 60%/20%, 과거 참조 10회, 최소 활성률 10%, 숨겨진 상태 3개, "
+        "CPU 최대 4개, Elite Seeding 20%, 시드 12345."
+    )
     with st.form("new_research_form"):
-        engine_choice = st.selectbox(
-            "탐색 엔진",
-            ("GP 유전 프로그래밍", "PySR 기호 회귀", "GP + PySR 비교 연구"),
-            key="new_research_engine",
-        )
-        engines = {
-            "GP 유전 프로그래밍": ("intermittent_gp",),
-            "PySR 기호 회귀": ("pysr_symbolic_regression",),
-            "GP + PySR 비교 연구": ("intermittent_gp", "pysr_symbolic_regression"),
-        }[engine_choice]
-        profile = st.selectbox(
-            "특징 프로파일", ("legacy", "calendar_round", "bonus_lag_v1"), key="new_profile"
-        )
-        duration_minutes = st.number_input(
-            "총 연구 시간(분)",
-            min_value=1,
-            max_value=10080,
-            value=180,
-            step=30,
-            key="new_duration_minutes",
-        )
-        population = st.number_input(
-            "개체군",
-            min_value=8,
-            max_value=512,
-            value=defaults.population_size,
-            step=8,
-            key="new_population_size",
-        )
-        generations = st.number_input(
-            "세대 수", min_value=1, max_value=500, value=defaults.generations, key="new_generations"
-        )
-        col1, col2, col3 = st.columns(3)
-        crossover = col1.slider(
-            "교차 확률", 0.0, 1.0, defaults.crossover_probability, key="new_crossover_probability"
-        )
-        mutation = col2.slider(
-            "돌연변이 확률", 0.0, 1.0, defaults.mutation_probability, key="new_mutation_probability"
-        )
-        max_depth = col3.number_input(
-            "최대 수식 깊이", 2, 20, defaults.max_depth, key="new_max_depth"
-        )
-        workers = st.number_input("CPU 워커", 1, 4, defaults.workers, key="new_workers")
-        col1, col2, col3 = st.columns(3)
-        train_ratio = col1.slider(
-            "학습 비율", 0.1, 0.9, defaults.train_ratio, key="new_train_ratio"
-        )
-        validation_ratio = col2.slider(
-            "검증 비율", 0.05, 0.8, defaults.validation_ratio, key="new_validation_ratio"
-        )
-        max_lag = col3.number_input("최대 과거 참조", 1, 10, defaults.max_lag, key="new_max_lag")
-        col1, col2, col3 = st.columns(3)
-        controls = col1.number_input("무작위 대조 반복", 0, 100, 3, key="new_control_runs")
-        min_activation = col2.slider(
-            "최소 활성화 비율", 0.05, 1.0, 0.1, key="new_min_activation_rate"
-        )
-        hidden_states = col3.number_input("숨겨진 상태 수", 2, 5, 3, key="new_hidden_states")
-        seed = st.number_input("초기 난수 시드", 0, 2**31 - 1, defaults.seed, key="new_seed")
-        elite_enabled = st.checkbox(
-            "Elite Seeding 사용", value=True, key="new_elite_seeding_enabled"
-        )
-        elite_ratio = st.slider(
-            "기존 패턴 계승 비율", 0.0, 0.8, 0.2, 0.05, key="new_elite_seed_ratio"
-        )
-        pysr_defaults = PySRConfig(feature_profile=profile)
-        pysr_targets = ("main_positions", "one_number") + (
-            ("bonus",) if profile in {"bonus_lag_v1", "calendar_round"} else ()
-        )
-        pysr_target = st.selectbox(
-            "PySR 탐색 목표", pysr_targets,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_target",
-        )
-        pysr_binary_operators = st.multiselect(
-            "PySR 이항 연산자", ("+", "-", "*", "/"), default=["+", "-", "*", "/"],
-            disabled="pysr_symbolic_regression" not in engines,
-            key="new_pysr_binary_operators",
-        )
-        pysr_unary_operators = st.multiselect(
-            "PySR 단항 연산자", ("square", "abs"), default=["square", "abs"],
-            disabled="pysr_symbolic_regression" not in engines,
-            key="new_pysr_unary_operators",
-        )
-        pysr_guesses_text = st.text_area(
-            "초기 추정 수식 (한 줄에 하나, 변수 x0, x1, ...)",
-            disabled="pysr_symbolic_regression" not in engines,
-            key="new_pysr_guesses",
-        )
-        pysr_warm_start = st.checkbox(
-            "실패 시 동일 난수 시드의 PySR 저장 상태에서 재개",
-            value=False,
-            disabled="pysr_symbolic_regression" not in engines,
-            help=(
-                "PySR의 저장된 hall-of-fame 상태를 from_file로 불러옵니다. "
-                "재개에는 해당 실행 폴더의 정상 PySR 체크포인트가 필요합니다."
-            ),
-            key="new_pysr_warm_start",
-        )
-        pysr_timeout = st.number_input(
-            "PySR 탐색 시간(초, 위치별 상한)", 1.0, 3600.0, 60.0, 1.0,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_timeout",
-        )
-        pysr_train_ratio = st.slider(
-            "PySR 학습 비율", 0.1, 0.8, 0.6, 0.05,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_train_ratio",
-        )
-        pysr_validation_ratio = st.slider(
-            "PySR 검증 비율", 0.05, 0.7, 0.2, 0.05,
-            disabled="pysr_symbolic_regression" not in engines,
-            key="new_pysr_validation_ratio",
-        )
-        col1, col2, col3 = st.columns(3)
-        pysr_iterations = col1.number_input(
-            "PySR 반복", 1, 10000, pysr_defaults.niterations,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_iterations",
-        )
-        pysr_population = col2.number_input(
-            "PySR 모집단", 8, 512, pysr_defaults.population_size,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_population",
-        )
-        pysr_populations = col3.number_input(
-            "PySR 모집단 수", 1, 32, pysr_defaults.populations,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_populations",
-        )
-        col1, col2, col3 = st.columns(3)
-        pysr_maxsize = col1.number_input(
-            "PySR 최대 복잡도", 4, 100, pysr_defaults.maxsize,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_maxsize",
-        )
-        pysr_maxdepth = col2.number_input(
-            "PySR 최대 깊이", 1, 100, pysr_defaults.maxdepth,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_maxdepth",
-        )
-        pysr_workers = col3.number_input(
-            "PySR CPU 워커", 1, 4, pysr_defaults.workers,
-            disabled="pysr_symbolic_regression" not in engines, key="new_pysr_workers",
-        )
-        pysr_controls = st.number_input(
-            "PySR 무작위 대조 반복", 0, 100, pysr_defaults.random_control_replicates,
-            disabled="pysr_symbolic_regression" not in engines,
-            key="new_pysr_controls",
-        )
+        with st.expander("고급 설정", expanded=False):
+            population = st.number_input(
+                "개체군",
+                min_value=8,
+                max_value=512,
+                step=8,
+                help="한 세대에서 평가할 후보 수이며 값이 클수록 계산량이 늘어납니다.",
+                key="new_population_size",
+            )
+            generations = st.number_input(
+                "세대 수",
+                min_value=1,
+                max_value=500,
+                help="진화 탐색 반복 횟수입니다.",
+                key="new_generations",
+            )
+            col1, col2, col3 = st.columns(3)
+            crossover = col1.slider(
+                "교차 확률",
+                0.0,
+                1.0,
+                help="세대 간 후보를 섞어 새 후보를 만드는 비율입니다.",
+                key="new_crossover_probability",
+            )
+            mutation = col2.slider(
+                "돌연변이 확률",
+                0.0,
+                1.0,
+                help="후보를 무작위로 변형해 탐색하는 비율입니다.",
+                key="new_mutation_probability",
+            )
+            max_depth = col3.number_input(
+                "최대 수식 깊이", 2, 20,
+                help="GP 수식 트리의 최대 깊이입니다.", key="new_max_depth"
+            )
+            workers = st.number_input(
+                "CPU 워커", 1, 4, help="동시에 사용할 CPU 프로세스 수입니다.", key="new_workers"
+            )
+            col1, col2, col3 = st.columns(3)
+            train_ratio = col1.slider(
+                "학습 비율", 0.1, 0.9,
+                help="후보 생성과 학습에 사용하는 과거 회차 비율입니다.", key="new_train_ratio"
+            )
+            validation_ratio = col2.slider(
+                "검증 비율", 0.05, 0.8,
+                help="후보 비교와 선택에 사용하는 별도 과거 회차 비율입니다.",
+                key="new_validation_ratio",
+            )
+            max_lag = col3.number_input(
+                "최대 과거 참조", 1, 10,
+                help="예측 입력에서 참조할 과거 회차의 최대 수입니다.", key="new_max_lag"
+            )
+            col1, col2, col3 = st.columns(3)
+            controls = col1.number_input(
+                "무작위 대조 반복", 0, 100,
+                help="무작위 기준선 비교를 반복하는 횟수입니다.", key="new_control_runs"
+            )
+            min_activation = col2.slider(
+                "최소 활성화 비율", 0.05, 1.0,
+                help="이 비율보다 적게 활성화되는 규칙을 후보에서 제외합니다.",
+                key="new_min_activation_rate"
+            )
+            hidden_states = col3.number_input(
+                "숨겨진 상태 수", 2, 5,
+                help="GP 조건식에서 구분하는 내부 상태 수입니다.", key="new_hidden_states"
+            )
+            seed = st.number_input(
+                "초기 난수 시드", 0, 2**31 - 1,
+                help="같은 환경에서 탐색을 재현하기 위한 난수 시드입니다.", key="new_seed"
+            )
+            elite_enabled = st.checkbox(
+                "Elite Seeding 사용",
+                help="호환되는 저장 패턴을 초기 후보에 포함합니다.",
+                key="new_elite_seeding_enabled"
+            )
+            elite_ratio = st.slider(
+                "기존 패턴 계승 비율", 0.0, 0.8, step=0.05,
+                help="초기 개체군 중 저장 패턴에서 가져오는 비율입니다.", key="new_elite_seed_ratio"
+            )
+            pysr_targets = ("main_positions", "one_number") + (
+                ("bonus",) if profile in {"bonus_lag_v1", "calendar_round"} else ()
+            )
+            pysr_target = st.selectbox(
+                "PySR 탐색 목표", pysr_targets,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR이 수식으로 예측할 번호 대상입니다.", key="new_pysr_target",
+            )
+            pysr_binary_operators = st.multiselect(
+                "PySR 이항 연산자", ("+", "-", "*", "/"),
+                disabled="pysr_symbolic_regression" not in engines,
+                help="수식에 허용할 이항 연산자입니다.", key="new_pysr_binary_operators",
+            )
+            pysr_unary_operators = st.multiselect(
+                "PySR 단항 연산자", ("square", "abs"),
+                disabled="pysr_symbolic_regression" not in engines,
+                help="수식에 허용할 단항 연산자입니다.", key="new_pysr_unary_operators",
+            )
+            pysr_guesses_text = st.text_area(
+                "초기 추정 수식 (한 줄에 하나, 변수 x0, x1, ...)",
+                disabled="pysr_symbolic_regression" not in engines,
+                help=(
+                    "초기 후보 수식입니다. 한 줄에 하나씩 입력하고 입력 변수는 "
+                    "실제 특징 스키마와 맞아야 합니다."
+                ),
+                key="new_pysr_guesses",
+            )
+            pysr_warm_start = st.checkbox(
+                "실패 시 동일 난수 시드의 PySR 저장 상태에서 재개",
+                value=False,
+                disabled="pysr_symbolic_regression" not in engines,
+                help=(
+                    "PySR의 저장된 hall-of-fame 상태를 from_file로 불러옵니다. "
+                    "재개에는 해당 실행 폴더의 정상 PySR 체크포인트가 필요합니다."
+                ),
+                key="new_pysr_warm_start",
+            )
+            pysr_timeout = st.number_input(
+                "PySR 탐색 시간(초, 위치별 상한)", 1.0, 3600.0, step=1.0,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 한 번의 fit에 허용할 전체 초입니다. 대상 위치별로 나누어 적용합니다.",
+                key="new_pysr_timeout",
+            )
+            pysr_train_ratio = st.slider(
+                "PySR 학습 비율", 0.1, 0.8, step=0.05,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 수식 생성에 사용할 과거 회차 비율입니다.",
+                key="new_pysr_train_ratio",
+            )
+            pysr_validation_ratio = st.slider(
+                "PySR 검증 비율", 0.05, 0.7, step=0.05,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 후보를 선택하는 검증 회차 비율입니다.", key="new_pysr_validation_ratio",
+            )
+            col1, col2, col3 = st.columns(3)
+            pysr_iterations = col1.number_input(
+                "PySR 반복", 1, 10000,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 진화 탐색 반복 횟수입니다.", key="new_pysr_iterations",
+            )
+            pysr_population = col2.number_input(
+                "PySR 모집단", 8, 512,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 각 모집단의 수식 후보 수입니다.", key="new_pysr_population",
+            )
+            pysr_populations = col3.number_input(
+                "PySR 모집단 수", 1, 32,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR이 동시에 유지하는 모집단 수입니다.", key="new_pysr_populations",
+            )
+            col1, col2, col3 = st.columns(3)
+            pysr_maxsize = col1.number_input(
+                "PySR 최대 복잡도", 4, 100,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 수식의 최대 복잡도입니다.", key="new_pysr_maxsize",
+            )
+            pysr_maxdepth = col2.number_input(
+                "PySR 최대 깊이", 1, 100,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 수식의 최대 중첩 깊이입니다.", key="new_pysr_maxdepth",
+            )
+            pysr_workers = col3.number_input(
+                "PySR CPU 워커", 1, 4,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR에서 사용할 CPU 워커 수입니다.", key="new_pysr_workers",
+            )
+            pysr_controls = st.number_input(
+                "PySR 무작위 대조 반복", 0, 100,
+                disabled="pysr_symbolic_regression" not in engines,
+                help="PySR 후보와 비교할 무작위 대조 횟수입니다.", key="new_pysr_controls",
+            )
         pattern_db = project_path("data/database/patterns.sqlite")
         pattern_db_stat = (
             (pattern_db.stat().st_mtime_ns, pattern_db.stat().st_size)
@@ -592,6 +779,27 @@ with new_tab:
         except ValueError as error:
             config_error = str(error)
             st.error(f"PySR 설정을 확인하세요: {error}")
+    if effective_config is not None:
+        expected = GP_PRESETS[int(duration_minutes)]
+        is_custom = (
+            effective_config.population_size != expected["population"]
+            or effective_config.generations != expected["generations"]
+            or effective_config.max_depth != expected["max_depth"]
+            or effective_config.control_runs != expected["controls"]
+            or effective_config.crossover_probability != 0.65
+            or effective_config.mutation_probability != 0.25
+            or effective_config.train_ratio != 0.60
+            or effective_config.validation_ratio != 0.20
+            or effective_config.max_lag != 10
+            or effective_config.min_activation_rate != 0.10
+            or effective_config.hidden_states != 3
+            or effective_config.workers != 4
+            or not effective_config.elite_seeding_enabled
+            or effective_config.elite_seed_ratio != 0.20
+            or effective_config.seed != 12345
+        )
+        st.caption("?? ??: ??? ??" if is_custom else "?? ??: ?? ???")
+
     if new_dataset is not None and effective_config is not None:
         invalid_profile = (
             (profile == "calendar_round" and not new_integrity["all_draws_dated"])
