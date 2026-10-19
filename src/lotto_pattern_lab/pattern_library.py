@@ -328,8 +328,11 @@ class PatternLibrary:
         max_lag: int,
         max_candidates: int,
         max_per_origin: int = 2,
+        target_model_type: str = "main",
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         """Rank eligible patterns from train/validation evidence only, preserving diversity."""
+        if target_model_type not in {"main", "bonus_number"}:
+            raise ValueError("Target model type must be main or bonus_number.")
         from .storage import ExperimentStore
 
         target_mapping = feature_mapping(feature_profile, max_lag)
@@ -339,6 +342,23 @@ class PatternLibrary:
         experiment_cache: dict[str, dict[str, Any] | None] = {}
         for pattern in self.list_patterns(limit=100_000):
             pattern_id = str(pattern["pattern_id"])
+            pattern_type = pattern.get("model_type")
+            if target_model_type == "main" and pattern_type == "bonus_number":
+                skipped.append(
+                    {
+                        "pattern_id": pattern_id,
+                        "reason": "bonus target is isolated from main-number Elite Seeding",
+                    }
+                )
+                continue
+            if target_model_type == "bonus_number" and pattern_type != "bonus_number":
+                skipped.append(
+                    {
+                        "pattern_id": pattern_id,
+                        "reason": "main-number patterns cannot seed the bonus-number target",
+                    }
+                )
+                continue
             performance = pattern.get("performance", {})
             if performance.get("validation_score") is None:
                 experiment_id = str(pattern.get("experiment_id", ""))
@@ -883,8 +903,15 @@ def register_experiment_candidates(
     configuration = result.get("config", {})
     feature_schema = result.get("feature_schema", {})
     registered: list[dict[str, Any]] = []
-    for model_name in ("one_number_model", "six_number_set_model"):
+    model_types = (
+        ("one_number_model", "one_number"),
+        ("six_number_set_model", "six_number_set"),
+        ("bonus_number_model", "bonus_number"),
+    )
+    for model_name, model_type in model_types:
         model = result.get(model_name, {})
+        if not model:
+            continue
         selected = model.get("selected", {})
         candidates = model.get("candidates") or [selected]
         for candidate_rank, candidate in enumerate(candidates, start=1):
@@ -899,7 +926,7 @@ def register_experiment_candidates(
                 payload = {
                     "activation_condition": str(candidate["activation_condition"]),
                     "formulas": list(rule_formulas),
-                    "model_type": "one_number" if outputs == 1 else "six_number_set",
+                    "model_type": model_type,
                     "feature_profile": feature_schema.get(
                         "feature_profile", configuration.get("feature_profile", "legacy")
                     ),

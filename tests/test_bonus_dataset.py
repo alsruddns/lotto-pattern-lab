@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import pytest
 
 from lotto_pattern_lab.bonus_research import (
@@ -17,7 +20,11 @@ from lotto_pattern_lab.features import (
     build_bonus_features_for_target,
 )
 from lotto_pattern_lab.gp_engine import SearchConfig
+from lotto_pattern_lab.intermittent import IntermittentConfig
+from lotto_pattern_lab.intermittent_experiment import run_intermittent_experiment
+from lotto_pattern_lab.pattern_library import PatternLibrary, register_experiment_candidates
 from lotto_pattern_lab.prize_evaluation import evaluate_prize_predictions
+from lotto_pattern_lab.research import dataset_digest
 
 
 def _dataset(count: int = 45) -> DrawDataset:
@@ -46,6 +53,30 @@ def test_old_and_bonus_csv_formats_are_both_supported(tmp_path):
     )
     assert load_csv(old).records[0].draw.bonus is None
     assert load_csv(bonus).records[0].draw.bonus == 7
+
+
+def test_bonus_digest_changes_without_breaking_legacy_checkpoint_digest():
+    legacy_records = tuple(
+        DrawRecord(record.round_number, Draw(record.draw.numbers), record.draw_date)
+        for record in _dataset().records
+    )
+    legacy = DrawDataset(legacy_records, "synthetic", "legacy")
+    expected_legacy = hashlib.sha256(
+        json.dumps(
+            [
+                {
+                    "round": record.round_number,
+                    "date": None,
+                    "numbers": record.draw.numbers,
+                }
+                for record in legacy.records
+            ],
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert dataset_digest(legacy) == expected_legacy
+    assert dataset_digest(_dataset()) != expected_legacy
 
 
 def test_bonus_target_uses_only_lagged_bonus_values():
@@ -165,3 +196,37 @@ def test_paired_backtest_separates_exact_six_from_five_plus_bonus():
     assert result["first_prize_exact_six"] == {"hits": 2, "denominator": 3}
     assert result["second_prize_five_plus_bonus"] == {"hits": 1, "denominator": 3}
     assert result["evaluation_kind"] == "chronological_backtest_not_pre_draw_predictions"
+
+
+def test_persistent_bonus_profile_runs_bonus_target_and_paired_tiers(tmp_path):
+    library = PatternLibrary(tmp_path / "patterns.sqlite")
+    result = run_intermittent_experiment(
+        _dataset(),
+        IntermittentConfig(
+            population_size=8,
+            generations=1,
+            workers=1,
+            max_lag=3,
+            control_runs=0,
+            hidden_states=2,
+            min_activation_rate=0.05,
+            feature_profile="bonus_lag_v1",
+            seed=17,
+        ),
+        ExperimentStore(tmp_path / "experiments"),
+        pattern_library=library,
+    )
+    assert result["bonus_number_model"] is not None
+    paired = result["prize_tier_backtest"]
+    assert paired["first_prize_exact_six"]["denominator"] > 0
+    assert paired["second_prize_five_plus_bonus"]["denominator"] == paired[
+        "first_prize_exact_six"
+    ]["denominator"]
+    assert paired["bonus_elite_seeding"]["cross_target_patterns_allowed"] is False
+    registered = register_experiment_candidates(result, library)
+    assert any(item["model_type"] == "bonus_number" for item in registered)
+    elite, skipped = library.select_elite_candidates(
+        feature_profile="bonus_lag_v1", max_lag=3, max_candidates=20
+    )
+    assert all(item.get("model_type") != "bonus_number" for item in elite)
+    assert any("bonus target is isolated" in item["reason"] for item in skipped)

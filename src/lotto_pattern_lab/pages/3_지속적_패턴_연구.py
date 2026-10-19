@@ -101,6 +101,11 @@ with st.sidebar:
         disabled=workflow == "저장된 연구 재개",
         key="research_feature_profile",
     )
+    if feature_profile == "bonus_lag_v1":
+        st.caption(
+            "이 프로파일은 이전 보너스 특징을 사용하고, 보너스 전용 GP와 무작위 대조도 실행합니다. "
+            "보너스 계보는 보너스 대상끼리만 Elite Seeding에 사용합니다."
+        )
     elite_enabled = st.checkbox(
         "Elite Seeding 사용",
         value=bool(

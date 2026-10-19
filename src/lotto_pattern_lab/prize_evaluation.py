@@ -8,7 +8,7 @@ from .dataset import DrawDataset
 def evaluate_prize_predictions(
     dataset: DrawDataset,
     main_predictions: Mapping[int, Sequence[int]],
-    bonus_predictions: Mapping[int, int],
+    bonus_predictions: Mapping[int, int | None],
 ) -> dict[str, object]:
     """Count exact six and exactly five plus bonus on shared, explicit target rounds."""
     records = {record.round_number: record for record in dataset.records}

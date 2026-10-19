@@ -1,5 +1,6 @@
 """Full intermittent-rule experiments with matched random controls and causal regimes."""
 
+import math
 import time
 import uuid
 from collections import defaultdict
@@ -31,6 +32,7 @@ from .pattern_library import (
     register_experiment_candidates,
     register_experiment_exact_matches,
 )
+from .prize_evaluation import evaluate_prize_predictions
 from .research_features import (
     ResearchFeatureConfig,
     build_research_examples,
@@ -249,6 +251,36 @@ def run_intermittent_experiment(
         run_label="actual_six_number_set",
         elite_seeds=elite_seeds,
     )
+    bonus_model = None
+    bonus_elite_seeds: list[dict[str, object]] = []
+    bonus_elite_skipped: list[dict[str, str]] = []
+    if config.feature_profile == "bonus_lag_v1":
+        if config.elite_seeding_enabled:
+            bonus_library = pattern_library or PatternLibrary()
+            bonus_elite_seeds, bonus_elite_skipped = bonus_library.select_elite_candidates(
+                feature_profile="bonus_lag_v1",
+                max_lag=config.max_lag,
+                max_candidates=math.ceil(config.population_size * config.elite_seed_ratio) * 2,
+                target_model_type="bonus_number",
+            )
+        bonus_examples = build_bonus_examples(dataset, config.max_lag)
+        bonus_splits = chronological_split(
+            bonus_examples, config.train_ratio, config.validation_ratio
+        )
+        bonus_config = IntermittentConfig(
+            **{
+                **asdict(config),
+                "seed": config.seed + 2,
+            }
+        )
+        bonus_model = run_intermittent_search(
+            bonus_splits,
+            bonus_config,
+            outputs_per_event=1,
+            progress=record_progress,
+            run_label="actual_bonus_number",
+            elite_seeds=tuple(bonus_elite_seeds),
+        )
     actual_gp_runtime = time.perf_counter() - actual_gp_started
     paired_unseeded = None
     paired_unseeded_runtime = None
@@ -287,10 +319,53 @@ def run_intermittent_experiment(
     change_points = [row for row in state_rows if row["online_change_point"]]
     one_dict = _search_dict(one_number)
     set_dict = _search_dict(set_model)
+    bonus_dict = _search_dict(bonus_model) if bonus_model else None
+    if bonus_dict is not None and bonus_model is not None:
+        bonus_dict["elite_seeding_compatibility"] = {
+            "target_model_type": "bonus_number",
+            "source_pattern_ids": bonus_model.seeding.get("source_pattern_ids", []),
+            "skipped": bonus_elite_skipped,
+        }
     one_dict["selected"]["activation_events"] = _with_state_tags(
         one_number.selected, state_by_round
     )
     set_dict["selected"]["activation_events"] = _with_state_tags(set_model.selected, state_by_round)
+    prize_tier_backtest = None
+    if bonus_model is not None and bonus_dict is not None:
+        bonus_events = {
+            int(event["round_number"]): event
+            for event in bonus_model.selected.activation_events
+            if int(event["round_number"]) in set_model.test_rounds
+        }
+        main_events = {
+            int(event["round_number"]): event
+            for event in set_model.selected.activation_events
+            if int(event["round_number"]) in set_model.test_rounds
+        }
+        prize_tier_backtest = evaluate_prize_predictions(
+            dataset,
+            {
+                round_number: main_events[round_number]["predicted_numbers"]
+                for round_number in set_model.test_rounds
+            },
+            {
+                round_number: (
+                    bonus_events[round_number]["predicted_numbers"][0]
+                    if bonus_events[round_number]["predicted_numbers"]
+                    else None
+                )
+                for round_number in set_model.test_rounds
+            },
+        )
+        prize_tier_backtest["evaluation_kind"] = (
+            "chronological_backtest_not_pre_draw_predictions"
+        )
+        prize_tier_backtest["bonus_elite_seeding"] = {
+            "enabled": config.elite_seeding_enabled,
+            "source_pattern_ids": bonus_model.seeding.get("source_pattern_ids", []),
+            "skipped": bonus_elite_skipped,
+            "cross_target_patterns_allowed": False,
+        }
     state_metrics = {
         "one_number_test": _state_conditioned_metrics(one_number.selected, splits, state_by_round),
         "six_number_test": _state_conditioned_metrics(set_model.selected, splits, state_by_round),
@@ -342,6 +417,21 @@ def run_intermittent_experiment(
             progress=record_progress,
             run_label=f"random_{control_index + 1}_six_number_set",
         )
+        control_bonus = None
+        if config.feature_profile == "bonus_lag_v1":
+            bonus_control_examples = build_bonus_examples(control_dataset, config.max_lag)
+            bonus_control_splits = chronological_split(
+                bonus_control_examples, config.train_ratio, config.validation_ratio
+            )
+            control_bonus = run_intermittent_search(
+                bonus_control_splits,
+                IntermittentConfig(
+                    **{**asdict(control_config), "seed": control_config.seed + 2}
+                ),
+                outputs_per_event=1,
+                progress=record_progress,
+                run_label=f"random_{control_index + 1}_bonus_number",
+            )
         control_states, _ = _hypothetical_states(control_splits, control_config)
         random_controls.append(
             {
@@ -350,6 +440,7 @@ def run_intermittent_experiment(
                 "search_seed": control_config.seed,
                 "one_number": _search_dict(control_one),
                 "six_number_set": _search_dict(control_set),
+                "bonus_number": _search_dict(control_bonus) if control_bonus else None,
                 "hypothetical_state_count": config.hidden_states,
                 "change_point_count": sum(
                     bool(row["online_change_point"]) for row in control_states
@@ -388,9 +479,11 @@ def run_intermittent_experiment(
             "source_pattern_ids": sorted(
                 set(one_number.seeding.get("source_pattern_ids", ()))
                 | set(set_model.seeding.get("source_pattern_ids", ()))
+                | (set(bonus_model.seeding.get("source_pattern_ids", ())) if bonus_model else set())
             ),
             "one_number_search": one_number.seeding,
             "six_number_set_search": set_model.seeding,
+            "bonus_number_search": bonus_model.seeding if bonus_model else None,
             "random_controls": "unseeded controls; cumulative search history is not matched",
             "control_comparability": "limited" if elite_seeds else "no elite seeds used",
         },
@@ -432,6 +525,8 @@ def run_intermittent_experiment(
         },
         "one_number_model": one_dict,
         "six_number_set_model": set_dict,
+        "bonus_number_model": bonus_dict,
+        "prize_tier_backtest": prize_tier_backtest,
         "hypothetical_states": {
             "labels_are_organizational_only": True,
             "state_rows": state_rows,

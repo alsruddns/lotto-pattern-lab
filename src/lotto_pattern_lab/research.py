@@ -40,14 +40,17 @@ SUPPORTED_ENGINES = tuple(
 
 
 def dataset_digest(dataset: DrawDataset) -> str:
-    payload = [
-        {
+    payload = []
+    include_bonus = any(record.draw.bonus is not None for record in dataset.records)
+    for record in dataset.records:
+        item = {
             "round": record.round_number,
             "date": record.draw_date.isoformat() if record.draw_date else None,
             "numbers": record.draw.numbers,
         }
-        for record in dataset.records
-    ]
+        if include_bonus:
+            item["bonus"] = record.draw.bonus
+        payload.append(item)
     return hashlib.sha256(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).hexdigest()
@@ -428,6 +431,12 @@ def run_research_schedule(
                 "patterns_registered": len(registered),
                 "one_number_test_score": result["one_number_model"]["selected"]["test_score"],
                 "six_number_test_score": result["six_number_set_model"]["selected"]["test_score"],
+                "bonus_number_test_score": (
+                    result.get("bonus_number_model", {}).get("selected", {}).get("test_score")
+                    if result.get("bonus_number_model")
+                    else None
+                ),
+                "prize_tier_backtest": result.get("prize_tier_backtest"),
             }
             state.pop("in_progress", None)
             consecutive_failures = 0

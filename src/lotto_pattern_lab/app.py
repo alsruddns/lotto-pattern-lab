@@ -262,7 +262,10 @@ if base_dataset is not None:
         bonus_research_enabled = st.checkbox(
             "보너스 번호를 별도 GP 연구 대상으로 실행",
             value=False,
-            disabled=not all(record.draw.bonus is not None for record in selected_dataset.records),
+            disabled=(
+                feature_profile == "bonus_lag_v1"
+                or not all(record.draw.bonus is not None for record in selected_dataset.records)
+            ),
             help="1등 6개 번호 모델은 유지하고, 별도 실행으로 보너스 번호 정확 일치를 평가합니다.",
         )
     except ValueError as error:
@@ -297,14 +300,24 @@ if run_clicked and selected_dataset is not None:
             generations_in_run = max(int(event["generations"]), 1)
             if "validation_score" in event:
                 run_label = str(event["run"])
+                runs_per_seed = 3 if feature_profile == "bonus_lag_v1" else 2
                 if run_label == "actual_one_number":
                     run_index = 0
                 elif run_label == "actual_six_number_set":
                     run_index = 1
+                elif run_label == "actual_bonus_number":
+                    run_index = 2
                 else:
                     control_index = int(run_label.split("_")[1]) - 1
-                    run_index = 2 + control_index * 2 + int(run_label.endswith("six_number_set"))
-                total_runs = 2 * (int(controls) + 1)
+                    control_offset = (
+                        2
+                        if run_label.endswith("six_number_set")
+                        else 1
+                        if run_label.endswith("bonus_number")
+                        else 0
+                    )
+                    run_index = runs_per_seed + control_index * runs_per_seed + control_offset
+                total_runs = runs_per_seed * (int(controls) + 1)
                 fraction = (run_index + generation / generations_in_run) / total_runs
             else:
                 total_runs = int(controls) + 1
