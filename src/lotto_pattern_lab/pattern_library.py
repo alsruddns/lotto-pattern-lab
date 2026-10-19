@@ -3,6 +3,7 @@
 import ast
 import copy
 import json
+import math
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -10,6 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import DrawDataset
+from .feature_schema import (
+    CODE_VERSION,
+    FEATURE_SCHEMA_VERSION,
+    PRIMITIVE_SET_VERSION,
+    feature_mapping,
+    remap_formula_features,
+)
 from .paths import project_path
 
 _COMMUTATIVE = {"add", "mul", "min2", "max2", "bit_xor", "bit_and", "bit_or"}
@@ -20,6 +28,26 @@ PATTERN_STATUSES = {
     "tentative_pass",
     "refuted",
     "insufficient_evidence",
+}
+PATTERN_SCHEMA_VERSION = 2
+_PATTERN_COLUMNS: dict[str, str] = {
+    "model_type": "TEXT",
+    "feature_profile": "TEXT",
+    "feature_schema_version": "INTEGER",
+    "primitive_set_version": "TEXT",
+    "origin_research_id": "TEXT",
+    "last_used_research_id": "TEXT",
+    "discovered_at": "TEXT",
+    "inheritance_count": "INTEGER NOT NULL DEFAULT 0",
+    "child_count": "INTEGER NOT NULL DEFAULT 0",
+    "formula": "TEXT",
+    "activation_condition": "TEXT",
+    "training_score": "REAL",
+    "validation_score": "REAL",
+    "independent_test_score": "REAL",
+    "complexity": "INTEGER",
+    "activation_rate": "REAL",
+    "code_version": "TEXT",
 }
 
 
@@ -93,6 +121,97 @@ class PatternLibrary:
                 );
                 """
             )
+            self._migrate_schema(connection)
+
+    def _migrate_schema(self, connection: sqlite3.Connection) -> None:
+        """Add lineage and searchable metadata while retaining every existing row."""
+        columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(patterns)").fetchall()
+        }
+        for name, sql_type in _PATTERN_COLUMNS.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE patterns ADD COLUMN {name} {sql_type}")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS pattern_lineage (
+                lineage_id TEXT PRIMARY KEY,
+                parent_pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
+                child_pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
+                research_id TEXT,
+                generation INTEGER NOT NULL DEFAULT 0,
+                method TEXT NOT NULL,
+                operators TEXT NOT NULL,
+                parent_formula TEXT,
+                child_formula TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(parent_pattern_id, child_pattern_id, research_id, method)
+            );
+            CREATE INDEX IF NOT EXISTS pattern_lineage_parent_idx
+                ON pattern_lineage(parent_pattern_id, created_at);
+            CREATE INDEX IF NOT EXISTS pattern_lineage_child_idx
+                ON pattern_lineage(child_pattern_id, created_at);
+            CREATE TABLE IF NOT EXISTS pattern_schema_versions (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            """
+        )
+        rows = connection.execute("SELECT pattern_id, payload, created_at FROM patterns").fetchall()
+        for row in rows:
+            payload = json.loads(row["payload"])
+            config = payload.get("experiment_config", {})
+            profile = payload.get("feature_profile") or config.get("feature_profile", "legacy")
+            outputs = int(payload.get("outputs_per_event", 0))
+            model_type = payload.get("model_type") or (
+                "one_number" if outputs == 1 else "six_number_set" if outputs == 6 else None
+            )
+            performance = payload.get("performance", {})
+            values = {
+                "model_type": model_type,
+                "feature_profile": profile,
+                "feature_schema_version": int(
+                    payload.get("feature_schema_version", FEATURE_SCHEMA_VERSION)
+                ),
+                "primitive_set_version": payload.get(
+                    "primitive_set_version", PRIMITIVE_SET_VERSION
+                ),
+                "origin_research_id": payload.get("origin_research_id")
+                or payload.get("research_id"),
+                "last_used_research_id": payload.get("last_used_research_id"),
+                "discovered_at": payload.get("discovered_at", row["created_at"]),
+                "inheritance_count": int(payload.get("inheritance_count", 0)),
+                "child_count": int(payload.get("child_count", 0)),
+                "formula": json.dumps(payload.get("formulas", []), ensure_ascii=False),
+                "activation_condition": payload.get("activation_condition"),
+                "training_score": performance.get("training_score"),
+                "validation_score": performance.get("validation_score"),
+                "independent_test_score": performance.get("test_score"),
+                "complexity": payload.get("complexity"),
+                "activation_rate": performance.get("validation_activation_rate"),
+                "code_version": payload.get("code_version", CODE_VERSION),
+            }
+            payload.setdefault("model_type", model_type)
+            payload.setdefault("feature_profile", profile)
+            payload.setdefault("feature_schema_version", FEATURE_SCHEMA_VERSION)
+            payload.setdefault("primitive_set_version", PRIMITIVE_SET_VERSION)
+            payload.setdefault("origin_research_id", values["origin_research_id"])
+            payload.setdefault("discovered_at", row["created_at"])
+            payload.setdefault("inheritance_count", values["inheritance_count"])
+            payload.setdefault("child_count", values["child_count"])
+            payload.setdefault("code_version", CODE_VERSION)
+            assignments = ", ".join(f"{column}=?" for column in values)
+            connection.execute(
+                f"UPDATE patterns SET {assignments}, payload=? WHERE pattern_id=?",
+                (
+                    *values.values(),
+                    json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                    row["pattern_id"],
+                ),
+            )
+        connection.execute(
+            "INSERT OR IGNORE INTO pattern_schema_versions VALUES (?, ?)",
+            (PATTERN_SCHEMA_VERSION, datetime.now(UTC).isoformat()),
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
@@ -109,22 +228,71 @@ class PatternLibrary:
             raise ValueError(f"Unknown pattern status: {initial_status}")
         now = datetime.now(UTC).isoformat()
         pattern_id = str(uuid.uuid4())
+        schema = payload.get("feature_schema", {})
+        performance = payload.get("performance", {})
+        output_count = int(payload.get("outputs_per_event", 0))
+        model_type = payload.get("model_type") or (
+            "one_number" if output_count == 1 else "six_number_set" if output_count == 6 else None
+        )
         stored_payload = {
             **payload,
             "pattern_id": pattern_id,
             "created_at": now,
+            "discovered_at": payload.get("discovered_at", now),
+            "origin_research_id": payload.get("origin_research_id") or payload.get("research_id"),
+            "last_used_research_id": payload.get("last_used_research_id"),
+            "inheritance_count": int(payload.get("inheritance_count", 0)),
+            "child_count": int(payload.get("child_count", 0)),
+            "model_type": model_type,
+            "feature_profile": payload.get(
+                "feature_profile", schema.get("feature_profile", "legacy")
+            ),
+            "feature_schema_version": int(
+                payload.get(
+                    "feature_schema_version",
+                    schema.get("feature_schema_version", FEATURE_SCHEMA_VERSION),
+                )
+            ),
+            "primitive_set_version": payload.get(
+                "primitive_set_version", schema.get("primitive_set_version", PRIMITIVE_SET_VERSION)
+            ),
+            "code_version": payload.get("code_version", schema.get("code_version", CODE_VERSION)),
             "canonical_fingerprint": fingerprint,
             "status": initial_status,
         }
         with self._connect() as connection:
             cursor = connection.execute(
-                "INSERT OR IGNORE INTO patterns VALUES (?, ?, ?, ?, ?)",
+                """INSERT OR IGNORE INTO patterns (
+                       pattern_id, fingerprint, created_at, payload, status,
+                       model_type, feature_profile, feature_schema_version,
+                       primitive_set_version, origin_research_id, last_used_research_id,
+                       discovered_at, inheritance_count, child_count, formula,
+                       activation_condition, training_score, validation_score,
+                       independent_test_score, complexity, activation_rate, code_version
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     pattern_id,
                     fingerprint,
                     now,
                     json.dumps(stored_payload, ensure_ascii=False, allow_nan=False),
                     initial_status,
+                    model_type,
+                    stored_payload["feature_profile"],
+                    stored_payload["feature_schema_version"],
+                    stored_payload["primitive_set_version"],
+                    stored_payload["origin_research_id"],
+                    stored_payload["last_used_research_id"],
+                    stored_payload["discovered_at"],
+                    stored_payload["inheritance_count"],
+                    stored_payload["child_count"],
+                    json.dumps(formulas, ensure_ascii=False),
+                    activation,
+                    performance.get("training_score"),
+                    performance.get("validation_score"),
+                    performance.get("test_score"),
+                    payload.get("complexity"),
+                    performance.get("validation_activation_rate"),
+                    stored_payload["code_version"],
                 ),
             )
             if cursor.rowcount:
@@ -144,12 +312,287 @@ class PatternLibrary:
                             "experiment_id": payload.get("experiment_id"),
                             "model": payload.get("model"),
                             "candidate_rank": payload.get("candidate_rank"),
+                            "research_id": payload.get("research_id"),
                         },
                         ensure_ascii=False,
                     ),
                 ),
             )
             return str(row["pattern_id"]), False
+
+    def select_elite_candidates(
+        self,
+        *,
+        feature_profile: str,
+        max_lag: int,
+        max_candidates: int,
+        max_per_origin: int = 2,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """Rank eligible patterns from train/validation evidence only, preserving diversity."""
+        from .storage import ExperimentStore
+
+        target_mapping = feature_mapping(feature_profile, max_lag)
+        eligible: list[tuple[float, str, dict[str, Any]]] = []
+        skipped: list[dict[str, str]] = []
+        seen: set[str] = set()
+        experiment_cache: dict[str, dict[str, Any] | None] = {}
+        for pattern in self.list_patterns(limit=100_000):
+            pattern_id = str(pattern["pattern_id"])
+            performance = pattern.get("performance", {})
+            if performance.get("validation_score") is None:
+                experiment_id = str(pattern.get("experiment_id", ""))
+                if experiment_id not in experiment_cache:
+                    try:
+                        experiment_cache[experiment_id] = ExperimentStore().load(
+                            experiment_id, expand_details=False
+                        )
+                    except (OSError, ValueError, KeyError):
+                        experiment_cache[experiment_id] = None
+                experiment = experiment_cache.get(experiment_id)
+                if experiment:
+                    model_key = str(pattern.get("model", ""))
+                    model = experiment.get(model_key, {})
+                    candidates = model.get("candidates") or [model.get("selected", {})]
+                    rank = int(pattern.get("candidate_rank", 1))
+                    if 1 <= rank <= len(candidates):
+                        candidate = candidates[rank - 1]
+                        performance = {
+                            **performance,
+                            **{
+                                key: candidate.get(key)
+                                for key in (
+                                    "training_score",
+                                    "validation_score",
+                                    "training_hit_rate",
+                                    "validation_hit_rate",
+                                    "training_activation_rate",
+                                    "validation_activation_rate",
+                                    "complexity",
+                                    "height",
+                                )
+                            },
+                        }
+                        pattern["performance"] = performance
+                        pattern["complexity"] = candidate.get(
+                            "complexity", pattern.get("complexity")
+                        )
+                        schema = experiment.get("feature_schema", {})
+                        pattern["feature_profile"] = experiment.get("config", {}).get(
+                            "feature_profile", pattern.get("feature_profile", "legacy")
+                        )
+                        pattern["feature_schema"] = schema
+                        pattern["feature_mapping"] = schema.get(
+                            "feature_mapping", experiment.get("feature_variables", {})
+                        )
+                        pattern["feature_schema_version"] = schema.get(
+                            "feature_schema_version", FEATURE_SCHEMA_VERSION
+                        )
+                        pattern["primitive_set_version"] = schema.get(
+                            "primitive_set_version", PRIMITIVE_SET_VERSION
+                        )
+            reason = None
+            if pattern.get("current_status") in {"refuted", "insufficient_evidence"}:
+                reason = f"pattern status is {pattern.get('current_status')}"
+            elif pattern.get("outputs_per_event") not in {1, 6}:
+                reason = "model output type is missing or unsupported"
+            elif int(pattern.get("feature_schema_version", 1)) > FEATURE_SCHEMA_VERSION:
+                reason = "feature schema version is newer than this application"
+            elif (
+                pattern.get("primitive_set_version", PRIMITIVE_SET_VERSION) != PRIMITIVE_SET_VERSION
+            ):
+                reason = "primitive set version is incompatible"
+            source_mapping = pattern.get("feature_schema", {}).get(
+                "feature_mapping"
+            ) or pattern.get("feature_mapping", {})
+            source_profile = str(pattern.get("feature_profile", "legacy"))
+            if reason is None:
+                for formula in [
+                    pattern.get("activation_condition", ""),
+                    *pattern.get("formulas", ()),
+                ]:
+                    _, incompatibility = remap_formula_features(
+                        str(formula), source_mapping, target_mapping, source_profile
+                    )
+                    if incompatibility:
+                        reason = incompatibility
+                        break
+            if reason:
+                skipped.append({"pattern_id": pattern_id, "reason": reason})
+                continue
+            fingerprint = str(pattern.get("canonical_fingerprint", ""))
+            if fingerprint in seen:
+                skipped.append({"pattern_id": pattern_id, "reason": "duplicate canonical formula"})
+                continue
+            seen.add(fingerprint)
+            performance = pattern.get("performance", {})
+            training = performance.get("training_score", performance.get("training_hit_rate"))
+            validation = performance.get("validation_score", performance.get("validation_hit_rate"))
+            if training is None or validation is None:
+                skipped.append(
+                    {"pattern_id": pattern_id, "reason": "training/validation metrics missing"}
+                )
+                continue
+            training_score = float(training)
+            validation_score = float(validation)
+            if not math.isfinite(training_score) or not math.isfinite(validation_score):
+                skipped.append(
+                    {"pattern_id": pattern_id, "reason": "non-finite training/validation score"}
+                )
+                continue
+            validation_activation = float(performance.get("validation_activation_rate", 0.0) or 0.0)
+            if not validation_activation:
+                skipped.append(
+                    {"pattern_id": pattern_id, "reason": "validation activation metric missing"}
+                )
+                continue
+            if validation_activation < 0.05:
+                skipped.append(
+                    {"pattern_id": pattern_id, "reason": "too few validation activations"}
+                )
+                continue
+            complexity = int(pattern.get("complexity", 0) or 0)
+            stability_penalty = min(0.2, abs(training_score - validation_score) * 0.35)
+            complexity_penalty = min(0.1, complexity * 0.0005)
+            reuse_penalty = min(0.05, int(pattern.get("inheritance_count", 0)) * 0.005)
+            score = validation_score - stability_penalty - complexity_penalty - reuse_penalty
+            pattern["elite_selection_score"] = score
+            pattern["elite_selection_policy"] = "validation_stability_complexity_diversity_v1"
+            eligible.append((score, pattern_id, pattern))
+        eligible.sort(key=lambda item: (-item[0], item[1]))
+        selected: list[dict[str, Any]] = []
+        origin_counts: dict[str, int] = {}
+        model_counts: dict[str, int] = {}
+        model_cap = max(1, math.ceil(max_candidates / 2))
+        for _, _, pattern in eligible:
+            if len(selected) >= max_candidates:
+                break
+            origin = str(
+                pattern.get("origin_research_id") or pattern.get("experiment_id") or "legacy"
+            )
+            model = str(pattern.get("model_type"))
+            if origin_counts.get(origin, 0) >= max_per_origin:
+                continue
+            if model_counts.get(model, 0) >= model_cap:
+                continue
+            selected.append(pattern)
+            origin_counts[origin] = origin_counts.get(origin, 0) + 1
+            model_counts[model] = model_counts.get(model, 0) + 1
+        selected_ids = {str(pattern["pattern_id"]) for pattern in selected}
+        for _, pattern_id, _ in eligible:
+            if pattern_id not in selected_ids and len(selected) >= max_candidates:
+                skipped.append(
+                    {"pattern_id": pattern_id, "reason": "elite candidate limit reached"}
+                )
+        return selected, skipped
+
+    def record_elite_use(
+        self, pattern_ids: list[str], research_id: str, dataset_sha256: str
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            for pattern_id in sorted(set(pattern_ids)):
+                row = connection.execute(
+                    "SELECT payload FROM patterns WHERE pattern_id=?", (pattern_id,)
+                ).fetchone()
+                if row is None:
+                    continue
+                payload = json.loads(row["payload"])
+                payload["inheritance_count"] = int(payload.get("inheritance_count", 0)) + 1
+                payload["last_used_research_id"] = research_id
+                payload["last_seeded_dataset_sha256"] = dataset_sha256
+                connection.execute(
+                    "UPDATE patterns SET payload=?, last_used_research_id=?, inheritance_count=? "
+                    "WHERE pattern_id=?",
+                    (
+                        json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                        research_id,
+                        payload["inheritance_count"],
+                        pattern_id,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO pattern_events VALUES (?, ?, ?, 'elite_seeded', ?)",
+                    (
+                        str(uuid.uuid4()),
+                        pattern_id,
+                        now,
+                        json.dumps(
+                            {
+                                "research_id": research_id,
+                                "dataset_sha256": dataset_sha256,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ),
+                )
+
+    def record_lineage(
+        self,
+        parent_pattern_id: str,
+        child_pattern_id: str,
+        *,
+        research_id: str | None,
+        generation: int,
+        method: str,
+        operators: list[str],
+        parent_formula: str,
+        child_formula: str,
+    ) -> bool:
+        if parent_pattern_id == child_pattern_id:
+            return False
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO pattern_lineage
+                   (lineage_id, parent_pattern_id, child_pattern_id, research_id,
+                    generation, method, operators, parent_formula, child_formula, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    parent_pattern_id,
+                    child_pattern_id,
+                    research_id,
+                    max(0, generation),
+                    method,
+                    json.dumps(sorted(set(operators)), ensure_ascii=False),
+                    parent_formula,
+                    child_formula,
+                    now,
+                ),
+            )
+            if cursor.rowcount:
+                parent_row = connection.execute(
+                    "SELECT payload, child_count FROM patterns WHERE pattern_id=?",
+                    (parent_pattern_id,),
+                ).fetchone()
+                if parent_row is None:
+                    raise KeyError(parent_pattern_id)
+                parent_payload = json.loads(parent_row["payload"])
+                new_count = int(parent_row["child_count"] or 0) + 1
+                parent_payload["child_count"] = new_count
+                connection.execute(
+                    "UPDATE patterns SET child_count=?, payload=? WHERE pattern_id=?",
+                    (
+                        new_count,
+                        json.dumps(parent_payload, ensure_ascii=False, allow_nan=False),
+                        parent_pattern_id,
+                    ),
+                )
+            return bool(cursor.rowcount)
+
+    def list_lineage(self, pattern_id: str | None = None) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            if pattern_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM pattern_lineage ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """SELECT * FROM pattern_lineage
+                       WHERE parent_pattern_id=? OR child_pattern_id=? ORDER BY created_at""",
+                    (pattern_id, pattern_id),
+                ).fetchall()
+        return [{**dict(row), "operators": json.loads(row["operators"])} for row in rows]
 
     def record_observation(
         self,
@@ -230,6 +673,26 @@ class PatternLibrary:
                 )
             ]
             return pattern
+
+    def get_pattern_summary(self, pattern_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload, status FROM patterns WHERE pattern_id=?", (pattern_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(pattern_id)
+        payload = json.loads(row["payload"])
+        return {
+            key: payload.get(key)
+            for key in (
+                "pattern_id",
+                "origin_research_id",
+                "inheritance_count",
+                "feature_profile",
+                "model_type",
+                "discovered_at",
+            )
+        } | {"current_status": row["status"]}
 
     def list_patterns(self, limit: int = 1000) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -337,6 +800,7 @@ def register_experiment_candidates(
     """Persist candidate rules from every archived model, with retrospective labeling."""
     dataset = result.get("dataset", {})
     configuration = result.get("config", {})
+    feature_schema = result.get("feature_schema", {})
     registered: list[dict[str, Any]] = []
     for model_name in ("one_number_model", "six_number_set_model"):
         model = result.get(model_name, {})
@@ -354,8 +818,23 @@ def register_experiment_candidates(
                 payload = {
                     "activation_condition": str(candidate["activation_condition"]),
                     "formulas": list(rule_formulas),
+                    "model_type": "one_number" if outputs == 1 else "six_number_set",
+                    "feature_profile": feature_schema.get(
+                        "feature_profile", configuration.get("feature_profile", "legacy")
+                    ),
+                    "feature_schema_version": feature_schema.get(
+                        "feature_schema_version", FEATURE_SCHEMA_VERSION
+                    ),
+                    "primitive_set_version": feature_schema.get(
+                        "primitive_set_version", PRIMITIVE_SET_VERSION
+                    ),
+                    "feature_schema": feature_schema,
                     "engine": "deap_intermittent_gp",
                     "experiment_id": result["experiment_id"],
+                    "research_id": result.get("research_id"),
+                    "origin_research_id": result.get("research_id"),
+                    "dataset_sha256": dataset.get("dataset_sha256"),
+                    "code_version": feature_schema.get("code_version", CODE_VERSION),
                     "model": model_name,
                     "candidate_rank": candidate_rank,
                     "rule_index": rule_index + 1,
@@ -372,9 +851,15 @@ def register_experiment_candidates(
                     "performance": {
                         key: candidate.get(key)
                         for key in (
+                            "training_score",
+                            "validation_score",
+                            "test_score",
                             "training_hit_rate",
                             "validation_hit_rate",
                             "test_hit_rate",
+                            "training_activation_rate",
+                            "validation_activation_rate",
+                            "test_activation_rate",
                             "training_full_set_matches",
                             "validation_full_set_matches",
                             "test_full_set_matches",
@@ -386,9 +871,34 @@ def register_experiment_candidates(
                         if event.get("active") and event.get("rule_index") == rule_index + 1
                     ],
                     "active_gaps": candidate.get("rule_active_gaps", [[], []])[rule_index],
+                    "lineage": candidate.get("lineage", {}),
+                    "discovered_at": datetime.now(UTC).isoformat(),
                     "status": "pending_validation",
                 }
                 pattern_id, created = library.register_pattern(payload)
+                lineage = candidate.get("lineage", {})
+                parent_ids = lineage.get("parent_pattern_ids", ())
+                parent_formulas = lineage.get(
+                    "parent_formulas", lineage.get("original_formulas", ())
+                )
+                parent_formula = ";".join(map(str, parent_formulas))
+                operators = list(lineage.get("operators", ()))
+                method = "+".join(operators) if operators else "elite_seed"
+                for parent_pattern_id in parent_ids:
+                    try:
+                        library.record_lineage(
+                            str(parent_pattern_id),
+                            pattern_id,
+                            research_id=str(result.get("research_id") or "") or None,
+                            generation=int(lineage.get("generation", 0)),
+                            method=method,
+                            operators=operators,
+                            parent_formula=parent_formula,
+                            child_formula=";".join(rule_formulas),
+                        )
+                    except (KeyError, sqlite3.IntegrityError):
+                        # A legacy or removed parent stays in its original payload and event log.
+                        continue
                 registered.append(
                     {
                         "pattern_id": pattern_id,
@@ -396,6 +906,7 @@ def register_experiment_candidates(
                         "candidate_rank": candidate_rank,
                         "rule_index": rule_index + 1,
                         "created": created,
+                        **library.get_pattern_summary(pattern_id),
                     }
                 )
     return registered
