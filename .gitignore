@@ -12,3 +12,8 @@ build/
 *.egg-info/
 .env
 experiments/
+artifacts/
+models/
+data/raw/
+*.pkl
+*.joblib

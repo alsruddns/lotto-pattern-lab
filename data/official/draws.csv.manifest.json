@@ -1,0 +1,13 @@
+{
+  "source_kind": "official_verified",
+  "verification_status": "official_verified",
+  "source_description": "Fetched draw numbers and dates from the Donghaeng Lottery official results endpoint.",
+  "source_url": "https://www.dhlottery.co.kr/lt645/selectPstLt645Info.do",
+  "verified_at": "2026-10-19T01:17:48.368737+00:00",
+  "start_round": 753,
+  "end_round": 1246,
+  "start_date": "2017-05-06",
+  "end_date": "2026-10-17",
+  "draw_count": 494,
+  "sha256": "9b0c1e7a210db9bfc72253771af0da8ec65cca1c85886cbe8b97aea67634f36e"
+}

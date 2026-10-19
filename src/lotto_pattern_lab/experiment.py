@@ -135,8 +135,16 @@ def dataset_metadata(dataset: DrawDataset) -> dict[str, object]:
         "source_kind": dataset.source_kind,
         "source_description": dataset.source_description,
         "source_url": dataset.source_url,
+        "verification_status": dataset.verification_status,
+        "verified_at": dataset.verified_at,
         "first_round": dataset.records[0].round_number,
         "last_round": dataset.records[-1].round_number,
+        "first_date": dataset.records[0].draw_date.isoformat()
+        if dataset.records[0].draw_date
+        else None,
+        "last_date": dataset.records[-1].draw_date.isoformat()
+        if dataset.records[-1].draw_date
+        else None,
         "draw_count": len(dataset.records),
     }
 
