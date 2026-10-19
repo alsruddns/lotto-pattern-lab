@@ -6,13 +6,22 @@ from pathlib import Path
 
 import streamlit as st
 
-from .dataset import filter_dataset, load_csv, make_random_dataset, save_official_csv
-from .experiment import run_experiment
-from .gp_engine import SearchConfig
-from .intermittent import IntermittentConfig
-from .intermittent_experiment import run_intermittent_experiment
-from .official_data import FIRST_SUPPORTED_DATE, FIRST_SUPPORTED_ROUND, fetch_official_dataset
-from .storage import ExperimentStore
+from lotto_pattern_lab.dataset import (
+    filter_dataset,
+    load_csv,
+    make_random_dataset,
+    save_official_csv,
+)
+from lotto_pattern_lab.experiment import run_experiment
+from lotto_pattern_lab.gp_engine import SearchConfig
+from lotto_pattern_lab.intermittent import IntermittentConfig
+from lotto_pattern_lab.intermittent_experiment import run_intermittent_experiment
+from lotto_pattern_lab.official_data import (
+    FIRST_SUPPORTED_DATE,
+    FIRST_SUPPORTED_ROUND,
+    fetch_official_dataset,
+)
+from lotto_pattern_lab.storage import ExperimentStore
 
 st.set_page_config(page_title="Lotto Pattern Lab", layout="wide")
 st.title("Lotto Pattern Lab 연구실")
