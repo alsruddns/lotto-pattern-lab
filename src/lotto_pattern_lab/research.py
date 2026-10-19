@@ -4,15 +4,16 @@ import hashlib
 import json
 import math
 import os
-import tempfile
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import AtomicWriteError, atomic_write_bytes, interprocess_lock
 from .dataset import DrawDataset
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
 from .feature_schema import PRIMITIVE_SET_VERSION, feature_schema_version
@@ -58,18 +59,34 @@ def dataset_digest(dataset: DrawDataset) -> str:
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path = project_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(value, output, ensure_ascii=False, indent=2, allow_nan=False)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    content = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode(
+        "utf-8"
+    )
+    atomic_write_bytes(path, content)
+
+
+def _single_research_worker(function: Callable[..., dict[str, Any]]):
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        checkpoint = project_path(kwargs.get("checkpoint_path", "checkpoints/research.json"))
+        with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def _unresolved_failure_count(state: dict[str, Any]) -> int:
+    completed = {
+        int(item["seed"])
+        for item in state.get("completed_experiments", [])
+        if item.get("seed") is not None
+    }
+    failed = {
+        int(item["seed"])
+        for item in state.get("failed_runs", [])
+        if item.get("seed") is not None
+    }
+    return len(failed - completed)
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
@@ -94,6 +111,7 @@ def request_stop(checkpoint_path: str | Path) -> Path:
     return stop_path
 
 
+@_single_research_worker
 def run_research_schedule(
     dataset: DrawDataset,
     config: IntermittentConfig,
@@ -214,6 +232,7 @@ def run_research_schedule(
                 dataset.records[-1].round_number,
             ],
             "config": config_payload,
+            "target_duration_seconds": float(duration_seconds),
             "elite_seeding": elite_state,
             "engines": list(engines),
             "completed_runs": 0,
@@ -234,6 +253,10 @@ def run_research_schedule(
         }
     state["checkpoint_path"] = str(checkpoint)
     state["config"] = config_payload
+    state.setdefault(
+        "target_duration_seconds",
+        float(state.get("total_elapsed_seconds", 0.0)) + float(duration_seconds),
+    )
     state["resumable"] = True
     state.setdefault("completed_experiments", [])
     round_number = round_store.ensure_round(
@@ -259,10 +282,21 @@ def run_research_schedule(
             },
             store.directory,
         )
+    else:
+        summary = state["dashboard_summary"]
+        summary["p_value_distributions"] = {"one_number": [], "six_number_set": []}
+        for compact in summary.get("experiment_summaries", []):
+            for model, value in compact.get("p_values", {}).items():
+                if value is not None and model in summary["p_value_distributions"]:
+                    summary["p_value_distributions"][model].append(value)
     state["rng_resume"] = {
         "mode": "per_attempt_seed",
         "base_seed": config.seed,
-        "next_seed": config.seed + int(state.get("attempts", 0)),
+        "next_seed": int(
+            state.get("rng_resume", {}).get(
+                "next_seed", config.seed + int(state.get("attempts", 0))
+            )
+        ),
     }
     previous_checkpoint_time = state.get("last_updated_at", state.get("created_at"))
     if resume and state.get("in_progress"):
@@ -294,6 +328,70 @@ def run_research_schedule(
             # Keep a new request made during a restart; consume only an old handled request.
             stop_path.unlink(missing_ok=True)
 
+    baseline_elapsed = float(state.get("total_elapsed_seconds", 0.0))
+    session_budget = min(
+        float(duration_seconds),
+        max(0.0, float(state["target_duration_seconds"]) - baseline_elapsed),
+    )
+    completed_seed_set = {
+        int(item["seed"])
+        for item in state.get("completed_experiments", [])
+        if item.get("seed") is not None
+    }
+    pending_seeds = []
+    recovered_orphan = False
+    for item in state.get("failed_runs", []):
+        seed = item.get("seed")
+        if seed is None or int(seed) in completed_seed_set:
+            continue
+        if int(seed) in pending_seeds:
+            continue
+        experiment_id = item.get("experiment_id")
+        if experiment_id:
+            try:
+                existing = store.load(str(experiment_id), expand_details=False)
+            except (OSError, ValueError):
+                existing = {}
+            if (
+                existing.get("status") == "completed"
+                and existing.get("research_id") == state["research_id"]
+                and int(existing.get("config", {}).get("seed", -1)) == int(seed)
+            ):
+                state["completed_experiments"].append(
+                    {
+                        "attempt": existing.get("research_attempt"),
+                        "seed": int(seed),
+                        "experiment_id": experiment_id,
+                        "research_id": state["research_id"],
+                        "path": str(store.directory / f"{experiment_id}.json"),
+                        "status": "completed",
+                        "recovered_from_failed_save": True,
+                    }
+                )
+                completed_seed_set.add(int(seed))
+                recovered_orphan = True
+                continue
+        pending_seeds.append(int(seed))
+    if recovered_orphan:
+        state["completed_runs"] = len(state["completed_experiments"])
+        for failed in state.get("failed_runs", []):
+            if failed.get("seed") is not None and int(failed["seed"]) in completed_seed_set:
+                failed["resolved_by_experiment_id"] = next(
+                    item["experiment_id"]
+                    for item in state["completed_experiments"]
+                    if int(item.get("seed", -1)) == int(failed["seed"])
+                )
+        state["dashboard_summary"] = rebuild_dashboard_summary_from_store(
+            {
+                "completed_experiment_ids": [
+                    item["experiment_id"] for item in state["completed_experiments"]
+                ],
+                "failed_runs": _unresolved_failure_count(state),
+            },
+            store.directory,
+        )
+    state["pending_retry_seeds"] = pending_seeds
+    retry_queue = list(pending_seeds)
     started = time.monotonic()
     elite_seeds = tuple(state.get("elite_seeding", {}).get("selected_patterns", ()))
     for failed in state["failed_runs"]:
@@ -313,7 +411,7 @@ def run_research_schedule(
             )
             store.save(orphan)
     consecutive_failures = 0
-    while time.monotonic() - started < duration_seconds:
+    while time.monotonic() - started < session_budget:
         if stop_path.exists():
             state["status"] = "paused"
             state["pause_reason"] = "stop_requested_at_experiment_boundary"
@@ -323,9 +421,12 @@ def run_research_schedule(
             state["stop_reason"] = "run_count_reached"
             break
         run_index = int(state["attempts"])
-        run_config = replace(config, seed=config.seed + run_index)
+        retry_seed = retry_queue.pop(0) if retry_queue else None
+        run_seed = retry_seed if retry_seed is not None else int(state["rng_resume"]["next_seed"])
+        run_config = replace(config, seed=run_seed)
         state["attempts"] = run_index + 1
-        state["rng_resume"]["next_seed"] = config.seed + state["attempts"]
+        if retry_seed is None:
+            state["rng_resume"]["next_seed"] = run_seed + 1
         state["in_progress"] = {
             "seed": run_config.seed,
             "attempt": state["attempts"],
@@ -345,6 +446,9 @@ def run_research_schedule(
                 "updated_at": datetime.now(UTC).isoformat(),
             }
             state["last_updated_at"] = datetime.now(UTC).isoformat()
+            elapsed_now = time.monotonic() - started
+            state["elapsed_seconds"] = elapsed_now
+            state["total_elapsed_seconds"] = baseline_elapsed + elapsed_now
             _atomic_json(checkpoint, state)
             if progress:
                 progress(state["current_progress"])
@@ -402,6 +506,9 @@ def run_research_schedule(
             merge_unique_hit_rounds(
                 dashboard_summary, compact_summary.get("unique_hit_rounds", {})
             )
+            for model, value in compact_summary.get("p_values", {}).items():
+                if value is not None and model in dashboard_summary["p_value_distributions"]:
+                    dashboard_summary["p_value_distributions"][model].append(value)
             for model_key, metrics in compact_summary["paired"].items():
                 dashboard_summary["paired_metrics"].setdefault(model_key, []).append(metrics)
             for key, values in compact_summary["hits"].items():
@@ -422,7 +529,19 @@ def run_research_schedule(
                     "status": "completed",
                 }
             )
+            completed_seed_set.add(run_config.seed)
+            for failed in state.get("failed_runs", []):
+                if (
+                    failed.get("seed") is not None
+                    and int(failed["seed"]) == run_config.seed
+                ):
+                    failed["resolved_by_experiment_id"] = result["experiment_id"]
+            state["pending_retry_seeds"] = [
+                pending for pending in state["pending_retry_seeds"] if pending != run_config.seed
+            ]
+            retry_queue = [pending for pending in retry_queue if pending != run_config.seed]
             state["discovered_exact_matches"].extend(exact_matches)
+            dashboard_summary["failed_experiment_count"] = _unresolved_failure_count(state)
             state["last_run_summary"] = {
                 "experiment_id": result["experiment_id"],
                 "runtime_seconds": result["runtime_seconds"],
@@ -442,15 +561,26 @@ def run_research_schedule(
             consecutive_failures = 0
         except Exception as error:
             consecutive_failures += 1
+            storage_failure = isinstance(error, AtomicWriteError) or (
+                isinstance(error, PermissionError) and ".tmp" in str(error)
+            )
             state["failed_runs"].append(
                 {
                     "seed": run_config.seed,
+                    "attempt": state["attempts"],
+                    "experiment_id": state.get("in_progress", {}).get("experiment_id"),
                     "failed_at": datetime.now(UTC).isoformat(),
                     "error_type": type(error).__name__,
                     "error": str(error),
+                    "failure_category": "storage" if storage_failure else "experiment",
+                    "retryable": True,
                 }
             )
-            state["dashboard_summary"]["failed_experiment_count"] = len(state["failed_runs"])
+            if run_config.seed not in state["pending_retry_seeds"]:
+                state["pending_retry_seeds"].append(run_config.seed)
+            state["dashboard_summary"]["failed_experiment_count"] = _unresolved_failure_count(
+                state
+            )
             state.pop("in_progress", None)
             if consecutive_failures >= 3:
                 state["status"] = "failed"
@@ -473,9 +603,7 @@ def run_research_schedule(
     state["last_updated_at"] = datetime.now(UTC).isoformat()
     elapsed_this_session = time.monotonic() - started
     state["elapsed_seconds"] = elapsed_this_session
-    state["total_elapsed_seconds"] = (
-        float(state.get("total_elapsed_seconds", 0.0)) + elapsed_this_session
-    )
+    state["total_elapsed_seconds"] = baseline_elapsed + elapsed_this_session
     _atomic_json(checkpoint, state)
     round_store.update(str(state["research_id"]), _round_metadata(state))
     run_automatic_checkpoint_cleanup()
@@ -500,7 +628,9 @@ def _round_metadata(state: dict[str, Any]) -> dict[str, Any]:
         "config": state.get("config", {}),
         "engines": state.get("engines", []),
         "completed_runs": state.get("completed_runs", 0),
-        "failed_runs": len(state.get("failed_runs", [])),
+        "failed_runs": _unresolved_failure_count(state),
+        "target_duration_seconds": state.get("target_duration_seconds"),
+        "pending_retry_seeds": state.get("pending_retry_seeds", []),
         "completed_experiment_ids": [
             item.get("experiment_id")
             for item in state.get("completed_experiments", [])

@@ -424,6 +424,34 @@ if checkpoint:
         st.json(state["last_run_summary"])
     if state.get("failed_runs"):
         st.warning(f"실패 또는 중단된 실험: {len(state['failed_runs'])}")
+    total_elapsed = float(state.get("total_elapsed_seconds", state.get("elapsed_seconds", 0)))
+    target_elapsed = float(state.get("target_duration_seconds", 0))
+    remaining_seconds = max(0.0, target_elapsed - total_elapsed) if target_elapsed else None
+    failed_seed_list = list(
+        dict.fromkeys(
+            int(item["seed"])
+            for item in state.get("failed_runs", [])
+            if item.get("seed") is not None
+        )
+    )
+    with st.expander("연구 저장 및 복구 상태", expanded=state.get("status") == "failed"):
+        st.write(f"마지막 정상 체크포인트: {active_checkpoint_path}")
+        st.write(f"완료 실험: {len(state.get('completed_experiments', []))}")
+        st.write(f"실패 실험 기록: {len(state.get('failed_runs', []))}")
+        st.write(f"복구 대기 시드: {failed_seed_list or '없음'}")
+        st.write(f"누적 실행 시간: {total_elapsed / 60:.2f}분")
+        st.write(
+            f"남은 연구 시간: {remaining_seconds / 60:.2f}분"
+            if remaining_seconds is not None
+            else "남은 연구 시간: 기존 체크포인트에 목표 시간이 기록되지 않음"
+        )
+        st.write(f"마지막 저장 시각: {state.get('last_updated_at', '미기록')}")
+        last_error = (
+            state.get("failed_runs", [])[-1].get("error")
+            if state.get("failed_runs")
+            else None
+        )
+        st.write(f"마지막 저장 오류: {last_error or '없음'}")
     current_experiment_id = state.get("current_progress", {}).get("event", {}).get("experiment_id")
     if (
         current_experiment_id
@@ -472,8 +500,18 @@ if st.session_state.get("last_import_summary"):
 
 button_col, stop_col = st.columns(2)
 with button_col:
+    launch_minutes = float(duration_minutes)
+    if workflow == "저장된 연구 재개" and checkpoint:
+        total_elapsed = float(
+            checkpoint.get("total_elapsed_seconds", checkpoint.get("elapsed_seconds", 0))
+        )
+        target_elapsed = float(checkpoint.get("target_duration_seconds", 0))
+        if target_elapsed:
+            launch_minutes = max(0.0, target_elapsed - total_elapsed) / 60
     if st.button(
-        "연구 시작 또는 재개",
+        "실패 연구 복구 및 재개"
+        if workflow == "저장된 연구 재개" and checkpoint and checkpoint.get("status") == "failed"
+        else "연구 시작 또는 재개",
         type="primary",
         disabled=dataset is None
         or effective_config is None
@@ -485,6 +523,7 @@ with button_col:
                     and not integrity["all_draws_have_bonus"]
                 )
         or active_worker
+        or launch_minutes <= 0
         or (workflow == "저장된 연구 재개" and selected_checkpoint is None),
     ):
         if workflow == "새 장시간 연구":
@@ -505,7 +544,7 @@ with button_col:
             "--csv",
             str(csv_path),
             "--duration-minutes",
-            str(int(duration_minutes)),
+            str(max(1, ceil(launch_minutes))),
             "--checkpoint",
             str(checkpoint_path),
             "--population",

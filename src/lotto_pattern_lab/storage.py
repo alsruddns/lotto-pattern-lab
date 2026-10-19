@@ -3,11 +3,10 @@
 import gzip
 import hashlib
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import atomic_write_bytes
 from .paths import project_path
 
 DETAIL_KEYS = {
@@ -26,19 +25,7 @@ DETAIL_MIN_ITEMS = 32
 
 
 def _atomic_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f"{path.stem}_", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+    atomic_write_bytes(project_path(path), content)
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
