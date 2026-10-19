@@ -158,39 +158,71 @@ def _ephemeral_constant() -> float:
     return random.uniform(-10.0, 10.0)
 
 
-def _make_primitive_set(feature_count: int) -> gp.PrimitiveSet:
-    pset = gp.PrimitiveSet("MAIN", feature_count)
+def _make_primitive_set(feature_count: int) -> gp.PrimitiveSetTyped:
+    """Build a float-only grammar, including typed float terminals for elite literals."""
+    if feature_count < 1:
+        raise ValueError("A GP primitive set requires at least one input feature.")
+    pset = gp.PrimitiveSetTyped("MAIN", [float] * feature_count, float)
     pset.renameArguments(**{f"ARG{i}": f"x{i}" for i in range(feature_count)})
-    pset.addPrimitive(operator.add, 2, name="add")
-    pset.addPrimitive(operator.sub, 2, name="sub")
-    pset.addPrimitive(operator.mul, 2, name="mul")
-    pset.addPrimitive(_safe_div, 2, name="safe_div")
-    pset.addPrimitive(_safe_mod, 2, name="safe_mod")
-    pset.addPrimitive(abs, 1, name="abs")
-    pset.addPrimitive(min, 2, name="min2")
-    pset.addPrimitive(max, 2, name="max2")
-    pset.addPrimitive(_square, 1, name="square")
-    pset.addPrimitive(_cube, 1, name="cube")
-    pset.addPrimitive(_bit_xor, 2, name="bit_xor")
-    pset.addPrimitive(_bit_and, 2, name="bit_and")
-    pset.addPrimitive(_bit_or, 2, name="bit_or")
-    pset.addPrimitive(_shift_left, 2, name="shift_left")
-    pset.addPrimitive(_shift_right, 2, name="shift_right")
-    pset.addPrimitive(_rotate_left, 2, name="rotate_left")
-    pset.addPrimitive(_rotate_right, 2, name="rotate_right")
-    pset.addPrimitive(_concat_digits, 2, name="concat_digits")
-    pset.addPrimitive(_digit_sum, 1, name="digit_sum")
-    pset.addPrimitive(_reverse_digits, 1, name="reverse_digits")
-    pset.addPrimitive(_digital_root, 1, name="digital_root")
-    pset.addPrimitive(_is_prime, 1, name="is_prime")
-    pset.addPrimitive(_factor_count, 1, name="factor_count")
-    pset.addPrimitive(_fibonacci_index, 1, name="fibonacci_index")
-    pset.addEphemeralConstant("constant", _ephemeral_constant)
+    for function, arity, name in (
+        (operator.add, 2, "add"),
+        (operator.sub, 2, "sub"),
+        (operator.mul, 2, "mul"),
+        (_safe_div, 2, "safe_div"),
+        (_safe_mod, 2, "safe_mod"),
+        (abs, 1, "abs"),
+        (min, 2, "min2"),
+        (max, 2, "max2"),
+        (_square, 1, "square"),
+        (_cube, 1, "cube"),
+        (_bit_xor, 2, "bit_xor"),
+        (_bit_and, 2, "bit_and"),
+        (_bit_or, 2, "bit_or"),
+        (_shift_left, 2, "shift_left"),
+        (_shift_right, 2, "shift_right"),
+        (_rotate_left, 2, "rotate_left"),
+        (_rotate_right, 2, "rotate_right"),
+        (_concat_digits, 2, "concat_digits"),
+        (_digit_sum, 1, "digit_sum"),
+        (_reverse_digits, 1, "reverse_digits"),
+        (_digital_root, 1, "digital_root"),
+        (_is_prime, 1, "is_prime"),
+        (_factor_count, 1, "factor_count"),
+        (_fibonacci_index, 1, "fibonacci_index"),
+    ):
+        pset.addPrimitive(function, [float] * arity, float, name=name)
+    pset.addEphemeralConstant("constant", _ephemeral_constant, float)
+    validate_primitive_set(pset)
     return pset
 
 
+def validate_primitive_set(pset: gp.PrimitiveSetTyped) -> None:
+    """Fail before search if any supported return type cannot reach a terminal."""
+    required_types = {pset.ret, *(argument for argument in pset.ins)}
+    required_types.update(
+        primitive.ret
+        for values in pset.primitives.values()
+        for primitive in values
+    )
+    required_types.update(
+        argument
+        for values in pset.primitives.values()
+        for primitive in values
+        for argument in primitive.args
+    )
+    missing = [
+        value_type.__name__
+        for value_type in required_types
+        if not pset.terminals.get(value_type)
+    ]
+    if missing:
+        raise ValueError(
+            "GP primitive set has no terminal for required type(s): " + ", ".join(sorted(missing))
+        )
+
+
 def _compile_expression(
-    expression: gp.PrimitiveTree, pset: gp.PrimitiveSet
+    expression: gp.PrimitiveTree, pset: gp.PrimitiveSetTyped
 ) -> Callable[..., float]:
     return gp.compile(expression, pset)
 
@@ -213,7 +245,9 @@ def _score(function: Callable[..., float], examples: tuple[Example, ...]) -> flo
     ) / len(examples)
 
 
-def _worker_init(examples: tuple[Example, ...], pset: gp.PrimitiveSet, max_depth: int) -> None:
+def _worker_init(
+    examples: tuple[Example, ...], pset: gp.PrimitiveSetTyped, max_depth: int
+) -> None:
     global _EVALUATION_EXAMPLES, _WORKER_PSET, _MAX_DEPTH
     _EVALUATION_EXAMPLES = examples
     _WORKER_PSET = pset
@@ -228,7 +262,9 @@ def _evaluate_individual(individual: gp.PrimitiveTree) -> tuple[float]:
 
 
 def _metrics(
-    individual: gp.PrimitiveTree, examples: tuple[Example, ...], pset: gp.PrimitiveSet
+    individual: gp.PrimitiveTree,
+    examples: tuple[Example, ...],
+    pset: gp.PrimitiveSetTyped,
 ) -> float:
     return _score(_compile_expression(individual, pset), examples)
 

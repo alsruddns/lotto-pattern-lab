@@ -20,7 +20,10 @@ def test_continuous_research_page_separates_start_and_resume() -> None:
     assert not app.exception, [exception.message for exception in app.exception]
     assert [tab.label for tab in app.tabs] == ["새 연구 시작", "기존 연구 이어서 하기"]
     labels = [button.label for button in app.button]
+    assert "연구 환경 사전 검사" in labels
     assert "새 연구 시작" in labels
+    start_button = next(button for button in app.button if button.label == "새 연구 시작")
+    assert start_button.disabled
     assert "이어서 하기" in labels
     resume_selector = next(item for item in app.selectbox if item.label == "재개할 연구")
     if resume_selector.value == "962a0a57-92c3-4e88-a04f-5cf4b836ba29":

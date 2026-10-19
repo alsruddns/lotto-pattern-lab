@@ -11,6 +11,9 @@ from .intermittent_experiment import run_intermittent_experiment
 from .pysr_backend import PySRConfig, run_pysr_experiment
 from .storage import ExperimentStore
 
+GP_ENGINE_ID = "intermittent_gp"
+PYSR_ENGINE_ID = "pysr_symbolic_regression"
+
 
 @dataclass(frozen=True, slots=True)
 class ResearchRunContext:
@@ -36,7 +39,7 @@ class ResearchEngine(Protocol):
 class IntermittentGPEngine:
     """Adapter around the existing DEAP gated-rule and random-control experiment."""
 
-    engine_id: str = "intermittent_gp"
+    engine_id: str = GP_ENGINE_ID
     implemented: bool = True
 
     def run(self, context: ResearchRunContext) -> dict[str, Any]:
@@ -53,7 +56,7 @@ class IntermittentGPEngine:
 class PySRSymbolicRegressionEngine:
     """Independent adapter that calls the actual optional PySR implementation."""
 
-    engine_id: str = "pysr_symbolic_regression"
+    engine_id: str = PYSR_ENGINE_ID
     implemented: bool = True
 
     def run(self, context: ResearchRunContext) -> dict[str, Any]:

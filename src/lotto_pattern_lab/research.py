@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+import traceback
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, replace
@@ -505,6 +506,9 @@ def run_research_schedule(
             "seed": run_config.seed,
             "attempt": state["attempts"],
             "research_id": state["research_id"],
+            "engine": engines[run_index % len(engines)],
+            "feature_profile": config.feature_profile,
+            "stage": "engine_start",
             "started_at": datetime.now(UTC).isoformat(),
         }
         _atomic_json(checkpoint, state)
@@ -512,6 +516,9 @@ def run_research_schedule(
         def report(event: dict[str, Any]) -> None:
             if event.get("experiment_id"):
                 state["in_progress"]["experiment_id"] = event["experiment_id"]
+            state["in_progress"]["stage"] = str(
+                event.get("stage") or event.get("run") or "experiment_running"
+            )
             state["current_progress"] = {
                 "engine": engines[run_index % len(engines)],
                 "research_id": state["research_id"],
@@ -681,6 +688,9 @@ def run_research_schedule(
             consecutive_failures = 0
         except Exception as error:
             consecutive_failures += 1
+            in_progress = state.get("in_progress", {})
+            current_progress = state.get("current_progress", {})
+            progress_event = current_progress.get("event", {})
             storage_failure = isinstance(error, AtomicWriteError) or (
                 isinstance(error, PermissionError) and ".tmp" in str(error)
             )
@@ -689,9 +699,18 @@ def run_research_schedule(
                     "seed": run_config.seed,
                     "attempt": state["attempts"],
                     "experiment_id": state.get("in_progress", {}).get("experiment_id"),
+                    "research_id": state["research_id"],
+                    "engine": in_progress.get(
+                        "engine", engines[run_index % len(engines)]
+                    ),
+                    "feature_profile": in_progress.get("feature_profile", config.feature_profile),
+                    "stage": in_progress.get(
+                        "stage", progress_event.get("run", "engine_start")
+                    ),
                     "failed_at": datetime.now(UTC).isoformat(),
                     "error_type": type(error).__name__,
                     "error": str(error),
+                    "traceback": traceback.format_exc(),
                     "failure_category": "storage" if storage_failure else "experiment",
                     "retryable": True,
                 }

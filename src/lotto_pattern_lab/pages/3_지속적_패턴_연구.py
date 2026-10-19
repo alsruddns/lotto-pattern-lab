@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -22,6 +23,7 @@ from lotto_pattern_lab.gp_config import GPConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
+from lotto_pattern_lab.preflight import run_research_preflight
 from lotto_pattern_lab.pysr_backend import PySRConfig, optional_backend_status
 from lotto_pattern_lab.research import (
     _round_metadata,
@@ -35,6 +37,11 @@ from lotto_pattern_lab.research_rounds import ResearchRoundStore
 PAUSE_MESSAGE = (
     "일시정지 요청 완료. 현재 진행 중인 실험의 계산과 저장이 끝난 후 자동으로 일시정지됩니다."
 )
+
+
+def _preflight_fingerprint(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _worker_active(checkpoint_path: Path) -> bool:
@@ -463,7 +470,63 @@ with new_tab:
             disabled="pysr_symbolic_regression" not in engines,
             key="new_pysr_controls",
         )
-        submitted = st.form_submit_button("새 연구 시작", type="primary")
+        pattern_db = project_path("data/database/patterns.sqlite")
+        pattern_db_stat = (
+            (pattern_db.stat().st_mtime_ns, pattern_db.stat().st_size)
+            if pattern_db.is_file()
+            else None
+        )
+        preflight_input_key = _preflight_fingerprint(
+            {
+                "dataset_sha256": dataset_digest(new_dataset) if new_dataset else None,
+                "engines": engines,
+                "feature_profile": profile,
+                "gp": {
+                    "population": population,
+                    "generations": generations,
+                    "crossover": crossover,
+                    "mutation": mutation,
+                    "max_depth": max_depth,
+                    "workers": workers,
+                    "train_ratio": train_ratio,
+                    "validation_ratio": validation_ratio,
+                    "max_lag": max_lag,
+                    "control_runs": controls,
+                    "min_activation": min_activation,
+                    "hidden_states": hidden_states,
+                    "seed": seed,
+                    "elite_enabled": elite_enabled,
+                    "elite_ratio": elite_ratio,
+                },
+                "pysr": {
+                    "target": pysr_target,
+                    "binary_operators": pysr_binary_operators,
+                    "unary_operators": pysr_unary_operators,
+                    "guesses": pysr_guesses_text,
+                    "warm_start": pysr_warm_start,
+                    "timeout": pysr_timeout,
+                    "train_ratio": pysr_train_ratio,
+                    "validation_ratio": pysr_validation_ratio,
+                    "iterations": pysr_iterations,
+                    "population": pysr_population,
+                    "populations": pysr_populations,
+                    "maxsize": pysr_maxsize,
+                    "maxdepth": pysr_maxdepth,
+                    "workers": pysr_workers,
+                    "controls": pysr_controls,
+                },
+                "pattern_library_stat": pattern_db_stat,
+            }
+        )
+        preflight_submitted = st.form_submit_button("연구 환경 사전 검사")
+        saved_preflight = st.session_state.get("research_preflight_report", {})
+        preflight_ready = (
+            st.session_state.get("research_preflight_input_key") == preflight_input_key
+            and saved_preflight.get("status") == "passed"
+        )
+        submitted = st.form_submit_button(
+            "새 연구 시작", type="primary", disabled=not preflight_ready
+        )
 
     effective_config = None
     config_error = None
@@ -615,6 +678,8 @@ with new_tab:
             width="stretch",
         )
         library = PatternLibrary()
+        preview: list[dict[str, Any]] = []
+        skipped: list[dict[str, str]] = []
         if elite_enabled:
             preview, skipped = library.select_elite_candidates(
                 feature_profile=profile,
@@ -624,14 +689,70 @@ with new_tab:
             st.caption(
                 f"호환 계승 후보 {len(preview)}개, 호환되지 않아 제외된 후보 {len(skipped)}개"
             )
+        elite_seeds = tuple(preview)
     else:
         invalid_profile = True
+        elite_seeds = ()
+
+    if preflight_submitted:
+        if new_dataset is None or effective_config is None or invalid_profile:
+            report = {
+                "status": "failed",
+                "engines": {
+                    engine: {
+                        "status": "failed",
+                        "engine": engine,
+                        "feature_profile": profile,
+                        "stage": "input_validation",
+                        "error": "선택한 데이터 또는 특징 프로파일 검증에 실패했습니다.",
+                    }
+                    for engine in engines
+                },
+            }
+        else:
+            report = run_research_preflight(
+                new_dataset,
+                effective_config,
+                engines,
+                pysr_config,
+                elite_seeds=elite_seeds,
+            )
+        st.session_state["research_preflight_report"] = report
+        st.session_state["research_preflight_input_key"] = preflight_input_key
+
+    current_preflight = st.session_state.get("research_preflight_report")
+    current_preflight_matches = (
+        st.session_state.get("research_preflight_input_key") == preflight_input_key
+    )
+    if current_preflight and current_preflight_matches:
+        if current_preflight.get("status") == "passed":
+            st.success("연구 환경 사전 검사 통과. 현재 설정으로 연구를 시작할 수 있습니다.")
+        else:
+            st.error(
+                "사전 검사 실패. 오류를 수정하고 재검사해야 연구를 시작할 수 있습니다."
+            )
+        for engine_id, engine_report in current_preflight.get("engines", {}).items():
+            with st.expander(f"{engine_id}: {engine_report.get('status', 'failed')}"):
+                st.json(
+                    {
+                        key: value
+                        for key, value in engine_report.items()
+                        if key != "traceback"
+                    }
+                )
+                if engine_report.get("traceback"):
+                    st.code(engine_report["traceback"], language="text")
+    else:
+        st.info("현재 설정으로 환경 사전 검사를 통과해야 새 연구 시작 버튼이 활성화됩니다.")
 
     if submitted:
-        invalid_backend = (
-            "pysr_symbolic_regression" in engines and not pysr_status["installed"]
-        )
-        if new_dataset is None or effective_config is None or invalid_profile or invalid_backend:
+        if (
+            not current_preflight_matches
+            or not current_preflight
+            or current_preflight.get("status") != "passed"
+        ):
+            st.error("현재 엔진·설정 조합의 사전 검사가 완료되지 않아 연구를 시작하지 않았습니다.")
+        elif new_dataset is None or effective_config is None or invalid_profile:
             st.error("데이터 또는 설정 검증을 통과하지 못해 연구를 시작하지 않았습니다.")
         else:
             checkpoint_path = checkpoint_dir / (

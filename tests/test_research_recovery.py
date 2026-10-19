@@ -70,6 +70,12 @@ def test_resume_retries_failed_seeds_before_next_seed_and_restores_elapsed_time(
     assert first["status"] == "failed"
     assert [item["seed"] for item in first["failed_runs"]] == [90, 91, 92]
     assert all(item["failure_category"] == "experiment" for item in first["failed_runs"])
+    assert all(item["engine"] == "intermittent_gp" for item in first["failed_runs"])
+    assert all(item["research_id"] == first["research_id"] for item in first["failed_runs"])
+    assert all(item["feature_profile"] == "calendar_round" for item in first["failed_runs"])
+    assert all(item["stage"] == "engine_start" for item in first["failed_runs"])
+    assert all("PermissionError" in item["traceback"] for item in first["failed_runs"])
+    assert all("research.py" in item["traceback"] for item in first["failed_runs"])
     assert first["pending_retry_seeds"] == [90, 91, 92]
     assert first["rng_resume"]["next_seed"] == 93
     prior_elapsed = first["total_elapsed_seconds"]

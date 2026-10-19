@@ -18,7 +18,7 @@ from .gp_config import GPConfig
 from .gp_engine import _make_primitive_set, _predict
 
 _WORKER_EXAMPLES: tuple[Example, ...] = ()
-_WORKER_PSET: gp.PrimitiveSet | None = None
+_WORKER_PSET: gp.PrimitiveSetTyped | None = None
 _WORKER_OUTPUTS = 1
 _RULE_COUNT = 2
 _WORKER_MIN_COVERAGE = 0.1
@@ -96,17 +96,17 @@ class IntermittentSearchResult:
     seeding: dict[str, object] = field(default_factory=dict)
 
 
-def _new_tree(pset: gp.PrimitiveSet, max_depth: int) -> gp.PrimitiveTree:
+def _new_tree(pset: gp.PrimitiveSetTyped, max_depth: int) -> gp.PrimitiveTree:
     nodes = gp.genHalfAndHalf(pset=pset, min_=1, max_=min(3, max_depth))
     return gp.PrimitiveTree(nodes)
 
 
-def _new_individual(pset: gp.PrimitiveSet, outputs: int, max_depth: int):
+def _new_individual(pset: gp.PrimitiveSetTyped, outputs: int, max_depth: int):
     tree_count = outputs * _RULE_COUNT + 1
     return creator.IntermittentIndividual([_new_tree(pset, max_depth) for _ in range(tree_count)])
 
 
-def _validate_formula_ast(formula: str, pset: gp.PrimitiveSet) -> None:
+def _validate_formula_ast(formula: str, pset: gp.PrimitiveSetTyped) -> None:
     """Reject formula syntax outside numeric literals and names in this primitive set."""
     try:
         root = ast.parse(formula, mode="eval")
@@ -137,9 +137,22 @@ def _validate_formula_ast(formula: str, pset: gp.PrimitiveSet) -> None:
             raise ValueError("only numeric constants are supported in GP formulas")
 
 
+def _float_literal_formula(formula: str) -> str:
+    """Re-emit validated integer literals as float terminals without changing values."""
+
+    class FloatLiterals(ast.NodeTransformer):
+        def visit_Constant(self, node: ast.Constant) -> ast.AST:
+            if type(node.value) is int:
+                return ast.copy_location(ast.Constant(value=float(node.value)), node)
+            return node
+
+    tree = FloatLiterals().visit(ast.parse(formula, mode="eval"))
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
 def restore_elite_individual(
     seed: dict[str, object],
-    pset: gp.PrimitiveSet,
+    pset: gp.PrimitiveSetTyped,
     outputs: int,
     config: IntermittentConfig,
     base_individual=None,
@@ -168,7 +181,7 @@ def restore_elite_individual(
             _validate_formula_ast(str(migrated), pset)
         except ValueError as error:
             return None, f"formula is invalid for the current primitive set: {error}"
-        rewritten.append(str(migrated))
+        rewritten.append(_float_literal_formula(str(migrated)))
     try:
         trees = [gp.PrimitiveTree.from_string(formula, pset) for formula in rewritten]
     except (IndexError, TypeError, ValueError, SyntaxError) as error:
@@ -203,7 +216,7 @@ def _ensure_individual_types() -> None:
 
 
 def _initial_population(
-    pset: gp.PrimitiveSet,
+    pset: gp.PrimitiveSetTyped,
     outputs: int,
     config: IntermittentConfig,
     elite_seeds: tuple[dict[str, object], ...],
@@ -305,7 +318,7 @@ def _predict_numbers(
 def _measure(
     individual,
     examples: tuple[Example, ...],
-    pset: gp.PrimitiveSet,
+    pset: gp.PrimitiveSetTyped,
     outputs: int,
     min_activation_rate: float,
 ) -> dict[str, object]:
@@ -387,7 +400,7 @@ def _fitness(individual) -> tuple[float]:
 
 def _worker_init(
     examples: tuple[Example, ...],
-    pset: gp.PrimitiveSet,
+    pset: gp.PrimitiveSetTyped,
     outputs: int,
     min_activation_rate: float,
 ) -> None:
@@ -446,7 +459,7 @@ def _mate_individuals(first, second, max_depth: int, max_nodes: int, generation:
 
 def _mutate_individual(
     individual,
-    pset: gp.PrimitiveSet,
+    pset: gp.PrimitiveSetTyped,
     max_depth: int,
     max_nodes: int,
     generation: int = 0,
