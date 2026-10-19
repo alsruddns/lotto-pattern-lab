@@ -1,6 +1,7 @@
 """Safely execute saved intermittent GP rules and store immutable recommendations."""
 
 import ast
+import copy
 import hashlib
 import json
 import math
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .dataset import DrawDataset
+from .feature_schema import feature_schema_version
 from .features import build_bonus_features_for_target, build_features_for_target, feature_names
 from .gp_engine import (
     _bit_and,
@@ -38,6 +40,7 @@ from .gp_engine import (
     _square,
 )
 from .paths import project_path
+from .pattern_library import pattern_fingerprint
 from .research_features import (
     ResearchFeatureConfig,
     build_research_features_for_target,
@@ -169,6 +172,197 @@ def evaluate_formula(
     }
 
 
+def evaluate_pysr_formula(formula: str, values: tuple[float, ...], names: tuple[str, ...]) -> float:
+    """Evaluate the small, versioned PySR arithmetic grammar without eval/exec."""
+    try:
+        root = ast.parse(formula, mode="eval").body
+    except SyntaxError as error:
+        raise FormulaError(f"Invalid PySR formula syntax: {error.msg}") from error
+
+    def visit(node: ast.AST) -> float:
+        if isinstance(node, ast.Constant) and type(node.value) in {float, int}:
+            result = float(node.value)
+        elif isinstance(node, ast.Name) and node.id.startswith("x") and node.id[1:].isdigit():
+            index = int(node.id[1:])
+            if index >= len(values) or index >= len(names):
+                raise FormulaError(f"PySR variable {node.id} is outside the feature mapping.")
+            result = float(values[index])
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            child = visit(node.operand)
+            result = child if isinstance(node.op, ast.UAdd) else -child
+        elif isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)
+        ):
+            left, right = visit(node.left), visit(node.right)
+            if isinstance(node.op, ast.Add):
+                result = left + right
+            elif isinstance(node.op, ast.Sub):
+                result = left - right
+            elif isinstance(node.op, ast.Mult):
+                result = left * right
+            else:
+                result = left / right if right else 0.0
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"square", "abs"}
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            child = visit(node.args[0])
+            result = child * child if node.func.id == "square" else abs(child)
+        else:
+            raise FormulaError("PySR formula uses an unsupported saved operation.")
+        if not math.isfinite(result):
+            raise FormulaError("PySR formula produced a non-finite value.")
+        return result
+
+    return visit(root)
+
+
+def create_pysr_recommendation(
+    experiment: dict[str, Any],
+    dataset: DrawDataset,
+    target_round: int,
+    *,
+    candidate_rank: int = 1,
+    data_file_sha256: str | None = None,
+    official_latest_round: int | None = None,
+    target_date: date | None = None,
+) -> dict[str, Any]:
+    """Execute a stored PySR candidate using its recorded target and transform contract."""
+    if (
+        experiment.get("engine") != "pysr_symbolic_regression"
+        or experiment.get("status") != "completed"
+    ):
+        raise ValueError("PySR recommendation requires a completed PySR experiment.")
+    from .feature_schema import feature_mapping
+    from .pysr_backend import PySRConfig, _examples, _legal_lotto_number
+
+    config = PySRConfig(
+        **{
+            key: value
+            for key, value in experiment.get("config", {}).items()
+            if key in PySRConfig.__dataclass_fields__
+        }
+    )
+    examples = _examples(dataset, config)
+    previous = [item for item in examples if item.round_number < target_round]
+    if not previous or max(item.round_number for item in previous) != target_round - 1:
+        raise ValueError("PySR inputs must contain every draw through the round before target.")
+    features = tuple(float(value) for value in previous[-1].features)
+    mapping = feature_mapping(config.feature_profile, config.max_lag)
+    if len(features) != len(mapping) or experiment.get("feature_mapping") != mapping:
+        raise ValueError("Stored PySR feature schema does not match the current input schema.")
+    expected_schema = experiment.get("config", {}).get("feature_profile")
+    if expected_schema != config.feature_profile or not experiment.get("dataset_sha256"):
+        raise ValueError("PySR experiment lacks required schema or dataset provenance.")
+    target_names = (
+        [f"main_position_{index}" for index in range(1, 7)]
+        if config.target == "main_positions"
+        else [config.target]
+    )
+    by_target: dict[str, list[dict[str, Any]]] = {name: [] for name in target_names}
+    for candidate in experiment.get("candidates", []):
+        target_name = candidate.get("target")
+        if target_name in by_target:
+            by_target[target_name].append(candidate)
+    formulas: list[str] = []
+    candidate_fingerprints: list[str] = []
+    raw_values: list[float] = []
+    for target_name in target_names:
+        candidates = by_target[target_name]
+        if candidate_rank < 1 or candidate_rank > len(candidates):
+            raise ValueError(
+                f"PySR candidate rank {candidate_rank} is unavailable for {target_name}."
+            )
+        row = candidates[candidate_rank - 1]
+        if not row.get("fingerprint") or row.get("classification") in {"INVALID", "REDUNDANT"}:
+            raise ValueError("Selected PySR candidate lacks a verified evaluation fingerprint.")
+        formula = str(row.get("formula", ""))
+        formulas.append(formula)
+        candidate_fingerprints.append(str(row["fingerprint"]))
+        raw_values.append(evaluate_pysr_formula(formula, features, tuple(mapping)))
+    numbers: list[int] = []
+    used: set[int] = set()
+    for value in raw_values:
+        number = _legal_lotto_number(value, used)
+        numbers.append(number)
+        used.add(number)
+    expected_count = 6 if config.target == "main_positions" else 1
+    if (
+        len(numbers) != expected_count
+        or len(set(numbers)) != expected_count
+        or any(not 1 <= n <= 45 for n in numbers)
+    ):
+        raise ValueError("PySR execution did not produce a valid Lotto number set.")
+    latest = max(record.round_number for record in dataset.records)
+    status = (
+        "historical_reproduction"
+        if latest >= target_round
+        or (official_latest_round is not None and official_latest_round >= target_round)
+        else "pre_draw_prediction"
+        if official_latest_round is not None
+        else "timing_unverified"
+    )
+    formulas_payload = json.dumps(
+        {"formulas": formulas, "targets": target_names, "rank": candidate_rank}, sort_keys=True
+    )
+    calculations = [
+        {"target": name, "formula": formula, "raw_value": value, "final_number": number}
+        for name, formula, value, number in zip(
+            target_names, formulas, raw_values, numbers, strict=True
+        )
+    ]
+    return {
+        "recommendation_id": str(uuid.uuid4()),
+        "target_round": target_round,
+        "created_at": datetime.now(UTC).isoformat(),
+        "experiment_id": experiment["experiment_id"],
+        "candidate_rank": candidate_rank,
+        "engine": experiment["engine"],
+        "engine_version": experiment.get("engine_version"),
+        "model_type": "six_number_set" if expected_count == 6 else "one_number",
+        "recommended_numbers": sorted(numbers),
+        "used_formulas": formulas,
+        "all_selected_candidate_formulas": formulas,
+        "formula_calculations": calculations,
+        "gate_result": {"branch": "always_active", "rule_index": 1},
+        "gate_calculation": {"explanation": "PySR 후보식은 활성화 게이트 없이 실행됩니다."},
+        "model_validation": {
+            "training_score": None,
+            "validation_score": None,
+            "test_score": None,
+            "candidate_validation": [
+                by_target[name][candidate_rank - 1].get("evaluation", {}).get("validation")
+                for name in target_names
+            ],
+        },
+        "formula_fingerprint": hashlib.sha256(formulas_payload.encode()).hexdigest(),
+        "candidate_fingerprints": candidate_fingerprints,
+        "feature_schema": {
+            "profile": config.feature_profile,
+            "version": feature_schema_version(config.feature_profile),
+            "mapping": mapping,
+        },
+        "feature_values": {f"x{i}": value for i, value in enumerate(features)},
+        "data_provenance": {
+            "source_kind": dataset.source_kind,
+            "source_file_sha256": data_file_sha256,
+            "used_draws_sha256": _canonical_data_hash(dataset, target_round - 1),
+            "data_used_through_round": target_round - 1,
+        },
+        "official_latest_round_at_creation": official_latest_round,
+        "recommendation_status": status,
+        "replay_status": "verified_saved_formula_reexecution",
+        "random_baseline": {
+            "numbers": [],
+            "seed": None,
+            "source": "not generated by the PySR executor",
+        },
+    }
+
+
 def evaluate_gate(value: float) -> dict[str, Any]:
     """Match the existing intermittent engine's modulo-three gate semantics."""
     if not math.isfinite(value):
@@ -183,7 +377,12 @@ def evaluate_gate(value: float) -> dict[str, Any]:
 
 def _canonical_data_hash(dataset: DrawDataset, through_round: int) -> str:
     payload = [
-        {"round": record.round_number, "numbers": list(record.draw.numbers)}
+        {
+            "round": record.round_number,
+            "numbers": list(record.draw.numbers),
+            "bonus": record.draw.bonus,
+            "date": record.draw_date.isoformat() if record.draw_date else None,
+        }
         for record in dataset.records
         if record.round_number <= through_round
     ]
@@ -243,9 +442,7 @@ def create_recommendation(
         mapping = feature_names(max_lag) + research_feature_names(feature_config)
     elif feature_profile == "bonus_lag_v1":
         features = build_bonus_features_for_target(dataset, target_round, max_lag)
-        mapping = feature_names(max_lag) + tuple(
-            f"lag{lag}_bonus" for lag in range(1, max_lag + 1)
-        )
+        mapping = feature_names(max_lag) + tuple(f"lag{lag}_bonus" for lag in range(1, max_lag + 1))
     elif feature_profile == "legacy":
         features = build_features_for_target(dataset, target_round, max_lag)
         mapping = feature_names(max_lag)
@@ -255,6 +452,10 @@ def create_recommendation(
         raise ValueError("Generated feature vector does not match the saved engine feature layout.")
     prior_records = [record for record in dataset.records if record.round_number < target_round]
     latest_input_round = max(record.round_number for record in prior_records)
+    if latest_input_round != target_round - 1:
+        raise ValueError(
+            "Prediction inputs must include every draw through the round before target."
+        )
     model, selected = _selected_model(experiment, model_type)
 
     gate_formula = str(selected["activation_condition"])
@@ -280,13 +481,21 @@ def create_recommendation(
             calculation["duplicate_adjustments"] = adjustments
             final_numbers.append(adjusted_number)
             calculations.append(calculation)
+    expected_number_count = 1 if model_type == "one_number" else 6
+    if gate["rule_index"] and (
+        len(final_numbers) != expected_number_count
+        or len(set(final_numbers)) != expected_number_count
+        or any(number < 1 or number > 45 for number in final_numbers)
+    ):
+        raise ValueError("The saved formula did not produce a valid, unique Lotto number set.")
     pattern_model = "one_number_model" if model_type == "one_number" else "six_number_set_model"
+    candidate_rank = int(experiment.get("selected_candidate_rank", 1))
     selected_pattern = next(
         (
             item
             for item in experiment.get("pattern_library_candidates", ())
             if item.get("model") == pattern_model
-            and int(item.get("candidate_rank", 0)) == 1
+            and int(item.get("candidate_rank", 0)) == candidate_rank
             and int(item.get("rule_index", 0)) == int(gate["rule_index"] or 0)
         ),
         {},
@@ -318,6 +527,9 @@ def create_recommendation(
     except (KeyError, IndexError, TypeError, ValueError):
         training_last_round = int(experiment["splits"]["train_rounds"][1])
     recommendation_id = str(uuid.uuid4())
+    fingerprint_payload = pattern_fingerprint(gate_formula, formulas)
+    formula_fingerprint = hashlib.sha256(fingerprint_payload.encode("utf-8")).hexdigest()
+    schema_version = feature_schema_version(feature_profile)
     return {
         "recommendation_id": recommendation_id,
         "target_round": target_round,
@@ -325,10 +537,20 @@ def create_recommendation(
         "learning_last_round": training_last_round,
         "input_through_round": latest_input_round,
         "experiment_id": experiment["experiment_id"],
+        "candidate_rank": candidate_rank,
         "experiment_config": config,
         "target_date": target_date.isoformat() if target_date else None,
         "model_type": model_type,
         "model_version": MODEL_VERSION,
+        "program_version": MODEL_VERSION,
+        "engine": experiment.get("engine", experiment.get("engine_version", "unknown")),
+        "engine_version": experiment.get("engine_version"),
+        "formula_fingerprint": formula_fingerprint,
+        "feature_schema": {
+            "profile": feature_profile,
+            "version": schema_version,
+            "mapping": {f"x{index}": name for index, name in enumerate(mapping)},
+        },
         "activation_condition": gate_formula,
         "gate_result": gate,
         "gate_calculation": gate_result,
@@ -412,19 +634,40 @@ def load_recommendation(path: str | Path) -> dict[str, Any]:
 
 
 def compare_recommendation(
-    recommendation: dict[str, Any], actual_numbers: tuple[int, ...] | list[int]
+    recommendation: dict[str, Any],
+    actual_numbers: tuple[int, ...] | list[int],
+    actual_bonus: int | None = None,
 ) -> dict[str, Any]:
     """Compare saved numbers to a draw without mutating the saved recommendation."""
     actual = set(actual_numbers)
     predicted = set(recommendation["recommended_numbers"])
     random_numbers = set(recommendation["random_baseline"]["numbers"])
+    hit_count = len(predicted & actual)
+    bonus_in_prediction = actual_bonus is not None and actual_bonus in predicted
+    if recommendation["model_type"] != "six_number_set":
+        prize_tier = None
+    elif hit_count == 6:
+        prize_tier = 1
+    elif hit_count == 5 and bonus_in_prediction:
+        prize_tier = 2
+    elif hit_count == 5:
+        prize_tier = 3
+    elif hit_count == 4:
+        prize_tier = 4
+    elif hit_count == 3:
+        prize_tier = 5
+    else:
+        prize_tier = None
     return {
         "recommendation_id": recommendation["recommendation_id"],
         "target_round": recommendation["target_round"],
         "compared_at": datetime.now(UTC).isoformat(),
         "actual_numbers": sorted(actual),
+        "actual_bonus": actual_bonus,
         "ai_hits": sorted(predicted & actual),
-        "ai_hit_count": len(predicted & actual),
+        "ai_hit_count": hit_count,
+        "bonus_in_prediction": bonus_in_prediction,
+        "prize_tier": prize_tier,
         "random_hits": sorted(random_numbers & actual),
         "random_hit_count": len(random_numbers & actual),
         "gate_branch": recommendation["gate_result"]["branch"],
@@ -436,14 +679,15 @@ def summarize_prediction_history(
     history: list[dict[str, Any]], dataset: DrawDataset
 ) -> dict[str, dict[str, Any]]:
     """Summarize saved prospective recommendations whose actual draws are now available."""
-    actual_by_round = {record.round_number: set(record.draw.numbers) for record in dataset.records}
+    actual_by_round = {record.round_number: record.draw for record in dataset.records}
     summaries: dict[str, dict[str, Any]] = {}
     for recommendation in history:
         if recommendation.get("recommendation_status") != "pre_draw_prediction":
             continue
-        actual = actual_by_round.get(int(recommendation["target_round"]))
-        if actual is None:
+        actual_draw = actual_by_round.get(int(recommendation["target_round"]))
+        if actual_draw is None:
             continue
+        actual = set(actual_draw.numbers)
         model_type = str(recommendation["model_type"])
         row = summaries.setdefault(
             model_type,
@@ -453,6 +697,14 @@ def summarize_prediction_history(
                 "ai_numbers": 0,
                 "random_hits": 0,
                 "random_numbers": 0,
+                "hit_distribution": {str(count): 0 for count in range(7)},
+                "three_or_more": 0,
+                "four_or_more": 0,
+                "five_or_more": 0,
+                "six_exact": 0,
+                "second_prize_bonus": 0,
+                "highest_hit_count": 0,
+                "recommendation_combinations": 0,
                 "by_gate_branch": {},
             },
         )
@@ -465,6 +717,16 @@ def summarize_prediction_history(
         row["ai_numbers"] += len(predicted)
         row["random_hits"] += len(random_hits)
         row["random_numbers"] += len(random_numbers)
+        hit_count = len(hits)
+        row["hit_distribution"][str(hit_count)] += 1
+        row["three_or_more"] += int(hit_count >= 3)
+        row["four_or_more"] += int(hit_count >= 4)
+        row["five_or_more"] += int(hit_count >= 5)
+        row["six_exact"] += int(hit_count == 6)
+        row["highest_hit_count"] = max(row["highest_hit_count"], hit_count)
+        row["recommendation_combinations"] += 1
+        if model_type == "six_number_set" and hit_count == 5 and actual_draw.bonus in predicted:
+            row["second_prize_bonus"] += 1
         branch = str(recommendation["gate_result"]["branch"])
         branch_summary = row["by_gate_branch"].setdefault(
             branch, {"recommendations": 0, "ai_hits": 0, "actual_draws": 0}
@@ -476,6 +738,74 @@ def summarize_prediction_history(
         row["ai_hit_rate_per_number"] = row["ai_hits"] / max(row["ai_numbers"], 1)
         row["random_hit_rate_per_number"] = row["random_hits"] / max(row["random_numbers"], 1)
     return summaries
+
+
+def audit_candidate_history(
+    experiment: dict[str, Any],
+    dataset: DrawDataset,
+    model_type: str,
+    candidate_rank: int,
+) -> dict[str, Any]:
+    """Replay one saved candidate once per unique draw using only earlier draws as inputs."""
+    model_key = {
+        "one_number": "one_number_model",
+        "six_number_set": "six_number_set_model",
+    }.get(model_type)
+    if model_key is None:
+        raise ValueError("Unsupported recommendation model type.")
+    replay_experiment = copy.deepcopy(experiment)
+    model = replay_experiment.get(model_key, {})
+    candidates = model.get("candidates") or [model.get("selected", {})]
+    if candidate_rank < 1 or candidate_rank > len(candidates):
+        raise ValueError("Candidate rank is outside the saved experiment.")
+    model["selected"] = candidates[candidate_rank - 1]
+    replay_experiment["selected_candidate_rank"] = candidate_rank
+    max_lag = int(replay_experiment.get("config", {}).get("max_lag", 10))
+    events: list[dict[str, Any]] = []
+    distribution = {str(count): 0 for count in range(7)}
+    active_count = 0
+    for record in dataset.records:
+        target_round = record.round_number
+        if target_round - dataset.records[0].round_number < max_lag:
+            continue
+        recommendation = create_recommendation(
+            replay_experiment,
+            dataset,
+            target_round,
+            model_type,
+            random_seed=target_round,
+            official_latest_round=target_round - 1,
+            target_date=record.draw_date,
+        )
+        predicted = set(recommendation["recommended_numbers"])
+        actual = set(record.draw.numbers)
+        hits = sorted(predicted & actual)
+        hit_count = len(hits)
+        distribution[str(hit_count)] += 1
+        active_count += int(bool(predicted))
+        events.append(
+            {
+                "round": target_round,
+                "actual_numbers": sorted(actual),
+                "actual_bonus": record.draw.bonus,
+                "predicted_numbers": sorted(predicted),
+                "matched_numbers": hits,
+                "hit_count": hit_count,
+                "gate_branch": recommendation["gate_result"]["branch"],
+                "prediction_type": "retrospective_unique_round",
+                "formula_fingerprint": recommendation["formula_fingerprint"],
+            }
+        )
+    return {
+        "evaluation_rounds": len(events),
+        "active_rounds": active_count,
+        "hit_distribution": distribution,
+        "three_or_more": sum(event["hit_count"] >= 3 for event in events),
+        "four_or_more": sum(event["hit_count"] >= 4 for event in events),
+        "five_or_more": sum(event["hit_count"] >= 5 for event in events),
+        "six_exact": sum(event["hit_count"] == 6 for event in events),
+        "events": events,
+    }
 
 
 def save_comparison(
