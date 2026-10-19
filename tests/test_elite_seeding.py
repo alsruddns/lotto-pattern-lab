@@ -163,9 +163,9 @@ def test_seeded_run_keeps_random_slots_paired_with_unseeded_initialization() -> 
     random.seed(108)
     seeded_population, report = _initial_population(pset, 1, enabled, (_seed(),))
     assert report["seeded_count"] == 1
-    assert [
-        _candidate_key(item) for item in seeded_population[1:]
-    ] == [_candidate_key(item) for item in baseline_population[1:]]
+    assert [_candidate_key(item) for item in seeded_population[1:]] == [
+        _candidate_key(item) for item in baseline_population[1:]
+    ]
 
 
 def test_windows_spawn_workers_accept_elite_seed_payloads() -> None:
@@ -345,6 +345,10 @@ def test_research_checkpoint_reuses_selected_elites_and_next_seed(tmp_path) -> N
     assert experiment["elite_seeding"]["one_number_search"]["new_random_count"] == 7
     assert experiment["paired_unseeded_comparison"]["same_dataset_and_splits"] is True
     assert experiment["paired_unseeded_comparison"]["same_population_and_generations"] is True
+
+    paused = json.loads(checkpoint.read_text(encoding="utf-8"))
+    paused["status"] = "paused"
+    checkpoint.write_text(json.dumps(paused), encoding="utf-8")
 
     resumed = run_research_schedule(
         dataset,

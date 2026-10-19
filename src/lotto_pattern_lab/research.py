@@ -70,6 +70,7 @@ def _single_research_worker(function: Callable[..., dict[str, Any]]):
     def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
         checkpoint = project_path(kwargs.get("checkpoint_path", "checkpoints/research.json"))
         with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
+            Path(f"{checkpoint}.launch").unlink(missing_ok=True)
             return function(*args, **kwargs)
 
     return wrapped
@@ -82,9 +83,7 @@ def _unresolved_failure_count(state: dict[str, Any]) -> int:
         if item.get("seed") is not None
     }
     failed = {
-        int(item["seed"])
-        for item in state.get("failed_runs", [])
-        if item.get("seed") is not None
+        int(item["seed"]) for item in state.get("failed_runs", []) if item.get("seed") is not None
     }
     return len(failed - completed)
 
@@ -104,11 +103,69 @@ def load_checkpoint(path: str | Path) -> dict[str, Any]:
         return json.load(source)
 
 
+def pause_request_path(checkpoint_path: str | Path) -> Path:
+    return Path(f"{project_path(checkpoint_path)}.pause")
+
+
+def request_pause(
+    checkpoint_path: str | Path,
+    *,
+    pattern_database: str | Path = "data/database/patterns.sqlite",
+) -> Path:
+    """Persist a pause intent; the worker consumes it at an experiment boundary."""
+    checkpoint = project_path(checkpoint_path)
+    state = load_checkpoint(checkpoint)
+    if state.get("status") != "running":
+        raise ValueError(f"Cannot request pause while research is {state.get('status')}.")
+    if not state.get("research_id"):
+        raise ValueError("Cannot pause a checkpoint without a research ID.")
+    pause_path = pause_request_path(checkpoint)
+    request = {
+        "research_id": state["research_id"],
+        "requested_at": datetime.now(UTC).isoformat(),
+    }
+    with interprocess_lock(checkpoint, scope="research-control"):
+        state = load_checkpoint(checkpoint)
+        if state.get("status") != "running":
+            raise ValueError(f"Cannot request pause while research is {state.get('status')}.")
+        if state.get("research_id") != request["research_id"]:
+            raise ValueError("Research ID changed while requesting a pause.")
+        atomic_write_bytes(
+            pause_path,
+            (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"),
+        )
+        requested_state = {
+            **state,
+            "status": "pause_requested",
+            "pause_requested_at": request["requested_at"],
+            "last_updated_at": request["requested_at"],
+        }
+        try:
+            ResearchRoundStore(pattern_database).update(
+                str(state["research_id"]), _round_metadata(requested_state)
+            )
+        except Exception:
+            pause_path.unlink(missing_ok=True)
+            raise
+    return pause_path
+
+
 def request_stop(checkpoint_path: str | Path) -> Path:
-    stop_path = Path(f"{project_path(checkpoint_path)}.stop")
-    stop_path.parent.mkdir(parents=True, exist_ok=True)
-    stop_path.write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
-    return stop_path
+    """Backward-compatible alias for the persistent safe-pause request."""
+    return request_pause(checkpoint_path)
+
+
+def _pause_requested(checkpoint: Path, research_id: str) -> bool:
+    pause_path = pause_request_path(checkpoint)
+    if not pause_path.is_file():
+        # Accept stop markers written by older app versions.
+        legacy_stop = Path(f"{checkpoint}.stop")
+        return legacy_stop.is_file()
+    try:
+        request = json.loads(pause_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return request.get("research_id") in (None, research_id)
 
 
 @_single_research_worker
@@ -118,6 +175,8 @@ def run_research_schedule(
     *,
     duration_seconds: float,
     checkpoint_path: str | Path = "checkpoints/research.json",
+    dataset_path: str | Path | None = None,
+    research_id: str | None = None,
     experiment_directory: str | Path = "experiments",
     pattern_database: str | Path = "data/database/patterns.sqlite",
     resume: bool = False,
@@ -138,7 +197,7 @@ def run_research_schedule(
         raise ValueError(f"Supported engines are: {', '.join(SUPPORTED_ENGINES)}")
     checkpoint = project_path(checkpoint_path)
     run_automatic_checkpoint_cleanup()
-    stop_path = Path(f"{checkpoint}.stop")
+    pause_path = pause_request_path(checkpoint)
     data_hash = dataset_digest(dataset)
     config_payload = asdict(config)
     store = ExperimentStore(experiment_directory)
@@ -146,6 +205,8 @@ def run_research_schedule(
     round_store = ResearchRoundStore(pattern_database)
     if resume:
         state = load_checkpoint(checkpoint)
+        if state.get("status") == "completed":
+            raise ValueError("Cannot resume a completed research run.")
         if not state.get("research_id"):
             raise ValueError(f"Cannot resume: checkpoint has no research_id: {checkpoint}")
         recorded_path = state.get("checkpoint_path")
@@ -197,7 +258,7 @@ def run_research_schedule(
     else:
         if checkpoint.exists():
             raise FileExistsError(f"Checkpoint already exists: {checkpoint}; use resume=True.")
-        research_id = str(uuid.uuid4())
+        research_id = str(uuid.UUID(research_id)) if research_id else str(uuid.uuid4())
         if config.elite_seeding_enabled:
             selected_patterns, skipped_patterns = library.select_elite_candidates(
                 feature_profile=config.feature_profile,
@@ -225,6 +286,7 @@ def run_research_schedule(
             "status": "queued",
             "created_at": datetime.now(UTC).isoformat(),
             "dataset_sha256": data_hash,
+            "dataset_path": str(project_path(dataset_path)) if dataset_path else None,
             "dataset_source_kind": dataset.source_kind,
             "dataset_verification_status": dataset.verification_status,
             "dataset_round_range": [
@@ -298,7 +360,7 @@ def run_research_schedule(
             )
         ),
     }
-    previous_checkpoint_time = state.get("last_updated_at", state.get("created_at"))
+    previous_status = state.get("status")
     if resume and state.get("in_progress"):
         interrupted = dict(state["in_progress"])
         interrupted.update(
@@ -315,18 +377,17 @@ def run_research_schedule(
     state["started_at"] = state.get("started_at", datetime.now(UTC).isoformat())
     state["resume_count"] += int(resume)
     state["last_updated_at"] = datetime.now(UTC).isoformat()
-    _atomic_json(checkpoint, state)
-    round_store.update(str(state["research_id"]), _round_metadata(state))
-    if stop_path.exists():
-        try:
-            stop_time = datetime.fromisoformat(stop_path.read_text(encoding="utf-8").strip())
-            checkpoint_time = datetime.fromisoformat(previous_checkpoint_time)
-        except (OSError, ValueError):
-            stop_time = datetime.min.replace(tzinfo=UTC)
-            checkpoint_time = datetime.now(UTC)
-        if stop_time <= checkpoint_time and state.get("status") == "running":
-            # Keep a new request made during a restart; consume only an old handled request.
-            stop_path.unlink(missing_ok=True)
+    with interprocess_lock(checkpoint, scope="research-control"):
+        _atomic_json(checkpoint, state)
+        round_store.update(str(state["research_id"]), _round_metadata(state))
+        if resume and previous_status in {
+            "paused",
+            "failed",
+            "interrupted",
+            "pause_requested",
+        }:
+            pause_path.unlink(missing_ok=True)
+            Path(f"{checkpoint}.stop").unlink(missing_ok=True)
 
     baseline_elapsed = float(state.get("total_elapsed_seconds", 0.0))
     session_budget = min(
@@ -412,9 +473,9 @@ def run_research_schedule(
             store.save(orphan)
     consecutive_failures = 0
     while time.monotonic() - started < session_budget:
-        if stop_path.exists():
+        if _pause_requested(checkpoint, str(state["research_id"])):
             state["status"] = "paused"
-            state["pause_reason"] = "stop_requested_at_experiment_boundary"
+            state["pause_reason"] = "pause_requested_at_experiment_boundary"
             break
         if max_runs is not None and state["completed_runs"] >= max_runs:
             state["status"] = "completed"
@@ -449,6 +510,9 @@ def run_research_schedule(
             elapsed_now = time.monotonic() - started
             state["elapsed_seconds"] = elapsed_now
             state["total_elapsed_seconds"] = baseline_elapsed + elapsed_now
+            if _pause_requested(checkpoint, str(state["research_id"])):
+                state["status"] = "pause_requested"
+                state.setdefault("pause_requested_at", datetime.now(UTC).isoformat())
             _atomic_json(checkpoint, state)
             if progress:
                 progress(state["current_progress"])
@@ -488,9 +552,7 @@ def run_research_schedule(
                 dashboard_summary["duplicate_pattern_count"] += compact_summary[
                     "duplicate_pattern_count"
                 ]
-                dashboard_summary["child_pattern_count"] += compact_summary[
-                    "child_pattern_count"
-                ]
+                dashboard_summary["child_pattern_count"] += compact_summary["child_pattern_count"]
             else:
                 pattern_counts = library.research_pattern_counts(str(state["research_id"]))
                 dashboard_summary["new_pattern_count"] = pattern_counts["new_pattern_count"]
@@ -503,9 +565,7 @@ def run_research_schedule(
                 compact_summary["models"]["six_number_set"]
             )
             dashboard_summary["experiment_summaries"].append(compact_summary)
-            merge_unique_hit_rounds(
-                dashboard_summary, compact_summary.get("unique_hit_rounds", {})
-            )
+            merge_unique_hit_rounds(dashboard_summary, compact_summary.get("unique_hit_rounds", {}))
             for model, value in compact_summary.get("p_values", {}).items():
                 if value is not None and model in dashboard_summary["p_value_distributions"]:
                     dashboard_summary["p_value_distributions"][model].append(value)
@@ -531,10 +591,7 @@ def run_research_schedule(
             )
             completed_seed_set.add(run_config.seed)
             for failed in state.get("failed_runs", []):
-                if (
-                    failed.get("seed") is not None
-                    and int(failed["seed"]) == run_config.seed
-                ):
+                if failed.get("seed") is not None and int(failed["seed"]) == run_config.seed:
                     failed["resolved_by_experiment_id"] = result["experiment_id"]
             state["pending_retry_seeds"] = [
                 pending for pending in state["pending_retry_seeds"] if pending != run_config.seed
@@ -578,10 +635,12 @@ def run_research_schedule(
             )
             if run_config.seed not in state["pending_retry_seeds"]:
                 state["pending_retry_seeds"].append(run_config.seed)
-            state["dashboard_summary"]["failed_experiment_count"] = _unresolved_failure_count(
-                state
-            )
+            state["dashboard_summary"]["failed_experiment_count"] = _unresolved_failure_count(state)
             state.pop("in_progress", None)
+            if storage_failure:
+                state["status"] = "failed"
+                state["failure_reason"] = "experiment_storage_failure"
+                break
             if consecutive_failures >= 3:
                 state["status"] = "failed"
                 state["failure_reason"] = "three_consecutive_experiment_failures"
@@ -589,6 +648,18 @@ def run_research_schedule(
         state["last_updated_at"] = datetime.now(UTC).isoformat()
         _atomic_json(checkpoint, state)
         round_store.update(str(state["research_id"]), _round_metadata(state))
+        if _pause_requested(checkpoint, str(state["research_id"])):
+            with interprocess_lock(checkpoint, scope="research-control"):
+                state["status"] = "paused"
+                state["pause_reason"] = "pause_requested_at_experiment_boundary"
+                state["last_updated_at"] = datetime.now(UTC).isoformat()
+                state["elapsed_seconds"] = time.monotonic() - started
+                state["total_elapsed_seconds"] = baseline_elapsed + state["elapsed_seconds"]
+                _atomic_json(checkpoint, state)
+                round_store.update(str(state["research_id"]), _round_metadata(state))
+                pause_path.unlink(missing_ok=True)
+                Path(f"{checkpoint}.stop").unlink(missing_ok=True)
+            break
         if max_runs is not None and state["completed_runs"] >= max_runs:
             state["status"] = "completed"
             state["stop_reason"] = "run_count_reached"
@@ -597,18 +668,28 @@ def run_research_schedule(
         state["status"] = "completed"
         state["stop_reason"] = "time_budget_reached"
 
-    if state["status"] == "running":
-        state["status"] = "paused"
-        state["pause_reason"] = "time_budget_reached_before_boundary_completion"
-    state["last_updated_at"] = datetime.now(UTC).isoformat()
-    elapsed_this_session = time.monotonic() - started
-    state["elapsed_seconds"] = elapsed_this_session
-    state["total_elapsed_seconds"] = baseline_elapsed + elapsed_this_session
-    _atomic_json(checkpoint, state)
-    round_store.update(str(state["research_id"]), _round_metadata(state))
+    with interprocess_lock(checkpoint, scope="research-control"):
+        if state["status"] != "failed" and (
+            state["status"] == "pause_requested"
+            or _pause_requested(checkpoint, str(state["research_id"]))
+        ):
+            state["status"] = "paused"
+            state["pause_reason"] = "pause_requested_at_experiment_boundary"
+        elif state["status"] == "running":
+            state["status"] = "paused"
+            state["pause_reason"] = "time_budget_reached_before_boundary_completion"
+        state["last_updated_at"] = datetime.now(UTC).isoformat()
+        elapsed_this_session = time.monotonic() - started
+        state["elapsed_seconds"] = elapsed_this_session
+        state["total_elapsed_seconds"] = baseline_elapsed + elapsed_this_session
+        _atomic_json(checkpoint, state)
+        round_store.update(str(state["research_id"]), _round_metadata(state))
     run_automatic_checkpoint_cleanup()
-    if state.get("pause_reason") == "stop_requested_at_experiment_boundary":
-        stop_path.unlink(missing_ok=True)
+    if state.get("status") == "paused" and state.get("pause_reason") == (
+        "pause_requested_at_experiment_boundary"
+    ):
+        pause_path.unlink(missing_ok=True)
+        Path(f"{checkpoint}.stop").unlink(missing_ok=True)
     return state
 
 

@@ -332,7 +332,9 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
         experiment_directory=tmp_path / "experiments",
         pattern_database=tmp_path / "patterns.sqlite",
         max_runs=1,
+        research_id="79ecbfa6-5505-4ed2-8ba9-39fe9cd7ffb1",
     )
+    assert first["research_id"] == "79ecbfa6-5505-4ed2-8ba9-39fe9cd7ffb1"
     assert first["status"] == "completed"
     assert first["research_round"] == 1
     assert first["completed_runs"] == 1
@@ -360,6 +362,11 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     assert saved_experiment["pattern_library_candidates"]
     assert "full_set_match_discoveries" in saved_experiment
 
+    # The first run hit max_runs; model an explicit pause before testing resume.
+    paused_state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    paused_state["status"] = "paused"
+    checkpoint.write_text(json.dumps(paused_state), encoding="utf-8")
+
     second = run_research_schedule(
         dataset,
         config,
@@ -383,6 +390,10 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     )
     assert second["rng_resume"]["next_seed"] == 33
     assert len(PatternLibrary(tmp_path / "patterns.sqlite").list_patterns()) >= 4
+
+    paused_state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    paused_state["status"] = "paused"
+    checkpoint.write_text(json.dumps(paused_state), encoding="utf-8")
 
     changed = _dated_dataset(40)
     changed = DrawDataset(

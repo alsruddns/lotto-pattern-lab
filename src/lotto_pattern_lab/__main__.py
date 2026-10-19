@@ -217,6 +217,7 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument("--csv", default="data/official/draws.csv")
     parser.add_argument("--duration-minutes", type=float, default=30)
     parser.add_argument("--checkpoint", default="checkpoints/research.json")
+    parser.add_argument("--research-id")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--stop", action="store_true", help="request a stop at the next trial boundary"
@@ -282,6 +283,8 @@ def _run_research_cli(argv: list[str]) -> None:
         config,
         duration_seconds=args.duration_minutes * 60,
         checkpoint_path=args.checkpoint,
+        dataset_path=args.csv,
+        research_id=args.research_id,
         resume=args.resume,
         max_runs=args.max_runs,
         engines=tuple(args.engine or SUPPORTED_ENGINES),
