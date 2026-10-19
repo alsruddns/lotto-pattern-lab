@@ -62,3 +62,30 @@ def build_examples(dataset: DrawDataset, max_lag: int = MAX_LAG) -> tuple[Exampl
             )
         )
     return tuple(examples)
+
+
+def build_features_for_target(
+    dataset: DrawDataset, target_round: int, max_lag: int = MAX_LAG
+) -> tuple[float, ...]:
+    """Build a target's inputs from exactly the preceding contiguous draws only."""
+    if not 1 <= max_lag <= MAX_LAG:
+        raise ValueError(f"max_lag must be between 1 and {MAX_LAG}.")
+    prior_by_round = {
+        record.round_number: record
+        for record in dataset.records
+        if record.round_number < target_round
+    }
+    required_rounds = range(target_round - max_lag, target_round)
+    if target_round <= max_lag or any(
+        round_number not in prior_by_round for round_number in required_rounds
+    ):
+        raise ValueError(
+            f"Target {target_round} needs contiguous history for rounds "
+            f"{target_round - max_lag}..{target_round - 1}."
+        )
+    prior = [_set_features(prior_by_round[target_round - lag]) for lag in range(1, max_lag + 1)]
+    values = [target_round / 1000.0]
+    for summaries in prior:
+        values.extend(summaries)
+    values.extend(prior[lag - 1][0] - prior[lag][0] for lag in range(1, max_lag))
+    return tuple(float(value) for value in values)

@@ -12,6 +12,7 @@ build/
 *.egg-info/
 .env
 experiments/
+predictions/
 artifacts/
 models/
 data/raw/
