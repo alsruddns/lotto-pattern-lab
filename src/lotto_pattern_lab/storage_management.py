@@ -8,8 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .storage import _atomic_bytes, _atomic_json, _serialize_result
 from .paths import PROJECT_ROOT, project_path
+from .storage import _atomic_bytes, _atomic_json, _serialize_result
 
 MANAGED_DIRS = ("experiments", "checkpoints", "artifacts", "predictions", "logs")
 DEFAULT_QUOTA_BYTES = 10 * 1024**3

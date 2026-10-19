@@ -4,13 +4,13 @@ import os
 import subprocess
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from math import ceil
 
 import streamlit as st
 
 from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
-from lotto_pattern_lab.pattern_library import PatternLibrary, import_historical_experiment
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
+from lotto_pattern_lab.pattern_library import PatternLibrary, import_historical_experiment
 from lotto_pattern_lab.periodicity import periodicity_report
 from lotto_pattern_lab.pysr_backend import optional_backend_status
 from lotto_pattern_lab.research import load_checkpoint, request_stop
@@ -28,6 +28,7 @@ checkpoint_dir.mkdir(parents=True, exist_ok=True)
 checkpoint_paths = sorted(
     checkpoint_dir.glob("research*.json"), key=lambda p: p.stat().st_mtime, reverse=True
 )
+resume_config = {}
 with st.sidebar:
     data_source = st.radio("연구 데이터", ("공식 검증 데이터", "로컬 검증 미완료 CSV"))
     csv_path = (
@@ -44,26 +45,92 @@ with st.sidebar:
             )
         else:
             st.warning("재개할 체크포인트가 없습니다.")
+        if selected_checkpoint is not None:
+            try:
+                resume_config = load_checkpoint(selected_checkpoint).get("config", {})
+            except (OSError, ValueError):
+                resume_config = {}
     engine = st.selectbox("탐색 엔진", ("intermittent_gp",))
-    feature_profile = st.selectbox("특징 프로파일", ("legacy", "calendar_round"))
+    feature_profile = st.selectbox(
+        "특징 프로파일",
+        ("legacy", "calendar_round"),
+        index=("legacy", "calendar_round").index(
+            resume_config.get("feature_profile", "legacy")
+            if resume_config.get("feature_profile", "legacy") in {"legacy", "calendar_round"}
+            else "legacy"
+        ),
+        disabled=workflow == "저장된 연구 재개",
+    )
+    elite_enabled = st.checkbox(
+        "Elite Seeding 사용",
+        value=bool(
+            resume_config.get("elite_seeding_enabled", workflow != "저장된 연구 재개")
+        ),
+        disabled=workflow == "저장된 연구 재개",
+        help="검증 성능과 호환성을 통과한 기존 수식을 초기 GP 개체군에 넣습니다.",
+    )
+    elite_ratio = st.slider(
+        "기존 수식 계승 비율",
+        min_value=0.0,
+        max_value=0.8,
+        value=float(resume_config.get("elite_seed_ratio", 0.2)),
+        step=0.05,
+        disabled=workflow == "저장된 연구 재개" or not elite_enabled,
+        help="나머지 개체는 무작위로 새로 생성합니다.",
+    )
     duration_option = st.selectbox("실행 시간", ("30분", "1시간", "3시간", "6시간", "사용자 지정"))
     duration_minutes = {"30분": 30, "1시간": 60, "3시간": 180, "6시간": 360}.get(duration_option)
     if duration_option == "사용자 지정":
         duration_minutes = st.number_input("분", min_value=1, max_value=1440, value=30)
-    population = st.number_input("개체군 크기", min_value=8, max_value=1000, value=32, step=8)
-    generations = st.number_input("세대 수", min_value=1, max_value=1000, value=10)
-    workers = st.slider("CPU 워커", 1, 4, 4)
-    controls = st.number_input("무작위 대조 반복", min_value=0, max_value=1000, value=3)
-    seed = st.number_input("기본 난수 시드", min_value=0, max_value=2**31 - 1, value=12345)
+    population = st.number_input(
+        "개체군 크기",
+        min_value=8,
+        max_value=1000,
+        value=int(resume_config.get("population_size", 32)),
+        step=8,
+        disabled=workflow == "저장된 연구 재개",
+    )
+    generations = st.number_input(
+        "세대 수",
+        min_value=1,
+        max_value=1000,
+        value=int(resume_config.get("generations", 10)),
+        disabled=workflow == "저장된 연구 재개",
+    )
+    workers = st.slider(
+        "CPU 워커",
+        1,
+        4,
+        int(resume_config.get("workers", 4)),
+        disabled=workflow == "저장된 연구 재개",
+    )
+    controls = st.number_input(
+        "무작위 대조 반복",
+        min_value=0,
+        max_value=1000,
+        value=int(resume_config.get("control_runs", 3)),
+        disabled=workflow == "저장된 연구 재개",
+    )
+    seed = st.number_input(
+        "기본 난수 시드",
+        min_value=0,
+        max_value=2**31 - 1,
+        value=int(resume_config.get("seed", 12345)),
+        disabled=workflow == "저장된 연구 재개",
+    )
 
 dataset = None
 integrity = None
 checkpoint = None
 pending_checkpoint = st.session_state.get("pending_research_checkpoint")
 stored_checkpoint = st.session_state.get("active_research_checkpoint")
-active_checkpoint_path = project_path(
-    pending_checkpoint or stored_checkpoint or selected_checkpoint or checkpoint_paths[0]
-) if (pending_checkpoint or stored_checkpoint or selected_checkpoint or checkpoint_paths) else None
+active_checkpoint_path = (
+    project_path(
+        pending_checkpoint or stored_checkpoint or selected_checkpoint or checkpoint_paths[0]
+    )
+    if (pending_checkpoint or stored_checkpoint or selected_checkpoint or checkpoint_paths)
+    else None
+)
 checkpoint_relocated = None
 if active_checkpoint_path is not None:
     resolved_path, alternate_paths = locate_checkpoint(active_checkpoint_path)
@@ -105,11 +172,14 @@ if active_checkpoint_path is not None:
         try:
             checkpoint = load_checkpoint(active_checkpoint_path)
             if not checkpoint.get("research_id"):
-                st.error("체크포인트에 연구 ID가 없습니다. 손상 가능성이 있어 자동 수정하지 않았습니다.")
+                st.error(
+                    "체크포인트에 연구 ID가 없습니다. 손상 가능성이 있어 자동 수정하지 않았습니다."
+                )
                 checkpoint = None
-            elif checkpoint.get("checkpoint_path") and project_path(
-                checkpoint["checkpoint_path"]
-            ) != active_checkpoint_path:
+            elif (
+                checkpoint.get("checkpoint_path")
+                and project_path(checkpoint["checkpoint_path"]) != active_checkpoint_path
+            ):
                 st.error(
                     f"연구 ID {checkpoint['research_id']}가 다른 체크포인트 경로를 가리킵니다: "
                     f"{checkpoint['checkpoint_path']}"
@@ -169,13 +239,15 @@ if checkpoint:
         st.json(state["last_run_summary"])
     if state.get("failed_runs"):
         st.warning(f"실패 또는 중단된 실험: {len(state['failed_runs'])}")
-    current_experiment_id = (
-        state.get("current_progress", {}).get("event", {}).get("experiment_id")
-    )
-    if current_experiment_id and not (project_path("experiments") / f"{current_experiment_id}.json").is_file():
+    current_experiment_id = state.get("current_progress", {}).get("event", {}).get("experiment_id")
+    if (
+        current_experiment_id
+        and not (project_path("experiments") / f"{current_experiment_id}.json").is_file()
+    ):
         st.info(
-            f"현재 진행 기록의 실험 {current_experiment_id}는 완료 실험 JSON으로 저장되지 않았습니다. "
-            "기존 실험 파일은 변경하지 않았으며, 재개 시 체크포인트의 다음 난수 시드부터 계속합니다."
+            f"현재 진행 기록의 실험 {current_experiment_id}는 "
+            "완료 실험 JSON으로 저장되지 않았습니다. "
+            "기존 파일은 보존했으며, 재개 시 체크포인트의 다음 시드부터 계속합니다."
         )
 else:
     st.info("연구를 시작하면 진행 상황과 재개용 체크포인트가 로컬에 저장됩니다.")
@@ -258,9 +330,13 @@ with button_col:
             str(int(seed)),
             "--feature-profile",
             feature_profile,
+            "--elite-seed-ratio",
+            str(float(elite_ratio)),
             "--engine",
             engine,
         ]
+        if elite_enabled:
+            command.append("--elite-seeding")
         if resume:
             command.append("--resume")
         creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
@@ -292,25 +368,168 @@ with stop_col:
 st.subheader("패턴 라이브러리")
 library = PatternLibrary()
 patterns = library.list_patterns()
+if workflow == "새 장시간 연구" and elite_enabled:
+    seed_preview, preview_skipped = library.select_elite_candidates(
+        feature_profile=feature_profile,
+        max_lag=int(resume_config.get("max_lag", 10)),
+        max_candidates=2 * ceil(float(population) * float(elite_ratio)),
+    )
+    st.caption(
+        f"현재 프로파일과 검증 기준에 맞는 계승 후보 {len(seed_preview)}개 · "
+        f"제외된 후보 {len(preview_skipped)}개 · 새 무작위 개체 비율 {1 - elite_ratio:.0%}"
+    )
+    if seed_preview:
+        st.dataframe(
+            [
+                {
+                    "패턴 ID": item["pattern_id"],
+                    "모델": item.get("model_type"),
+                    "프로파일": item.get("feature_profile"),
+                    "검증 점수": item.get("performance", {}).get("validation_score"),
+                    "활성화 비율": item.get("performance", {}).get("validation_activation_rate"),
+                    "선정 점수": item.get("elite_selection_score"),
+                    "수식": item.get("formulas"),
+                }
+                for item in seed_preview
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    if preview_skipped:
+        with st.expander("계승 후보 제외 사유"):
+            st.dataframe(preview_skipped, width="stretch", hide_index=True)
 if patterns:
+    profile_filter = st.selectbox(
+        "프로파일 필터", ("전체", "legacy", "calendar_round"), key="pattern_profile_filter"
+    )
+    visible_patterns = [
+        item
+        for item in patterns
+        if profile_filter == "전체" or item.get("feature_profile", "legacy") == profile_filter
+    ]
     st.dataframe(
         [
             {
                 "패턴 ID": item["pattern_id"],
+                "모델": item.get("model_type"),
+                "프로파일": item.get("feature_profile", "legacy"),
                 "엔진": item.get("engine"),
                 "상태": item.get("current_status"),
                 "발견 방식": item.get("discovery_mode"),
+                "계승 횟수": item.get("inheritance_count", 0),
+                "자식 수": item.get("child_count", 0),
+                "검증 점수": item.get("performance", {}).get("validation_score"),
                 "조건": item.get("activation_condition"),
                 "수식": item.get("formulas"),
                 "실험": item.get("experiment_id"),
             }
-            for item in patterns
+            for item in visible_patterns
         ],
         width="stretch",
         hide_index=True,
     )
+    lineage = library.list_lineage()
+    if lineage:
+        with st.expander("수식 계보와 변형 이력"):
+            st.dataframe(
+                [
+                    {
+                        "부모 패턴": item["parent_pattern_id"],
+                        "자식 패턴": item["child_pattern_id"],
+                        "연구 ID": item.get("research_id"),
+                        "세대": item["generation"],
+                        "생성 방식": item["method"],
+                        "사용 연산자": item["operators"],
+                        "부모 수식": item.get("parent_formula"),
+                        "자식 수식": item.get("child_formula"),
+                    }
+                    for item in lineage
+                ],
+                width="stretch",
+                hide_index=True,
+            )
 else:
     st.info("저장된 패턴이 없습니다.")
+
+st.subheader("누적 연구 전략 비교")
+comparison_rows = []
+for experiment in ExperimentStore(project_path("experiments")).list():
+    if (
+        experiment.get("status") != "completed"
+        or experiment.get("experiment_type") != "intermittent"
+    ):
+        continue
+    elite = experiment.get("elite_seeding", {})
+    one = experiment.get("one_number_model", {}).get("selected", {})
+    six = experiment.get("six_number_set_model", {}).get("selected", {})
+    comparison_rows.append(
+        {
+            "실험 ID": experiment.get("experiment_id"),
+            "전략": "Elite Seeding" if elite.get("enabled") else "신규 무작위 초기화",
+            "계승 비율": elite.get("ratio", 0),
+            "실제 계승 개체 수": sum(
+                int(elite.get(key, {}).get("seeded_count", 0))
+                for key in ("one_number_search", "six_number_set_search")
+            ),
+            "실행 시간(초)": experiment.get("runtime_seconds"),
+            "신규 등록 패턴": len(experiment.get("pattern_library_candidates", [])),
+            "1개 번호 검증": one.get("validation_score"),
+            "6개 조합 검증": six.get("validation_score"),
+            "독립 테스트 점수": {
+                "1개 번호": one.get("test_score"),
+                "6개 조합": six.get("test_score"),
+            },
+            "테스트 완전 일치": int(one.get("test_full_set_matches", 0) or 0)
+            + int(six.get("test_full_set_matches", 0) or 0),
+            "독립 대조 해석": elite.get("control_comparability", "기존 실험 기록 없음"),
+        }
+    )
+    paired = experiment.get("paired_unseeded_comparison")
+    if paired:
+        paired_one = paired["one_number_model"]["selected"]
+        paired_six = paired["six_number_set_model"]["selected"]
+        comparison_rows.append(
+            {
+                "실험 ID": experiment.get("experiment_id"),
+                "전략": "같은 자료 무작위 초기화 대조",
+                "계승 비율": 0,
+                "실제 계승 개체 수": 0,
+                "실행 시간(초)": paired.get("runtime_seconds"),
+                "신규 등록 패턴": 0,
+                "1개 번호 검증": paired_one.get("validation_score"),
+                "6개 조합 검증": paired_six.get("validation_score"),
+                "독립 테스트 점수": {
+                    "1개 번호": paired_one.get("test_score"),
+                    "6개 조합": paired_six.get("test_score"),
+                },
+                "테스트 완전 일치": int(paired_one.get("test_full_set_matches", 0) or 0)
+                + int(paired_six.get("test_full_set_matches", 0) or 0),
+                "독립 대조 해석": "동일한 자료 분할·개체군·세대 수",
+            }
+        )
+if comparison_rows:
+    st.dataframe(comparison_rows, width="stretch", hide_index=True)
+    if any(row["전략"] == "Elite Seeding" for row in comparison_rows):
+        st.caption(
+            "실제 자료에서 후보를 선택한 실험은 무작위 대조군이 누적 이력을 재현하지 않습니다. "
+            "따라서 대조 해석을 제한적으로 표시하며, 검증 점수와 독립 테스트 점수를 구분합니다."
+        )
+else:
+    st.info("비교할 완료 연구 JSON이 아직 없습니다.")
+
+if checkpoint and checkpoint.get("elite_seeding"):
+    elite_state = checkpoint["elite_seeding"]
+    st.subheader("이 연구의 계승 후보")
+    st.caption(
+        f"Elite Seeding: {'사용' if elite_state.get('enabled') else '사용 안 함'} · "
+        f"계승 비율 {elite_state.get('ratio', 0):.0%} · "
+        f"선정 후보 {len(elite_state.get('source_pattern_ids', []))}개"
+    )
+    if elite_state.get("source_pattern_ids"):
+        st.write("계승 원본 패턴 ID", elite_state["source_pattern_ids"])
+    if elite_state.get("skipped"):
+        st.warning("호환성 또는 품질 기준에서 제외된 후보")
+        st.dataframe(elite_state["skipped"], width="stretch", hide_index=True)
 
 st.subheader("과거 6개 완전 일치 발견")
 exact_matches = library.list_exact_matches()

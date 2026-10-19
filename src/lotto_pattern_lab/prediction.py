@@ -16,7 +16,6 @@ from typing import Any
 
 from .dataset import DrawDataset
 from .features import build_features_for_target, feature_names
-from .paths import project_path
 from .gp_engine import (
     _bit_and,
     _bit_or,
@@ -38,6 +37,7 @@ from .gp_engine import (
     _shift_right,
     _square,
 )
+from .paths import project_path
 from .research_features import (
     ResearchFeatureConfig,
     build_research_features_for_target,
@@ -275,6 +275,17 @@ def create_recommendation(
             calculation["duplicate_adjustments"] = adjustments
             final_numbers.append(adjusted_number)
             calculations.append(calculation)
+    pattern_model = "one_number_model" if model_type == "one_number" else "six_number_set_model"
+    selected_pattern = next(
+        (
+            item
+            for item in experiment.get("pattern_library_candidates", ())
+            if item.get("model") == pattern_model
+            and int(item.get("candidate_rank", 0)) == 1
+            and int(item.get("rule_index", 0)) == int(gate["rule_index"] or 0)
+        ),
+        {},
+    )
 
     if random_seed is None:
         random_seed = secrets.randbelow(2**31)
@@ -317,6 +328,16 @@ def create_recommendation(
         "gate_result": gate,
         "gate_calculation": gate_result,
         "selected_rule": gate["rule_index"] or None,
+        "pattern_context": {
+            "pattern_id": selected_pattern.get("pattern_id"),
+            "origin_research_id": selected_pattern.get("origin_research_id"),
+            "inheritance_count": selected_pattern.get("inheritance_count", 0),
+            "validation_status": selected_pattern.get("current_status", "not_registered"),
+            "lineage": selected.get("lineage", {}),
+            "active_for_target": bool(gate["rule_index"]),
+            "prospective_round_result": "pending",
+            "inheritance_count_is_not_confidence": True,
+        },
         "used_formulas": [calculation["formula"] for calculation in calculations],
         "all_selected_candidate_formulas": formulas,
         "model_validation": {

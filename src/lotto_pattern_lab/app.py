@@ -21,9 +21,9 @@ from lotto_pattern_lab.official_data import (
     FIRST_SUPPORTED_ROUND,
     fetch_official_dataset,
 )
+from lotto_pattern_lab.paths import project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.storage import ExperimentStore
-from lotto_pattern_lab.paths import project_path
 from lotto_pattern_lab.storage_management import (
     load_storage_settings,
     storage_inventory,

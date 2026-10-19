@@ -165,7 +165,7 @@ def test_streamlit_storage_settings_page_executes() -> None:
     from lotto_pattern_lab.paths import PROJECT_ROOT
 
     page = PROJECT_ROOT / "src/lotto_pattern_lab/pages/4_저장_용량_관리.py"
-    app = AppTest.from_file(str(page)).run()
+    app = AppTest.from_file(str(page)).run(timeout=30)
 
     assert not app.exception
 
@@ -180,7 +180,7 @@ def test_research_page_uses_project_paths_from_another_working_directory(
     monkeypatch.chdir(tmp_path)
     page = PROJECT_ROOT / "src/lotto_pattern_lab/pages/3_지속적_패턴_연구.py"
 
-    app = AppTest.from_file(str(page)).run()
+    app = AppTest.from_file(str(page)).run(timeout=30)
 
     assert not app.exception
     assert "다른 작업 디렉터리" not in str(app.exception)

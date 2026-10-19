@@ -9,8 +9,8 @@ import streamlit as st
 
 from lotto_pattern_lab.dataset import load_csv
 from lotto_pattern_lab.official_data import _fetch_latest_round
-from lotto_pattern_lab.pattern_library import PatternLibrary, register_prospective_comparison
 from lotto_pattern_lab.paths import project_path
+from lotto_pattern_lab.pattern_library import PatternLibrary, register_prospective_comparison
 from lotto_pattern_lab.prediction import (
     compare_recommendation,
     create_recommendation,
@@ -133,6 +133,16 @@ if recommendation:
         st.warning("공식 최신 회차를 확인하지 못했습니다. 사전 예측 여부는 미검증입니다.")
     else:
         st.info("생성 시점의 공식 최신 회차 기준으로 사전 추천 상태를 기록했습니다.")
+    pattern_context = recommendation.get("pattern_context", {})
+    if pattern_context:
+        st.caption(
+            f"계산 수식 패턴 ID: {pattern_context.get('pattern_id') or '라이브러리 ID 없음'} · "
+            f"원본 연구: {pattern_context.get('origin_research_id') or '기존 연구'} · "
+            f"계승 횟수: {pattern_context.get('inheritance_count', 0)} · "
+            f"이번 회차 활성화: {'예' if pattern_context.get('active_for_target') else '아니요'} · "
+            f"신규 회차 결과: {pattern_context.get('prospective_round_result', '미평가')}"
+        )
+        st.info("계승 횟수는 계산 기록이며 추천 신뢰도를 뜻하지 않습니다.")
     if recommendation["gate_result"]["branch"] == "inactive":
         st.warning("패턴 비활성: 게이트에 따라 번호를 생성하지 않았습니다.")
     else:
