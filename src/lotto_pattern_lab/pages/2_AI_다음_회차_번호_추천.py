@@ -16,12 +16,21 @@ from lotto_pattern_lab.prediction import (
     compare_recommendation,
     create_recommendation,
     load_prediction_history,
+    pysr_replay_readiness,
     save_comparison,
     save_recommendation,
     summarize_prediction_history,
 )
 from lotto_pattern_lab.presentation import format_count, format_decimal, pretty_formula
 from lotto_pattern_lab.storage import ExperimentStore
+
+
+def _candidate_validation_value(candidate: dict) -> object:
+    score = candidate.get("validation_score")
+    if score is not None:
+        return score
+    return candidate.get("evaluation", {}).get("validation", {}).get("mae")
+
 
 st.set_page_config(page_title="AI 다음 회차 번호 추천", layout="wide")
 st.title("AI 다음 회차 번호 추천")
@@ -67,6 +76,16 @@ with st.sidebar:
     is_pysr = bool(
         selected_experiment and selected_experiment.get("engine") == "pysr_symbolic_regression"
     )
+    pysr_readiness = (
+        pysr_replay_readiness(selected_experiment)
+        if is_pysr and selected_experiment
+        else {"status": "verified", "reason": "GP executor"}
+    )
+    if is_pysr:
+        if pysr_readiness["status"] == "verified":
+            st.caption(f"PySR ?? ??? ??: {pysr_readiness['reason']}")
+        else:
+            st.warning(f"PySR ?? ?? ??: {pysr_readiness['reason']}")
     model_label = st.radio(
         "\ubaa8\ub378 \uc885\ub958",
         (
@@ -92,11 +111,16 @@ with st.sidebar:
                     if target_name == "main_positions"
                     else {target_name}
                 )
-                candidate_rows = [
-                    row
-                    for row in selected_experiment.get("candidates", [])
-                    if row.get("target") == sorted(target_names)[0]
-                ]
+                target_candidates = {
+                    target: [
+                        row
+                        for row in selected_experiment.get("candidates", [])
+                        if row.get("target") == target
+                    ]
+                    for target in target_names
+                }
+                common_count = min(map(len, target_candidates.values()), default=0)
+                candidate_rows = target_candidates[sorted(target_names)[0]][:common_count]
             else:
                 model_key = (
                     "one_number_model" if model_type == "one_number" else "six_number_set_model"
@@ -111,7 +135,7 @@ with st.sidebar:
                     range(1, len(candidate_rows) + 1),
                     format_func=lambda rank: (
                         f"\ud6c4\ubcf4 {rank} \u00b7 \uac80\uc99d \uc810\uc218 "
-                        f"{format_decimal(candidate_rows[rank - 1].get('validation_score'))}\uc810"
+                        f"{format_decimal(_candidate_validation_value(candidate_rows[rank - 1]))}"
                     ),
                     help=(
                         "\uac80\uc99d \uc810\uc218\uc640 "
@@ -179,7 +203,11 @@ with st.expander("\uae30\uc874 \uace0\uc801\uc911 \ud328\ud134 \uc0ac\ub840", ex
     )
 
 if st.button(
-    "공식 실행 및 추천 저장", type="primary", disabled=dataset is None or not experiment_id
+    "공식 실행 및 추천 저장",
+    type="primary",
+    disabled=(
+        dataset is None or not experiment_id or (is_pysr and pysr_readiness["status"] != "verified")
+    ),
 ):
     try:
         experiment = ExperimentStore(experiments).load(experiment_id)
@@ -202,6 +230,7 @@ if st.button(
                 int(target),
                 candidate_rank=selected_candidate_rank,
                 data_file_sha256=hashlib.sha256(data_bytes).hexdigest() if data_bytes else None,
+                random_seed=int(seed),
                 official_latest_round=official_latest,
                 target_date=target_date,
             )
@@ -302,7 +331,9 @@ if recommendation:
     if actual is None:
         st.info("대상 회차 결과가 아직 데이터에 없습니다.")
     else:
-        comparison = compare_recommendation(recommendation, actual.draw.numbers)
+        comparison = compare_recommendation(
+            recommendation, actual.draw.numbers, actual_bonus=actual.draw.bonus
+        )
         st.subheader("실제 결과 비교")
         st.json(comparison)
         if st.button("비교 결과를 별도 기록으로 저장"):
@@ -316,7 +347,9 @@ if recommendation:
 st.subheader("저장된 추천 이력")
 if dataset is not None and selected_experiment is not None:
     if st.button(
-        "\uc120\ud0dd \ud6c4\ubcf4\ub97c \uace0\uc720 \ud68c\ucc28\ub85c \ud68c\uace0 \uac80\uc99d"
+        "\uc120\ud0dd \ud6c4\ubcf4\ub97c \uace0\uc720 \ud68c\ucc28\ub85c \ud68c\uace0 \uac80\uc99d",
+        disabled=is_pysr,
+        help=("PySR 후보별 고유 회차 재검증은 현재 추가 검증이 필요합니다." if is_pysr else None),
     ):
         try:
             st.session_state["candidate_history_audit"] = audit_candidate_history(

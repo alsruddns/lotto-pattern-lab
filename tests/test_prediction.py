@@ -20,6 +20,7 @@ from lotto_pattern_lab.prediction import (
     evaluate_gate,
     evaluate_pysr_formula,
     load_recommendation,
+    pysr_replay_readiness,
     save_comparison,
     save_recommendation,
     summarize_prediction_history,
@@ -108,6 +109,15 @@ def test_pysr_formula_executor_uses_safe_arithmetic_and_unavailable_candidates_f
         evaluate_pysr_formula("__import__('os')", (1.0,), ("a",))
 
 
+def test_pysr_experiment_without_saved_replay_contract_needs_verification() -> None:
+    result = pysr_replay_readiness(
+        {"engine": "pysr_symbolic_regression", "status": "completed", "candidates": []}
+    )
+
+    assert result["status"] == "verification_required"
+    assert "버전" in result["reason"]
+
+
 def test_pysr_recommendation_reexecutes_saved_target_formulas() -> None:
     from lotto_pattern_lab.feature_schema import feature_mapping
 
@@ -133,6 +143,7 @@ def test_pysr_recommendation_reexecutes_saved_target_formulas() -> None:
         "dataset_sha256": "saved-dataset-hash",
         "candidates": candidates,
     }
+    assert pysr_replay_readiness(experiment)["status"] == "verified"
 
     result = create_pysr_recommendation(
         experiment,
