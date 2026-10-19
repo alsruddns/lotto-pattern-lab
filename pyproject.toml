@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Tools for exploring patterns in Korean Lotto 6/45 draws."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["deap>=1.4.1", "streamlit>=1.40"]
 
 [project.scripts]
 lotto-pattern-lab = "lotto_pattern_lab.__main__:main"
