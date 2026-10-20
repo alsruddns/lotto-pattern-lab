@@ -202,7 +202,9 @@ def render_optimization() -> None:
         )
 
     create_tab, resume_tab, history_tab = st.tabs(
-        ["새 자동 최적화", "기존 연구 이어하기", "최적화 이력"]
+        ["새 자동 최적화", "기존 연구 이어하기", "최적화 이력"],
+        key="optimization_workspace_tab",
+        on_change="rerun",
     )
     with create_tab:
         st.markdown(
@@ -361,7 +363,7 @@ def render_optimization() -> None:
                 }
                 for r in records
             ]
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.dataframe(rows, width="stretch", hide_index=True)
             csv_buffer = io.StringIO(newline="")
             writer = csv.DictWriter(csv_buffer, fieldnames=list(rows[0]))
             writer.writeheader()

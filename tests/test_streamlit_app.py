@@ -93,3 +93,24 @@ def test_optimization_tab_shows_history_and_separates_new_and_resume() -> None:
     assert "최적화 이력" in labels
     assert "새 자동 최적화 시작" in [button.label for button in app.button]
     assert "기존 자동 최적화 이어서 하기" in [button.label for button in app.button]
+
+def test_optimization_history_tab_state_survives_rerun() -> None:
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
+    )
+    app = AppTest.from_file(page).run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert len(app.tabs) >= 5
+    app.session_state["research_workspace_tab"] = app.tabs[-4].label
+    optimization_label = app.tabs[-4].label
+    history_label = app.tabs[-1].label
+    app.session_state["optimization_workspace_tab"] = history_label
+    app.run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.session_state["research_workspace_tab"] == optimization_label
+    assert app.session_state["optimization_workspace_tab"] == history_label
+    app.run(timeout=60)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.session_state["optimization_workspace_tab"] == history_label

@@ -483,7 +483,7 @@ else:
                 "실행 시간(초)": item.get("runtime_seconds"),
             }
         )
-    st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+    st.dataframe(summary_rows, width="stretch", hide_index=True)
     selected_id = st.selectbox(
         "실험 상세 조회", [str(item.get("experiment_id")) for item in experiments]
     )
@@ -536,12 +536,12 @@ else:
                 st.write("활성 회차 간격", candidate["active_gaps"])
                 st.write("규칙별 활성 회차", candidate["rule_active_rounds"])
                 st.write("규칙별 회차 간격", candidate["rule_active_gaps"])
-                st.dataframe(active_events, use_container_width=True, hide_index=True)
+                st.dataframe(active_events, width="stretch", hide_index=True)
 
         with state_tab:
             st.subheader("가설적 상태 및 온라인 변화점")
             st.caption("상태 A~E는 통계적 요약 라벨이며 추첨기 내부 상태나 개입의 증거가 아닙니다.")
-            st.dataframe(selected["hypothetical_states"]["state_rows"], use_container_width=True)
+            st.dataframe(selected["hypothetical_states"]["state_rows"], width="stretch")
             st.json(selected["hypothetical_states"]["test_metrics"])
 
         with validation_tab:
@@ -550,7 +550,7 @@ else:
             for label, key in model_items:
                 st.markdown(f"#### {label}")
                 candidate_rows = selected[key]["candidates"]
-                st.dataframe(candidate_rows, use_container_width=True, hide_index=True)
+                st.dataframe(candidate_rows, width="stretch", hide_index=True)
 
         with control_tab:
             st.subheader("실제 후보와 공정한 무작위 대조군")
@@ -563,7 +563,7 @@ else:
                     "판정 상태": selected["inference_status"],
                 }
             )
-            st.dataframe(selected["random_controls"], use_container_width=True, hide_index=True)
+            st.dataframe(selected["random_controls"], width="stretch", hide_index=True)
     elif selected.get("experiment_type") == "bonus_target":
         candidate = selected["candidate"]
         st.subheader("보너스 번호 단일 대상 GP 평가")

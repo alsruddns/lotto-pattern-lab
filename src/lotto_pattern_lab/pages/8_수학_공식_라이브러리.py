@@ -68,7 +68,7 @@ visible = (
 )
 st.dataframe(
     [{key: value for key, value in item.items() if key != "payload"} for item in visible],
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 

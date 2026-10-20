@@ -75,7 +75,7 @@ st.dataframe(
         }
         for folder in inventory["folders"]
     ],
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 st.subheader("파일 유형별 사용량")
@@ -90,7 +90,7 @@ st.dataframe(
             inventory["file_types"].items(), key=lambda item: item[1]["bytes"], reverse=True
         )
     ],
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 if inventory["research_usage"]:
@@ -108,7 +108,7 @@ if inventory["research_usage"]:
                 reverse=True,
             )
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -164,7 +164,7 @@ if experiment_plan["candidates"]:
             }
             for item in experiment_plan["candidates"]
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.info(
@@ -191,7 +191,7 @@ else:
     st.info("압축 후보가 없습니다. 완료/실패 상태의 1 MB 초과 기존 실험만 후보로 표시됩니다.")
 if experiment_plan["protected"]:
     with st.expander("압축 후보에서 제외된 파일"):
-        st.dataframe(experiment_plan["protected"], use_container_width=True, hide_index=True)
+        st.dataframe(experiment_plan["protected"], width="stretch", hide_index=True)
 
 pysr_plan = pysr_artifact_compression_plan()
 st.subheader("PySR 결과물 압축 미리보기")
@@ -200,7 +200,7 @@ st.caption(
     "PySR 모델 checkpoint.pkl은 보존합니다."
 )
 if pysr_plan["candidates"]:
-    st.dataframe(pysr_plan["candidates"], use_container_width=True, hide_index=True)
+    st.dataframe(pysr_plan["candidates"], width="stretch", hide_index=True)
     st.write(f"예상 절감량: {pysr_plan['expected_bytes_freed'] / 1024:.1f} KiB")
     approve_pysr_archive = st.checkbox(
         "완료된 PySR CSV의 gzip 보관에 동의합니다.", key="approve_pysr_archive"
@@ -215,7 +215,7 @@ else:
     st.info("압축 대상인 완료 PySR CSV가 없습니다.")
 if pysr_plan["protected"]:
     with st.expander("보호된 PySR 결과물"):
-        st.dataframe(pysr_plan["protected"], use_container_width=True, hide_index=True)
+        st.dataframe(pysr_plan["protected"], width="stretch", hide_index=True)
 
 st.subheader("체크포인트 정리 미리보기")
 checkpoint_plan = checkpoint_cleanup_plan(keep=int(keep_count))
@@ -225,7 +225,7 @@ st.caption(
     "파일은 정리 대상에서 제외합니다."
 )
 if checkpoint_plan["candidates"]:
-    st.dataframe(checkpoint_plan["candidates"], use_container_width=True, hide_index=True)
+    st.dataframe(checkpoint_plan["candidates"], width="stretch", hide_index=True)
     st.write(f"예상 확보 용량: {checkpoint_plan['expected_bytes_freed'] / 1024:.1f} KiB")
     approve_checkpoints = st.checkbox(
         "위의 검증된 종료 체크포인트를 삭제하는 데 동의합니다.",
@@ -242,7 +242,7 @@ else:
     st.info("삭제 가능한 체크포인트가 없습니다.")
 if checkpoint_plan["protected"]:
     with st.expander("보존되는 체크포인트"):
-        st.dataframe(checkpoint_plan["protected"], use_container_width=True, hide_index=True)
+        st.dataframe(checkpoint_plan["protected"], width="stretch", hide_index=True)
 
 st.caption(
     f"기본 저장 한도는 {DEFAULT_QUOTA_BYTES / 1024**3:.0f} GiB이며 자동 정리는 기본 꺼짐입니다. "
