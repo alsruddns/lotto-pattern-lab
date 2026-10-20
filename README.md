@@ -126,3 +126,9 @@ PySR/Julia 백엔드, 완전한 재귀식·무제한 비정형 문법, 세대 �
     .\.venv\Scripts\python.exe -m pip install -e ".[symbolic]"
 
 확인 시점에 PySR 저장소의 현재 프로젝트 메타데이터는 Python 3.10 이상을 선언하고 juliacall을 의존성으로 사용하므로 Python 3.13은 메타데이터 범위에 포함됩니다. 하지만 이 PC의 Julia 설치·초기화와 PySR 실제 탐색은 실행하지 않았으므로 Windows 11 런타임 호환성이 검증 완료된 상태는 아닙니다. 앱 시작 시 PySR를 import하지 않으며, 선택 백엔드 오류는 DEAP 기능과 분리해 표시합니다. [PySR 프로젝트 메타데이터](https://github.com/astroautomata/PySR/blob/master/pyproject.toml), [JuliaCall 의존성 안내](https://github.com/JuliaPy/PythonCall.jl/blob/main/docs/src/juliacall.md)
+
+## Windows에서 실행하기
+
+프로젝트 루트의 `start.bat`을 더블클릭하면 기존 `.venv` 가상환경으로 AI 패턴 연구실을 실행합니다. 실행 위치는 배치 파일이 있는 프로젝트 폴더를 기준으로 하며, 앱 진입점은 `src/lotto_pattern_lab/app.py`입니다.
+
+이미 기본 Streamlit 포트(8501)가 사용 중이면 새 서버를 추가로 실행하지 않고 기존 화면(`http://localhost:8501`)을 엽니다. 가상환경, 앱 파일 또는 Streamlit이 없으면 한국어 오류와 복구 방법을 표시하고 창을 유지합니다. 서버를 종료할 때는 실행 창에서 `Ctrl+C`를 누르세요.
