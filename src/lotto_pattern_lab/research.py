@@ -43,6 +43,16 @@ SUPPORTED_ENGINES = tuple(
     engine_id for engine_id, engine in ENGINE_REGISTRY.items() if engine.implemented
 )
 DEFAULT_ENGINES = ("intermittent_gp",)
+GLOBAL_RESEARCH_LOCK = project_path("checkpoints/research_global")
+
+
+def research_worker_active() -> bool:
+    """Report whether a research or optimization process holds the shared CPU slot."""
+    try:
+        with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
+            return False
+    except TimeoutError:
+        return True
 
 
 def dataset_digest(dataset: DrawDataset) -> str:
@@ -76,7 +86,10 @@ def _single_research_worker(function: Callable[..., dict[str, Any]]):
         checkpoint = project_path(kwargs.get("checkpoint_path", "checkpoints/research.json"))
         with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
             Path(f"{checkpoint}.launch").unlink(missing_ok=True)
-            return function(*args, **kwargs)
+            with interprocess_lock(
+                GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"
+            ):
+                return function(*args, **kwargs)
 
     return wrapped
 

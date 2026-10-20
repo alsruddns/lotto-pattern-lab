@@ -249,3 +249,36 @@ def test_auto_replay_deduplicates_work_but_preserves_discovery_events(
     assert jobs[0]["repeated_hit_events"] == 6
     assert jobs[0]["original_hit_rounds"] == [10, 11]
     assert jobs[0]["origin_experiment_ids"] == ["auto-one", "auto-two"]
+
+
+def test_replay_dispatch_respects_global_single_worker_slot(tmp_path) -> None:
+    import lotto_pattern_lab.formula_replay_queue as queue
+
+    source = tmp_path / "draws.csv"
+    source.write_text(
+        "round,n1,n2,n3,n4,n5,n6\n1,1,2,3,4,5,6\n2,2,3,4,5,6,7\n",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    enqueue_formula_replay(
+        dataset_path=source,
+        dataset_sha256=digest,
+        experiment={
+            "config": {"feature_profile": "legacy", "max_lag": 10},
+            "feature_schema": {"feature_profile": "legacy"},
+            "six_number_set_model": {},
+        },
+        model_key="six_number_set_model",
+        candidate=_candidate((10,)),
+        formula_id="waiting-slot",
+        start_round=1,
+        end_round=2,
+        directory=tmp_path / "jobs",
+        dispatch=False,
+    )
+
+    with queue.interprocess_lock(
+        queue.REPLAY_RESOURCE_LOCK, timeout=0, scope="formula-replay-global"
+    ):
+        queue._dispatch(tmp_path / "jobs")
+        assert list_replay_jobs(tmp_path / "jobs")[0]["status"] == "queued"

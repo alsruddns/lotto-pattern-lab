@@ -40,6 +40,7 @@ from lotto_pattern_lab.research import (
     load_checkpoint,
     pause_request_path,
     request_pause,
+    research_worker_active,
 )
 from lotto_pattern_lab.research_optimization import optuna_status
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
@@ -119,6 +120,8 @@ def _validate_live_research_start(
     checkpoint_directory: Path, csv_path: Path | None, dataset: Any
 ) -> None:
     """Recheck dynamic start conditions even when a disk preflight cache is reused."""
+    if research_worker_active():
+        raise RuntimeError("다른 연구 또는 최적화 작업이 CPU 실행 슬롯을 사용 중입니다.")
     if csv_path is None or not csv_path.is_file() or dataset is None:
         raise ValueError("선택한 당첨번호 데이터 파일을 찾을 수 없습니다.")
     refreshed = load_csv(csv_path)
@@ -2135,6 +2138,7 @@ with st.expander("Optuna로 검증 구간 연구 조건 찾기", expanded=False)
             and optimization_state_path.parent.exists()
             and _worker_active(optimization_state_path)
         )
+        optimization_active = optimization_active or research_worker_active()
         if optimization_state_path.is_file():
             try:
                 saved_state = json.loads(optimization_state_path.read_text(encoding="utf-8"))

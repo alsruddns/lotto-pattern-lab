@@ -6,6 +6,7 @@ import pytest
 from deap import gp
 from streamlit.testing.v1 import AppTest
 
+from lotto_pattern_lab.atomic_io import interprocess_lock
 from lotto_pattern_lab.backtest import chronological_split
 from lotto_pattern_lab.dataset import (
     DrawDataset,
@@ -29,7 +30,7 @@ from lotto_pattern_lab.pattern_library import (
 from lotto_pattern_lab.periodicity import periodicity_report
 from lotto_pattern_lab.prediction import create_recommendation, evaluate_formula
 from lotto_pattern_lab.pysr_backend import optional_backend_status
-from lotto_pattern_lab.research import run_research_schedule
+from lotto_pattern_lab.research import research_worker_active, run_research_schedule
 from lotto_pattern_lab.research_features import (
     ResearchFeatureConfig,
     build_research_examples,
@@ -53,6 +54,17 @@ def _dated_dataset(length: int = 35) -> DrawDataset:
         for index, record in enumerate(source.records)
     )
     return DrawDataset(records, "synthetic", "Synthetic numbers with explicit date fixtures.")
+
+
+def test_shared_research_slot_reports_other_research_or_optimizer(tmp_path, monkeypatch) -> None:
+    import lotto_pattern_lab.research as research
+
+    monkeypatch.setattr(research, "GLOBAL_RESEARCH_LOCK", tmp_path / "shared-slot")
+    assert research_worker_active() is False
+    with interprocess_lock(
+        research.GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"
+    ):
+        assert research_worker_active() is True
 
 
 def test_random_forest_baseline_uses_chronological_splits_and_saves_model(tmp_path) -> None:

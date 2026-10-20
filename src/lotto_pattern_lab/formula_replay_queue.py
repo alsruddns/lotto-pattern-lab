@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .atomic_io import atomic_write_bytes, interprocess_lock
+from .atomic_io import LockTimeoutError, atomic_write_bytes, interprocess_lock
 from .dataset import load_csv
 from .formula_replay import replay_formula
 from .paths import project_path
@@ -19,6 +19,7 @@ from .pattern_library import pattern_fingerprint
 from .storage import ExperimentStore
 
 MAX_REPLAY_WORKERS = 1
+REPLAY_RESOURCE_LOCK = project_path("data/replay_jobs/replay_worker_global")
 _EXECUTOR = ThreadPoolExecutor(max_workers=MAX_REPLAY_WORKERS, thread_name_prefix="formula-replay")
 _FUTURES: dict[str, Future] = {}
 _DISPATCH_LOCK = threading.RLock()
@@ -58,6 +59,11 @@ def list_replay_jobs(directory: str | Path | None = None) -> list[dict[str, Any]
 
 def _dispatch(directory: str | Path | None = None) -> None:
     jobs_root = _jobs_directory(directory)
+    try:
+        with interprocess_lock(REPLAY_RESOURCE_LOCK, timeout=0, scope="formula-replay-global"):
+            pass
+    except LockTimeoutError:
+        return
     with _DISPATCH_LOCK:
         for job_id, future in tuple(_FUTURES.items()):
             if future.done():
@@ -457,7 +463,7 @@ def discover_high_hit_candidates(
     )
 
 
-def _execute_job(job_id: str, directory: Path) -> None:
+def _execute_job_unlocked(job_id: str, directory: Path) -> None:
     path = _job_path(job_id, directory)
     with interprocess_lock(path, scope="formula-replay-job"):
         job = json.loads(path.read_text(encoding="utf-8"))
@@ -525,6 +531,17 @@ def _execute_job(job_id: str, directory: Path) -> None:
                 updated_at=datetime.now(UTC).isoformat(),
             )
             _write_job(latest, directory)
+
+
+def _execute_job(job_id: str, directory: Path) -> None:
+    """Use one replay worker slot across all Streamlit and CLI processes."""
+    try:
+        with interprocess_lock(
+            REPLAY_RESOURCE_LOCK, timeout=0, scope="formula-replay-global"
+        ):
+            _execute_job_unlocked(job_id, directory)
+    except LockTimeoutError:
+        return
 
 
 def resume_replay_job(job_id: str, directory: str | Path | None = None) -> dict[str, Any]:

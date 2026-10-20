@@ -19,7 +19,13 @@ from .paths import project_path
 from .pattern_library import PatternLibrary
 from .patterns import summarize_draw
 from .pysr_backend import PySRConfig
-from .research import DEFAULT_ENGINES, SUPPORTED_ENGINES, request_stop, run_research_schedule
+from .research import (
+    DEFAULT_ENGINES,
+    GLOBAL_RESEARCH_LOCK,
+    SUPPORTED_ENGINES,
+    request_stop,
+    run_research_schedule,
+)
 from .research_optimization import optimize_gp
 from .storage import ExperimentStore
 from .tabular_models import run_tabular_model
@@ -385,18 +391,19 @@ def _run_optimization_cli(argv: list[str]) -> None:
     storage_root.mkdir(parents=True, exist_ok=True)
     study_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.study_name).strip(".-")[:80]
     state_path = storage_root / f"{study_slug}.state.json"
-    with interprocess_lock(state_path, scope="research-worker"):
-        result = optimize_gp(
-            dataset,
-            config,
-            study_name=args.study_name,
-            mode=args.mode,
-            n_trials=args.trials,
-            timeout_seconds=args.timeout_seconds,
-            storage_directory=args.storage_directory,
-            experiment_directory=args.experiment_directory,
-            progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
-        )
+    with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
+        with interprocess_lock(state_path, scope="research-worker"):
+            result = optimize_gp(
+                dataset,
+                config,
+                study_name=args.study_name,
+                mode=args.mode,
+                n_trials=args.trials,
+                timeout_seconds=args.timeout_seconds,
+                storage_directory=args.storage_directory,
+                experiment_directory=args.experiment_directory,
+                progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
+            )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -410,16 +417,17 @@ def _run_model_cli(argv: list[str]) -> None:
     parser.add_argument("--seed", type=int, default=GP_DEFAULTS.seed)
     parser.add_argument("--max-lag", type=int, default=10)
     args = parser.parse_args(argv)
-    result = run_tabular_model(
-        load_csv(project_path(args.csv)),
-        args.model,
-        config=IntermittentConfig(
-            workers=min(max(1, args.workers), 4),
-            seed=args.seed,
-            max_lag=args.max_lag,
-            control_runs=0,
-        ),
-    )
+    with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
+        result = run_tabular_model(
+            load_csv(project_path(args.csv)),
+            args.model,
+            config=IntermittentConfig(
+                workers=min(max(1, args.workers), 4),
+                seed=args.seed,
+                max_lag=args.max_lag,
+                control_runs=0,
+            ),
+        )
     print(
         json.dumps(
             {
