@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 from datetime import date
 
+import plotly.graph_objects as go
 import streamlit as st
 
 from lotto_pattern_lab.dataset import load_csv
 from lotto_pattern_lab.future_validation import (
     audit_future_ledger,
+    build_future_scorecard,
     freeze_formula,
     load_frozen_formula,
+    read_future_ledger_events,
     record_future_comparison,
     save_frozen_prediction,
 )
@@ -269,6 +272,75 @@ elif dataset is not None:
             )
         else:
             st.info("대조할 새 추첨 결과가 없습니다.")
+
+st.subheader("공식별 미래 검증 성적표")
+if not prospective:
+    st.info("추첨 전에 저장된 예측이 없어 성적표가 비어 있습니다.")
+elif not ledger["valid"]:
+    st.warning("기록 무결성 확인이 통과된 뒤 미래 검증 성적표를 표시할 수 있습니다.")
+else:
+    try:
+        frozen_records = [load_frozen_formula(freeze_id) for freeze_id in freeze_ids]
+        scorecard = build_future_scorecard(
+            prospective, read_future_ledger_events(), frozen_records
+        )
+        if scorecard:
+            st.dataframe(
+                [
+                    {
+                        "공식 ID": row["freeze_id"],
+                        "동결 시각": row["frozen_at"],
+                        "모델": "6개 집합" if row["model_type"] == "six_number_set" else "한 번호",
+                        "예측 대상 회차": row["target_rounds"],
+                        "사전 예측 수": row["prediction_count"],
+                        "공식 대조 회차": row["official_verified_round_count"],
+                        "임시 결과": row["provisional_round_count"],
+                        "대기 회차": row["pending_round_count"],
+                        "공식 대조 평균 적중": row["mean_hits_official"],
+                        "무작위 기준 평균": row["mean_random_hits_official"],
+                        "최근 공식 검증 평균": row["recent_mean_hits_official"],
+                        "활성화율": row["official_gate_activation_rate"],
+                        "검증 상태": row["validation_status"],
+                    }
+                    for row in scorecard
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+            chart_rows = [row for row in scorecard if row["mean_hits_official"] is not None]
+            if chart_rows:
+                chart = go.Figure()
+                chart.add_trace(
+                    go.Bar(
+                        x=[row["freeze_id"][:8] for row in chart_rows],
+                        y=[row["mean_hits_official"] for row in chart_rows],
+                        name="동결 공식",
+                        text=[f"n={row['official_verified_round_count']}" for row in chart_rows],
+                        textposition="auto",
+                    )
+                )
+                chart.add_trace(
+                    go.Scatter(
+                        x=[row["freeze_id"][:8] for row in chart_rows],
+                        y=[row["mean_random_hits_official"] for row in chart_rows],
+                        mode="markers",
+                        name="동일 회차 무작위 기준 평균",
+                    )
+                )
+                chart.update_layout(
+                    xaxis_title="공식 동결 ID",
+                    yaxis_title="공식 대조 회차당 평균 적중 수",
+                    legend={"orientation": "h"},
+                )
+                st.plotly_chart(chart, width="stretch")
+            st.caption(
+                "순위는 표본 수가 적어 표시하지 않습니다. 공식 검증 결과만 평균에 포함하며, "
+                "수동 입력 결과는 임시 결과로 따로 셉니다."
+            )
+        else:
+            st.info("연결된 동결 공식과 사전 예측 기록이 없습니다.")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        st.error(f"미래 검증 성적표를 구성하지 못했습니다: {error}")
 
 with st.expander("로컬 기록의 한계"):
     st.write(

@@ -63,6 +63,107 @@ def audit_future_ledger(directory: str | Path | None = None) -> dict[str, Any]:
     return {"valid": True, "event_count": count, "last_hash": previous, "error": None}
 
 
+def read_future_ledger_events(directory: str | Path | None = None) -> list[dict[str, Any]]:
+    """Read ledger events only after the full chain passes integrity validation."""
+    audit = audit_future_ledger(directory)
+    if not audit["valid"]:
+        raise ValueError(f"미래 검증 이력 무결성 오류: {audit['error']}")
+    path = _ledger_path(directory)
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def build_future_scorecard(
+    history: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    frozen_formulas: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate prospective predictions, keeping official and provisional results apart."""
+    result_events = {
+        str(event.get("payload", {}).get("recommendation_id")): event["payload"]
+        for event in events
+        if event.get("event_type") == "future_result_registered"
+    }
+    predictions_by_freeze: dict[str, list[dict[str, Any]]] = {}
+    for item in history:
+        if (
+            item.get("freeze_id")
+            and item.get("recommendation_status") == "pre_draw_prediction"
+        ):
+            predictions_by_freeze.setdefault(str(item["freeze_id"]), []).append(item)
+    rows = []
+    for frozen in frozen_formulas:
+        freeze_id = str(frozen["freeze_id"])
+        predictions = sorted(
+            predictions_by_freeze.get(freeze_id, []),
+            key=lambda item: (int(item["target_round"]), str(item.get("created_at", ""))),
+        )
+        comparisons = [
+            result_events[str(item["recommendation_id"])]
+            for item in predictions
+            if str(item.get("recommendation_id")) in result_events
+        ]
+        verified = [
+            item for item in comparisons if item.get("result_status") == "official_verified"
+        ]
+        provisional = [
+            item for item in comparisons if item.get("result_status") != "official_verified"
+        ]
+        recent = verified[-10:]
+        distribution = {str(hit_count): 0 for hit_count in range(7)}
+        for item in verified:
+            distribution[str(int(item.get("ai_hit_count", 0)))] += 1
+        formula = frozen.get("frozen_experiment", {})
+        model = frozen.get("model_type")
+        rows.append(
+            {
+                "freeze_id": freeze_id,
+                "formula_content_sha256": frozen.get("formula_content_sha256"),
+                "formula_id": frozen.get("pattern_id") or frozen.get("candidate_formula_id"),
+                "origin_experiment_id": frozen.get("origin_experiment_id"),
+                "origin_research_id": frozen.get("origin_research_id"),
+                "model_type": model,
+                "frozen_at": frozen.get("frozen_at"),
+                "prediction_count": len(predictions),
+                "target_rounds": [int(item["target_round"]) for item in predictions],
+                "official_verified_round_count": len(verified),
+                "provisional_round_count": len(provisional),
+                "pending_round_count": len(predictions) - len(comparisons),
+                "mean_hits_official": (
+                    sum(int(item.get("ai_hit_count", 0)) for item in verified) / len(verified)
+                    if verified
+                    else None
+                ),
+                "mean_random_hits_official": (
+                    sum(int(item.get("random_hit_count", 0)) for item in verified) / len(verified)
+                    if verified
+                    else None
+                ),
+                "recent_verified_round_count": len(recent),
+                "recent_mean_hits_official": (
+                    sum(int(item.get("ai_hit_count", 0)) for item in recent) / len(recent)
+                    if recent
+                    else None
+                ),
+                "official_gate_activation_rate": (
+                    sum(item.get("gate_branch") != "inactive" for item in verified) / len(verified)
+                    if verified
+                    else None
+                ),
+                "hit_distribution_official": distribution,
+                "at_least_3_official": sum(
+                    count for hit_count, count in distribution.items() if int(hit_count) >= 3
+                ),
+                "validation_status": (
+                    "표본 부족" if len(verified) < 30 else "공식 결과 검증"
+                ),
+                "experiment_engine": formula.get("engine"),
+            }
+        )
+    return rows
+
+
 def append_future_event(
     event_type: str, payload: dict[str, Any], directory: str | Path | None = None
 ) -> dict[str, Any]:

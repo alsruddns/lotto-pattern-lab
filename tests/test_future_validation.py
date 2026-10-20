@@ -5,6 +5,7 @@ import json
 from lotto_pattern_lab.dataset import DrawDataset, DrawRecord, make_random_dataset
 from lotto_pattern_lab.future_validation import (
     audit_future_ledger,
+    build_future_scorecard,
     freeze_formula,
     load_frozen_formula,
     record_future_comparison,
@@ -36,6 +37,60 @@ def _experiment() -> dict:
     }
 
 
+def test_future_scorecard_separates_official_provisional_and_pending_results() -> None:
+    frozen = {
+        "freeze_id": "freeze-a",
+        "formula_content_sha256": "formula-hash",
+        "origin_experiment_id": "experiment-a",
+        "origin_research_id": "research-a",
+        "model_type": "six_number_set",
+        "frozen_at": "2026-01-01T00:00:00+00:00",
+    }
+    history = [
+        {
+            "recommendation_id": "verified",
+            "freeze_id": "freeze-a",
+            "recommendation_status": "pre_draw_prediction",
+            "target_round": 1300,
+            "created_at": "2026-01-02T00:00:00+00:00",
+        },
+        {
+            "recommendation_id": "pending",
+            "freeze_id": "freeze-a",
+            "recommendation_status": "pre_draw_prediction",
+            "target_round": 1301,
+            "created_at": "2026-01-03T00:00:00+00:00",
+        },
+        {
+            "recommendation_id": "historical",
+            "freeze_id": "freeze-a",
+            "recommendation_status": "historical_reproduction",
+            "target_round": 1299,
+        },
+    ]
+    events = [
+        {
+            "event_type": "future_result_registered",
+            "payload": {
+                "recommendation_id": "verified",
+                "result_status": "official_verified",
+                "ai_hit_count": 5,
+                "random_hit_count": 3,
+                "gate_branch": "rule_1",
+            },
+        }
+    ]
+
+    row = build_future_scorecard(history, events, [frozen])[0]
+
+    assert row["prediction_count"] == 2
+    assert row["official_verified_round_count"] == 1
+    assert row["provisional_round_count"] == 0
+    assert row["pending_round_count"] == 1
+    assert row["mean_hits_official"] == 5
+    assert row["mean_random_hits_official"] == 3
+    assert row["hit_distribution_official"]["5"] == 1
+    assert row["validation_status"] == "표본 부족"
 def test_frozen_formula_is_immutable_and_hash_checked(tmp_path) -> None:
     frozen = freeze_formula(
         _experiment(),

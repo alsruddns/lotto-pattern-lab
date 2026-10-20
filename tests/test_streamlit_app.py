@@ -37,6 +37,17 @@ def test_formula_library_page_renders_similarity_and_lineage_sections() -> None:
     assert "수식 계보" in [item.value for item in app.subheader]
 
 
+def test_future_validation_page_renders_scorecard() -> None:
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("9_*.py")
+    )
+    app = AppTest.from_file(page).run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.title[0].value == "미래 독립 검증"
+    assert "공식별 미래 검증 성적표" in [item.value for item in app.subheader]
+
+
 def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(research_queue, "QUEUE_DB", tmp_path / "queue.sqlite")
     page = next(
