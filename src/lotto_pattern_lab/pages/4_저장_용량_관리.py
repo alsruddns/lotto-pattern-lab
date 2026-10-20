@@ -20,8 +20,8 @@ from lotto_pattern_lab.storage_management import (
     verify_storage_backup,
 )
 
-st.set_page_config(page_title="저장 용량 관리", layout="wide")
-st.title("시스템 설정 · 저장 용량 관리")
+st.set_page_config(page_title="데이터 및 저장 공간 관리", layout="wide")
+st.title("데이터 및 저장 공간 관리")
 st.subheader("백업 및 복구 검증")
 st.caption("백업은 관리 대상 파일의 원본을 변경하지 않고 ZIP과 SHA-256 manifest를 생성합니다.")
 if st.button("연구 산출물 백업 생성"):
@@ -200,8 +200,7 @@ if pysr_plan["candidates"]:
     if st.button("완료 PySR CSV 압축", disabled=not approve_pysr_archive):
         outcome = compress_pysr_artifacts()
         st.success(
-            f"{len(outcome['compressed'])}개 압축, "
-            f"{outcome['bytes_freed'] / 1024:.1f} KiB 절감"
+            f"{len(outcome['compressed'])}개 압축, {outcome['bytes_freed'] / 1024:.1f} KiB 절감"
         )
         st.rerun()
 else:

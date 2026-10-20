@@ -309,4 +309,4 @@ def test_recommendation_streamlit_page_executes_without_script_errors() -> None:
     app = AppTest.from_file(page).run(timeout=30)
 
     assert not app.exception, [exception.message for exception in app.exception]
-    assert app.title[0].value.startswith("AI")
+    assert app.title[0].value == "다음 회차 번호 추천"

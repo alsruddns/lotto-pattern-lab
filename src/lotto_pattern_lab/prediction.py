@@ -354,7 +354,7 @@ def create_pysr_recommendation(
         or len(set(numbers)) != expected_count
         or any(not 1 <= n <= 45 for n in numbers)
     ):
-        raise ValueError("PySR execution did not produce a valid Lotto number set.")
+        raise ValueError("PySR 실행에서 올바른 6개 번호 조합을 만들지 못했습니다.")
     latest = max(record.round_number for record in dataset.records)
     status = (
         "historical_reproduction"
@@ -562,7 +562,7 @@ def create_recommendation(
         or len(set(final_numbers)) != expected_number_count
         or any(number < 1 or number > 45 for number in final_numbers)
     ):
-        raise ValueError("The saved formula did not produce a valid, unique Lotto number set.")
+        raise ValueError("저장된 수식이 중복 없는 유효한 6개 번호 조합을 만들지 못했습니다.")
     pattern_model = "one_number_model" if model_type == "one_number" else "six_number_set_model"
     candidate_rank = int(experiment.get("selected_candidate_rank", 1))
     selected_pattern = next(

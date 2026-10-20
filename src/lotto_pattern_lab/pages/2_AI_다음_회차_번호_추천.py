@@ -32,8 +32,8 @@ def _candidate_validation_value(candidate: dict) -> object:
     return candidate.get("evaluation", {}).get("validation", {}).get("mae")
 
 
-st.set_page_config(page_title="AI 다음 회차 번호 추천", layout="wide")
-st.title("AI 다음 회차 번호 추천")
+st.set_page_config(page_title="다음 회차 번호 추천", layout="wide")
+st.title("다음 회차 번호 추천")
 st.warning("저장된 GP 공식을 실행하는 연구용 후보입니다. 당첨 확률이나 당첨을 보장하지 않습니다.")
 
 experiments = project_path("experiments")
@@ -83,9 +83,9 @@ with st.sidebar:
     )
     if is_pysr:
         if pysr_readiness["status"] == "verified":
-            st.caption(f"PySR ?? ??? ??: {pysr_readiness['reason']}")
+            st.caption(f"PySR 실행 준비 상태: {pysr_readiness['reason']}")
         else:
-            st.warning(f"PySR ?? ?? ??: {pysr_readiness['reason']}")
+            st.warning(f"PySR 준비 실패: {pysr_readiness['reason']}")
     model_label = st.radio(
         "\ubaa8\ub378 \uc885\ub958",
         (
@@ -218,9 +218,12 @@ if st.button(
             official_latest = None
             st.warning(f"공식 최신 회차 확인 실패: {error}")
         if official_latest is None:
-            raise ValueError("?? ?? ??? ???? ?? ?? ??? ???? ?????.")
+            raise ValueError("최신 확정 회차를 확인할 수 없어 사전 추천을 만들 수 없습니다.")
         if int(target) != official_latest + 1:
-            raise ValueError(f"?? ?? ?? ??? {official_latest + 1}????. ??? ??? ? ?? ?????.")
+            raise ValueError(
+                f"예측 대상은 최신 확정 회차의 다음 회차인 {official_latest + 1}회입니다. "
+                "회차가 달력상 예정 회차인지 확인해 주세요."
+            )
         if is_pysr:
             from lotto_pattern_lab.prediction import create_pysr_recommendation
 
@@ -253,7 +256,7 @@ if st.button(
                 target_date=target_date,
             )
         if recommendation["recommendation_status"] != "pre_draw_prediction":
-            raise ValueError("?? ? ?? ?? ??? ???? ?? ???? ?????.")
+            raise ValueError("추첨 완료 회차는 사전 추천으로 저장할 수 없습니다.")
         saved_path = save_recommendation(recommendation, prediction_dir)
         st.session_state["active_recommendation_id"] = recommendation["recommendation_id"]
         st.success(f"추천 결과를 저장했습니다: {saved_path}")

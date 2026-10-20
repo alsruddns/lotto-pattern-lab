@@ -239,11 +239,11 @@ else:
                     "completed_experiment_count", item.get("completed_runs", 0)
                 ),
                 "실패 실험": summary.get("failed_experiment_count", item.get("failed_runs", 0)),
-                "신규 패턴": summary.get("new_pattern_count", "미수집"),
-                "3개 이상 반복 평가": _hit_total(summary, "3_plus"),
-                "4개 이상 반복 평가": _hit_total(summary, "4_plus"),
-                "5개 이상 반복 평가": _hit_total(summary, "5_plus"),
-                "6개 완전 일치 반복 평가": _hit_total(summary, "6_exact"),
+                "신규 패턴": format_count(summary.get("new_pattern_count")),
+                "3개 이상 반복 평가": format_count(_hit_total(summary, "3_plus")),
+                "4개 이상 반복 평가": format_count(_hit_total(summary, "4_plus")),
+                "5개 이상 반복 평가": format_count(_hit_total(summary, "5_plus")),
+                "6개 완전 일치 반복 평가": format_count(_hit_total(summary, "6_exact")),
                 "독립 테스트 요약": _test_summary(summary),
             }
         )
@@ -309,12 +309,8 @@ else:
     model_metrics = model_metric_stats(summary)
     headline = st.columns(5)
     headline[0].metric("연구 시간", _duration(selected.get("total_elapsed_seconds")))
-    headline[1].metric(
-        "완료 실험", format_count(summary.get("completed_experiment_count", 0))
-    )
-    headline[2].metric(
-        "실패·중단", format_count(summary.get("failed_experiment_count", 0))
-    )
+    headline[1].metric("완료 실험", format_count(summary.get("completed_experiment_count", 0)))
+    headline[2].metric("실패·중단", format_count(summary.get("failed_experiment_count", 0)))
     headline[3].metric("검사 후보 수", format_count(summary.get("candidate_count")))
     headline[4].metric("신규 패턴", format_count(summary.get("new_pattern_count")))
     second = st.columns(5)
@@ -619,8 +615,7 @@ else:
             "경험적 p값 평균": st.column_config.TextColumn(
                 "경험적 p값 평균",
                 help=(
-                    "무작위 대조에서 관측한 p값의 평균입니다. "
-                    "낮은 대조 횟수는 해상도가 거칩니다."
+                    "무작위 대조에서 관측한 p값의 평균입니다. 낮은 대조 횟수는 해상도가 거칩니다."
                 ),
             ),
             "중앙값": st.column_config.TextColumn(
@@ -800,9 +795,7 @@ else:
                 "검증 활성률": format_percent(item.get("validation_activation_rate")),
                 "수식 복잡도": item.get("complexity"),
                 "활성화 조건": item.get("activation_condition"),
-                "출력 수식": [
-                    pretty_formula(str(formula)) for formula in item.get("formulas", [])
-                ],
+                "출력 수식": [pretty_formula(str(formula)) for formula in item.get("formulas", [])],
             }
             for item in candidates[:10]
         ]

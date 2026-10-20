@@ -44,7 +44,7 @@ GP_PRESETS = {
     360: {"population": 96, "generations": 30, "max_depth": 6, "controls": 10},
     480: {"population": 112, "generations": 35, "max_depth": 7, "controls": 10},
 }
-ENGINE_OPTIONS = ("GP ?? ?????", "PySR ?? ??", "GP + PySR ?? ??")
+ENGINE_OPTIONS = ("GP 간헐 패턴 탐색", "PySR 기호 회귀", "GP와 PySR 비교")
 
 
 def _apply_research_preset() -> None:
@@ -796,7 +796,7 @@ with new_tab:
             and saved_preflight.get("status") == "passed"
         )
         submitted = st.form_submit_button(
-            "새 연구 시작", type="primary", disabled=not preflight_ready
+            "새 연구 시작", type="primary"
         )
 
     effective_config = None
@@ -876,7 +876,7 @@ with new_tab:
             or effective_config.elite_seed_ratio != 0.20
             or effective_config.seed != 12345
         )
-        st.caption("?? ??: ??? ??" if is_custom else "?? ??: ?? ???")
+        st.caption("설정 상태: 직접 설정" if is_custom else "설정 상태: 사전 구성")
 
     if new_dataset is not None and effective_config is not None:
         invalid_profile = (
@@ -984,7 +984,7 @@ with new_tab:
         invalid_profile = True
         elite_seeds = ()
 
-    if preflight_submitted:
+    if preflight_submitted or (submitted and not preflight_ready):
         if new_dataset is None or effective_config is None or invalid_profile:
             report = {
                 "status": "failed",
@@ -1000,13 +1000,23 @@ with new_tab:
                 },
             }
         else:
-            report = run_research_preflight(
-                new_dataset,
-                effective_config,
-                engines,
-                pysr_config,
-                elite_seeds=elite_seeds,
-            )
+            with st.status("연구 환경을 검사하고 있습니다.", expanded=True) as progress:
+                st.write("데이터 무결성, 특징 설정, GP 실행 및 저장 환경을 확인합니다.")
+                report = run_research_preflight(
+                    new_dataset,
+                    effective_config,
+                    engines,
+                    pysr_config,
+                    elite_seeds=elite_seeds,
+                )
+                progress.update(
+                    label=(
+                        "연구 환경 검사 통과"
+                        if report.get("status") == "passed"
+                        else "연구 환경 검사 실패"
+                    ),
+                    state="complete",
+                )
         st.session_state["research_preflight_report"] = report
         st.session_state["research_preflight_input_key"] = preflight_input_key
 
@@ -1403,7 +1413,7 @@ with queue_tab:
             "예약 대기열",
             [item["queue_id"] for item in queue_rows],
             format_func=lambda value: next(
-                f"{item['name']} ? {queue_status_labels.get(item['status'], item['status'])} ? "
+                f"{item['name']} · {queue_status_labels.get(item['status'], item['status'])} · "
                 f"{item['created_at'][:10]}"
                 for item in queue_rows
                 if item["queue_id"] == value
@@ -1653,7 +1663,7 @@ with queue_tab:
                 "대기 예약 선택",
                 [item["item_id"] for item in manageable],
                 format_func=lambda value: next(
-                    f"{item['position']}번 ? {item['engine']} ? {item['duration_seconds'] // 60}분"
+                    f"{item['position']}번 · {item['engine']} · {item['duration_seconds'] // 60}분"
                     for item in manageable
                     if item["item_id"] == value
                 ),
@@ -1856,10 +1866,11 @@ with queue_tab:
                 state = load_checkpoint(checkpoint_path)
                 if state.get("status") in {"running", "pause_requested", "paused", "failed"}:
                     st.warning(
-                        "\u9884\u7ea6\u8fd0\u884c\u72b6\u6001\u4e2d\u65ad\uff0c\u5de5\u4f5c\u5668\u672a\u5728\u8fd0\u884c\u3002\u590d\u6838\u68c0\u67e5\u70b9\u540e\u624d\u53ef\u7ee7\u7eed\u3002"
+                        "예약 실행이 중단되었고 연구 작업자는 실행 중이 아닙니다. "
+                        "체크포인트를 확인한 뒤 이어서 실행할 수 있습니다."
                     )
                     if st.button(
-                        "\u68c0\u67e5\u70b9\u590d\u6838\u5e76\u6062\u590d",
+                        "체크포인트 확인 후 이어서 실행",
                         key="queue_recover_interrupted",
                     ):
                         checkpoint_status = state.get("status")
@@ -1880,72 +1891,64 @@ with queue_tab:
                             queue_store.set_queue_status(active_queue_id, "paused")
                         st.rerun()
             except (OSError, ValueError, KeyError) as error:
-                st.error(f"\u590d\u6838\u68c0\u67e5\u70b9\u5931\u8d25\uff1a{error}")
+                st.error(f"체크포인트 확인에 실패했습니다: {error}")
         elif not lease_live and checkpoint_path.is_file() and _worker_active(checkpoint_path):
-            st.info(
-                "\u7814\u7a76\u5de5\u4f5c\u5668\u4ecd\u5728\u8fd0\u884c\uff0c\u4f46\u8c03\u5ea6\u5668\u5fc3\u8df3\u8d85\u65f6\u3002"
-            )
-            if st.button(
-                "\u6062\u590d\u9884\u7ea6\u8c03\u5ea6\u5668", key="queue_scheduler_recover"
-            ):
+            st.info("연구 작업자는 실행 중이지만 예약 실행기의 응답이 지연되고 있습니다.")
+            if st.button("예약 실행기 다시 연결", key="queue_scheduler_recover"):
                 try:
                     start_detached_scheduler(queue_store, active_queue_id)
                     st.toast(
-                        "\u8c03\u5ea6\u5668\u5df2\u91cd\u65b0\u8fde\u63a5\u6d3b\u7740\u7684\u7814\u7a76\u5de5\u4f5c\u5668\u3002",
+                        "예약 실행기가 실행 중인 연구 작업자에 다시 연결되었습니다.",
                         icon="\u2705",
                     )
                     st.rerun()
                 except (OSError, RuntimeError) as error:
-                    st.error(f"\u8c03\u5ea6\u5668\u6062\u590d\u5931\u8d25\uff1a{error}")
+                    st.error(f"예약 실행기 복구에 실패했습니다: {error}")
     failed_items = [item for item in queue_items if item["status"] == "failed"]
     if failed_items:
         failed_id = failed_items[-1]["item_id"]
         failure_cols = st.columns(2)
-        if failure_cols[0].button("\u5931\u8d25\u9884\u7ea6\u8df3\u8fc7", key="queue_skip_failed"):
+        if failure_cols[0].button("실패한 예약 건너뛰기", key="queue_skip_failed"):
             queue_store.skip_failed(failed_id)
             st.rerun()
         failed_checkpoint = Path(failed_items[-1].get("checkpoint_path") or "")
         can_recover = failed_checkpoint.is_file() and not _worker_active(failed_checkpoint)
         if failure_cols[1].button(
-            "\u5931\u8d25\u9884\u7ea6\u590d\u6838\u5e76\u7ee7\u7eed",
+            "실패한 예약 확인 후 이어서 실행",
             disabled=not can_recover,
             key="queue_retry_failed",
         ):
             try:
                 checkpoint_state = load_checkpoint(failed_checkpoint)
                 if not checkpoint_state.get("resumable", True):
-                    raise ValueError(
-                        "\u4fdd\u5b58\u7684\u68c0\u67e5\u70b9\u4e0d\u53ef\u7ee7\u7eed\u3002"
-                    )
+                    raise ValueError("저장된 체크포인트에서 이어서 실행할 수 없습니다.")
                 queue_store.retry_failed(failed_id)
                 st.rerun()
             except (OSError, ValueError, KeyError) as error:
-                st.error(f"\u7814\u7a76\u65e0\u6cd5\u6062\u590d\uff1a{error}")
+                st.error(f"연구를 복구할 수 없습니다: {error}")
 
     control_columns = st.columns(4)
     if control_columns[0].button(
-        "\u9884\u7ea6\u6267\u884c\u5f00\u59cb",
+        "예약 실행 시작",
         type="primary",
         disabled=queue_state["status"] not in {"waiting", "paused"},
         help="백그라운드 스케줄러 heartbeat를 확인한 뒤 시작합니다.",
     ):
         active_workers = [item for item in _resume_records(rounds) if item.get("_worker_active")]
         if active_workers:
-            st.error(
-                "\u5f53\u524d\u9879\u76ee\u6709\u7814\u7a76\u5de5\u4f5c\u5668\u6267\u884c\u4e2d\uff0c\u4e0d\u80fd\u5e76\u884c\u542f\u52a8\u3002"
-            )
+            st.error("현재 연구 작업자가 실행 중이므로 다른 작업을 시작할 수 없습니다.")
         else:
             try:
                 queue_store.set_queue_status(active_queue_id, "running")
                 start_detached_scheduler(queue_store, active_queue_id)
                 st.toast(
-                    "\u5df2\u786e\u8ba4\u9884\u7ea6\u5b9a\u65f6\u5668\u7684 heartbeat\u3002",
+                    "예약 실행기의 응답을 확인했습니다.",
                     icon="\u2705",
                 )
                 st.rerun()
             except (OSError, RuntimeError) as error:
                 queue_store.set_queue_status(active_queue_id, "failed")
-                st.error(f"\u5b9a\u65f6\u5668\u542f\u52a8\u5931\u8d25\uff1a{error}")
+                st.error(f"예약 실행기를 시작하지 못했습니다: {error}")
     if control_columns[1].button(
         "대기열 일시정지 요청",
         disabled=queue_state["status"] != "running",
@@ -1955,17 +1958,17 @@ with queue_tab:
         st.toast("실험이 저장 경계에 도달하면 대기열이 중지됩니다.", icon="⏸️")
         st.rerun()
     if control_columns[2].button(
-        "\u9884\u7ea6\u961f\u5217\u7ee7\u7eed\u8fd0\u884c",
+        "예약 대기열 이어서 실행",
         disabled=queue_state["status"] != "paused",
     ):
         try:
             queue_store.set_queue_status(active_queue_id, "running")
             start_detached_scheduler(queue_store, active_queue_id)
-            st.toast("\u9884\u7ea6\u961f\u5217\u5df2\u6062\u590d\u8fd0\u884c\u3002", icon="\u2705")
+            st.toast("예약 대기열을 다시 실행합니다.", icon="\u2705")
             st.rerun()
         except (OSError, RuntimeError) as error:
             queue_store.set_queue_status(active_queue_id, "paused")
-            st.error(f"\u9884\u7ea6\u961f\u5217\u65e0\u6cd5\u6062\u590d\uff1a{error}")
+            st.error(f"예약 대기열을 복구할 수 없습니다: {error}")
     if control_columns[3].button(
         "다음 예약 자동 실행 중지",
         disabled=queue_state["status"] != "running",
