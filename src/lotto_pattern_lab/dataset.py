@@ -18,6 +18,7 @@ class DrawRecord:
     round_number: int
     draw: Draw
     draw_date: date | None = None
+    verification_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ class DrawDataset:
         if self.source_kind not in {
             "csv_unverified",
             "csv_locally_validated",
+            "manual_unverified",
             "official_verified",
             "synthetic",
         }:
@@ -50,6 +52,7 @@ class DrawDataset:
         expected_status = {
             "csv_unverified": "unverified",
             "csv_locally_validated": "locally_validated_unreconciled",
+            "manual_unverified": "manual_unverified",
             "official_verified": "official_verified",
             "synthetic": "synthetic",
         }[self.source_kind]
@@ -117,6 +120,32 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
             str(manifest.get("source_description", "Official source CSV.")),
             str(manifest.get("source_url", "")),
             verified_at=str(manifest.get("verified_at", "")),
+        )
+    metadata_path = Path(f"{path}.metadata.json")
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        if metadata.get("csv_sha256") != digest:
+            raise ValueError("수동 관리 데이터 메타데이터와 CSV 해시가 일치하지 않습니다.")
+        if metadata.get("schema_version") != 1:
+            raise ValueError("지원하지 않는 수동 관리 데이터 메타데이터 버전입니다.")
+        dates = metadata.get("draw_dates", {})
+        statuses = metadata.get("round_verification", {})
+        records = [
+            DrawRecord(
+                record.round_number,
+                record.draw,
+                date.fromisoformat(dates[str(record.round_number)])
+                if str(record.round_number) in dates
+                else record.draw_date,
+                statuses.get(str(record.round_number), {}).get("status", "manual_unverified"),
+            )
+            for record in records
+        ]
+        return DrawDataset(
+            tuple(records),
+            "manual_unverified",
+            "사용자 관리 당첨번호 CSV; 회차별 검증 상태는 sidecar 기록을 따릅니다.",
         )
     rounds = [record.round_number for record in records]
     is_complete_study_range = len(rounds) == 494 and rounds == list(range(753, 1247))

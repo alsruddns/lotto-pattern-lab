@@ -14,5 +14,6 @@ pages = [
     st.Page("pages/10_설정.py", title="설정", icon="⚙️"),
     st.Page("pages/2_AI_다음_회차_번호_추천.py", title="다음 회차 추천", visibility="hidden"),
     st.Page("pages/7_데이터_해시_비교.py", title="데이터 해시 비교", visibility="hidden"),
+    st.Page("pages/11_당첨번호_관리.py", title="당첨번호 관리", visibility="hidden"),
 ]
 st.navigation(pages, position="sidebar").run()

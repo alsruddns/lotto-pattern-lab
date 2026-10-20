@@ -13,6 +13,18 @@ def test_streamlit_script_executes_without_import_errors() -> None:
     assert app.title[0].value == "AI 패턴 연구실"
 
 
+def test_replay_and_draw_management_pages_render_from_app_navigation() -> None:
+    page_root = Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages"
+    app = AppTest.from_file(
+        Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/app.py"
+    ).run(timeout=30)
+
+    for pattern in ("6_*.py", "11_*.py"):
+        page = next(page_root.glob(pattern))
+        app.switch_page(f"pages/{page.name}").run(timeout=60)
+        assert not app.exception, [exception.message for exception in app.exception]
+
+
 def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(research_queue, "QUEUE_DB", tmp_path / "queue.sqlite")
     page = next(

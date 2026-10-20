@@ -1,8 +1,10 @@
 """Korean storage inventory and explicit, preview-first maintenance controls."""
 
 import zipfile
+from pathlib import Path
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from lotto_pattern_lab.storage_management import (
     DEFAULT_QUOTA_BYTES,
@@ -22,6 +24,12 @@ from lotto_pattern_lab.storage_management import (
 
 st.set_page_config(page_title="데이터 및 저장 공간 관리", layout="wide")
 st.title("데이터 및 저장 공간 관리")
+script_context = get_script_run_ctx()
+if script_context and Path(script_context.main_script_path).name == "app.py":
+    st.page_link("pages/11_당첨번호_관리.py", label="당첨번호 관리로 이동", icon="🎱")
+else:
+    st.caption("당첨번호 관리는 AI 패턴 연구실 앱의 사이드바 페이지에서 열 수 있습니다.")
+st.caption("당첨번호 등록과 검증 이력은 기존 실험 기록과 분리해 관리합니다.")
 st.subheader("백업 및 복구 검증")
 st.caption("백업은 관리 대상 파일의 원본을 변경하지 않고 ZIP과 SHA-256 manifest를 생성합니다.")
 if st.button("연구 산출물 백업 생성"):

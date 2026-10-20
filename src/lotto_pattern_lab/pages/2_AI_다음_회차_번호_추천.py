@@ -1,6 +1,9 @@
 """다음 회차 추천 연구 화면."""
 
+import csv
 import hashlib
+import io
+import json
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -42,20 +45,40 @@ experiment_paths = sorted(experiments.glob("*.json"))
 experiment_ids = [path.stem for path in experiment_paths]
 default_id = "56f27190-1f2a-4573-9542-b30a2bbc60b4"
 default_index = experiment_ids.index(default_id) if default_id in experiment_ids else 0
+local_data_path = project_path("data/raw/lotto_draws_753_1246_with_bonus.csv")
+official_data_path = project_path("data/official/draws.csv")
+local_latest = 1246
+official_latest_from_file = 1246
+for data_path, value_name in (
+    (local_data_path, "local_latest"),
+    (official_data_path, "official_latest_from_file"),
+):
+    if data_path.is_file():
+        try:
+            latest_value = load_csv(data_path).records[-1].round_number
+            if value_name == "local_latest":
+                local_latest = latest_value
+            else:
+                official_latest_from_file = latest_value
+        except (OSError, ValueError):
+            pass
 
 with st.sidebar:
     st.header("예측 입력")
     source = st.radio(
-        "데이터 선택", ("로컬 데이터 753~1246회", "공식 데이터 파일", "CSV 파일 업로드")
+        "데이터 선택", ("수동 관리 데이터", "공식 날짜 데이터", "CSV 파일 업로드")
     )
     uploaded = st.file_uploader("CSV 파일", type=("csv",)) if source == "CSV 파일 업로드" else None
-    target = st.number_input(
-        "\ucd94\ucc9c \ub300\uc0c1 \ud68c\ucc28",
-        min_value=2,
-        value=1247,
-        step=1,
-        key="prediction_target_round",
+    source_latest = (
+        official_latest_from_file if source == "공식 날짜 데이터" else local_latest
     )
+    target_key = "prediction_target_round"
+    if (
+        st.session_state.get(target_key) is None
+        or int(st.session_state[target_key]) <= source_latest
+    ):
+        st.session_state[target_key] = source_latest + 1
+    target = st.number_input("추천 대상 회차", min_value=2, step=1, key=target_key)
     target_date = st.date_input(
         "\uc608\uc815 \ucd94\ucc28\uc77c \u0028\ub0a0\uc9dc \ud2b9\uc9d5 \ubaa8\ub378\uc6a9\u0029",
         value=date.today(),
@@ -158,12 +181,12 @@ with st.sidebar:
 dataset = None
 data_bytes = None
 try:
-    if source == "로컬 데이터 753~1246회":
+    if source == "수동 관리 데이터":
         csv_path = project_path("data/raw/lotto_draws_753_1246_with_bonus.csv")
         if csv_path.is_file():
             data_bytes = csv_path.read_bytes()
             dataset = load_csv(csv_path)
-    elif source == "공식 데이터 파일":
+    elif source == "공식 날짜 데이터":
         csv_path = project_path("data/official/draws.csv")
         if csv_path.is_file():
             data_bytes = csv_path.read_bytes()
@@ -300,6 +323,30 @@ if recommendation:
             for number in recommendation["recommended_numbers"]
         )
         st.markdown(balls, unsafe_allow_html=True)
+        prediction_csv = io.StringIO(newline="")
+        csv_writer = csv.writer(prediction_csv, lineterminator="\n")
+        csv_writer.writerow(("예측 회차", "예측 번호", "공식 ID", "예측 생성 시각"))
+        for number in recommendation["recommended_numbers"]:
+            csv_writer.writerow(
+                (
+                    recommendation["target_round"],
+                    number,
+                    recommendation.get("formula_fingerprint"),
+                    recommendation["created_at"],
+                )
+            )
+        st.download_button(
+            "예측 결과 CSV 다운로드",
+            prediction_csv.getvalue().encode("utf-8-sig"),
+            file_name=f"예측_{recommendation['target_round']}회.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "예측 결과 JSON 다운로드",
+            (json.dumps(recommendation, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+            file_name=f"예측_{recommendation['target_round']}회.json",
+            mime="application/json",
+        )
         if recommendation["model_type"] == "six_number_set":
             st.caption("번호는 순서 없는 조합이며 실제 추첨 순서를 뜻하지 않습니다.")
         st.dataframe(recommendation["formula_calculations"], width="stretch")

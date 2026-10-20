@@ -18,6 +18,11 @@ models/
 data/raw/
 data/processed/
 data/database/
+data/replay_jobs/
+data/replays/
+data/preflight_cache.json
+data/backups/manual_draws/
+data/manual_draw_requests/
 checkpoints/
 logs/
 .storage_settings.json

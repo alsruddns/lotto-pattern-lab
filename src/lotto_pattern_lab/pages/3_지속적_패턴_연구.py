@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -23,6 +25,11 @@ from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.preflight import run_research_preflight
+from lotto_pattern_lab.preflight_cache import (
+    load_preflight_cache,
+    preflight_cache_key,
+    save_preflight_cache,
+)
 from lotto_pattern_lab.presentation import format_count, format_duration
 from lotto_pattern_lab.pysr_backend import PySRConfig, optional_backend_status
 from lotto_pattern_lab.queue_scheduler import start_detached_scheduler
@@ -104,6 +111,35 @@ def _worker_active(checkpoint_path: Path) -> bool:
             return False
     except LockTimeoutError:
         return True
+
+
+def _validate_live_research_start(
+    checkpoint_directory: Path, csv_path: Path | None, dataset: Any
+) -> None:
+    """Recheck dynamic start conditions even when a disk preflight cache is reused."""
+    if csv_path is None or not csv_path.is_file() or dataset is None:
+        raise ValueError("선택한 당첨번호 데이터 파일을 찾을 수 없습니다.")
+    refreshed = load_csv(csv_path)
+    if dataset_digest(refreshed) != dataset_digest(dataset):
+        raise ValueError("검사 이후 당첨번호 데이터가 변경되었습니다. 재검사가 필요합니다.")
+    free_bytes = shutil.disk_usage(PROJECT_ROOT).free
+    if free_bytes < 100 * 1024 * 1024:
+        raise OSError(f"저장 공간이 부족합니다. 사용 가능 공간: {free_bytes / 1024**2:.1f} MiB")
+    checkpoint_directory.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=".research-write-check-", dir=checkpoint_directory, delete=True
+        ):
+            pass
+    except OSError as error:
+        raise OSError(f"체크포인트 저장 경로에 쓸 수 없습니다: {error}") from error
+    for checkpoint in checkpoint_directory.glob("research_*.json"):
+        try:
+            state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if state.get("status") in {"running", "pause_requested"} and _worker_active(checkpoint):
+            raise RuntimeError(f"다른 연구가 이미 실행 중입니다: {state.get('research_id')}")
 
 
 def _dataset_for_checkpoint(state: dict[str, Any]) -> tuple[Path | None, str | None]:
@@ -750,6 +786,11 @@ with new_tab:
         preflight_input_key = _preflight_fingerprint(
             {
                 "dataset_sha256": dataset_digest(new_dataset) if new_dataset else None,
+                "dataset_file_sha256": (
+                    hashlib.sha256(csv_path.read_bytes()).hexdigest()
+                    if csv_path is not None and csv_path.is_file()
+                    else None
+                ),
                 "engines": engines,
                 "feature_profile": profile,
                 "gp": {
@@ -789,10 +830,19 @@ with new_tab:
                 "pattern_library_stat": pattern_db_stat,
             }
         )
+        preflight_disk_key = preflight_cache_key({"ui_settings_fingerprint": preflight_input_key})
+        cache_loaded_from_disk = False
+        if st.session_state.get("research_preflight_input_key") != preflight_disk_key:
+            disk_cache = load_preflight_cache(preflight_disk_key)
+            if disk_cache is not None:
+                st.session_state["research_preflight_report"] = disk_cache["report"]
+                st.session_state["research_preflight_input_key"] = preflight_disk_key
+                st.session_state["research_preflight_checked_at"] = disk_cache["checked_at"]
+                cache_loaded_from_disk = True
         preflight_submitted = st.form_submit_button("연구 환경 사전 검사")
         saved_preflight = st.session_state.get("research_preflight_report", {})
         preflight_ready = (
-            st.session_state.get("research_preflight_input_key") == preflight_input_key
+            st.session_state.get("research_preflight_input_key") == preflight_disk_key
             and saved_preflight.get("status") == "passed"
         )
         submitted = st.form_submit_button(
@@ -1018,15 +1068,29 @@ with new_tab:
                     state="complete",
                 )
         st.session_state["research_preflight_report"] = report
-        st.session_state["research_preflight_input_key"] = preflight_input_key
+        st.session_state["research_preflight_input_key"] = preflight_disk_key
+        st.session_state["research_preflight_checked_at"] = datetime.now(UTC).isoformat()
+        try:
+            save_preflight_cache(preflight_disk_key, report)
+        except OSError as error:
+            st.warning(
+                "검사 결과를 디스크에 저장하지 못했습니다. "
+                f"이번 세션에는 유지합니다: {error}"
+            )
 
     current_preflight = st.session_state.get("research_preflight_report")
     current_preflight_matches = (
-        st.session_state.get("research_preflight_input_key") == preflight_input_key
+        st.session_state.get("research_preflight_input_key") == preflight_disk_key
     )
     if current_preflight and current_preflight_matches:
         if current_preflight.get("status") == "passed":
-            st.success("연구 환경 사전 검사 통과. 현재 설정으로 연구를 시작할 수 있습니다.")
+            origin = (
+                "저장된 검사 결과 사용"
+                if cache_loaded_from_disk
+                else "현재 세션 검사 결과 사용"
+            )
+            checked_at = st.session_state.get("research_preflight_checked_at", "시각 미기록")
+            st.success(f"연구 환경 사전 검사 통과 · {origin} · 검사 시각 {checked_at}")
         else:
             st.error("사전 검사 실패. 오류를 수정하고 재검사해야 연구를 시작할 수 있습니다.")
         for engine_id, engine_report in current_preflight.get("engines", {}).items():
@@ -1050,6 +1114,11 @@ with new_tab:
             checkpoint_path = checkpoint_dir / (
                 f"research_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"
             )
+            try:
+                _validate_live_research_start(checkpoint_dir, csv_path, new_dataset)
+            except (OSError, RuntimeError, ValueError) as error:
+                st.error(f"실행 직전 환경 확인 실패: {error}")
+                st.stop()
             research_id = str(uuid.uuid4())
             created_at = datetime.now(UTC).isoformat()
             research_round = rounds.ensure_round(

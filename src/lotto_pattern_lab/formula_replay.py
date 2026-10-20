@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -96,6 +98,7 @@ def replay_formula(
     start_round: int = DEFAULT_START_ROUND,
     end_round: int = DEFAULT_END_ROUND,
     output_directory: str | Path = "data/replays",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Replay a frozen saved candidate. Source experiment JSON is never modified."""
     if model_key != "six_number_set_model":
@@ -132,7 +135,25 @@ def replay_formula(
         "test_rounds": test_rounds,
     }
 
-    for round_number in target_rounds:
+    started = time.monotonic()
+
+    def emit_progress(row_index: int) -> None:
+        if not progress_callback or (row_index % 10 and row_index != len(target_rounds)):
+            return
+        elapsed = time.monotonic() - started
+        rate = row_index / elapsed if elapsed > 0 else 0.0
+        progress_callback(
+            {
+                "processed_rounds": row_index,
+                "total_rounds": len(target_rounds),
+                "elapsed_seconds": elapsed,
+                "estimated_remaining_seconds": (
+                    (len(target_rounds) - row_index) / rate if rate > 0 else None
+                ),
+            }
+        )
+
+    for row_index, round_number in enumerate(target_rounds, start=1):
         record = records_by_round.get(round_number)
         if record is None:
             counts["INPUT_UNAVAILABLE"] += 1
@@ -153,6 +174,7 @@ def replay_formula(
                     "draw_date": None,
                 }
             )
+            emit_progress(row_index)
             continue
         example = examples_by_round.get(round_number)
         if example is None:
@@ -174,6 +196,7 @@ def replay_formula(
                     "reason": f"{max_lag}회 lag 입력이 없거나 연속 회차가 아닙니다.",
                 }
             )
+            emit_progress(row_index)
             continue
         try:
             rule_index = _gate_rule(gate, example.features)
@@ -191,10 +214,11 @@ def replay_formula(
             if rule_index:
                 counts["EVALUATED"] += 1
                 counts["ACTIVE_PREDICTION"] += 1
-                matches[match_count] += 1
             else:
                 counts["EVALUATED"] += 1
                 counts["INACTIVE"] += 1
+            if rule_index:
+                matches[match_count] += 1
             rows.append(
                 {
                     "round_number": round_number,
@@ -232,6 +256,7 @@ def replay_formula(
                     "reason": f"{type(error).__name__}: {error}",
                 }
             )
+        emit_progress(row_index)
 
     evaluable = counts["EVALUATED"]
     active_predictions = counts["ACTIVE_PREDICTION"]
@@ -287,6 +312,7 @@ def replay_formula(
         )
         if active_predictions
         else None,
+        "runtime_seconds": time.monotonic() - started,
         "dataset_snapshot_hash": record_hash,
         "rows": rows,
     }

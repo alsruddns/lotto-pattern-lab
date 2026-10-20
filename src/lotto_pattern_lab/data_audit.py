@@ -57,6 +57,41 @@ def dataset_hashes(dataset: DrawDataset, *, max_lag: int = 10) -> dict[str, str]
     }
 
 
+def dataset_range_hashes(
+    dataset: DrawDataset, start_round: int, end_round: int
+) -> dict[str, str | int]:
+    """Hash explicit fields within a fixed inclusive range, independent of later rows."""
+    if start_round < 1 or end_round < start_round:
+        raise ValueError("회차 해시 범위가 올바르지 않습니다.")
+    selected = [
+        row
+        for row in dataset.records
+        if start_round <= row.round_number <= end_round
+    ]
+    rows = [
+        {
+            "round": row.round_number,
+            "numbers": list(row.draw.numbers),
+            "date": row.draw_date.isoformat() if row.draw_date else None,
+            "bonus": row.draw.bonus,
+        }
+        for row in selected
+    ]
+    number_rows = [{"round": row["round"], "numbers": row["numbers"]} for row in rows]
+    date_rows = [{"round": row["round"], "date": row["date"]} for row in rows]
+    bonus_rows = [{"round": row["round"], "bonus": row["bonus"]} for row in rows]
+    range_header = {"start_round": start_round, "end_round": end_round}
+    return {
+        "algorithm_version": HASH_ALGORITHM_VERSION,
+        **range_header,
+        "draw_count": len(rows),
+        "range_sha256": _digest({**range_header, "rows": rows}),
+        "main_numbers_sha256": _digest({**range_header, "rows": number_rows}),
+        "dates_sha256": _digest({**range_header, "rows": date_rows}),
+        "bonus_sha256": _digest({**range_header, "rows": bonus_rows}),
+    }
+
+
 def legacy_dataset_hash(dataset: DrawDataset) -> str:
     """Reproduce the original aggregate JSON hash (numbers, date, bonus)."""
     return str(dataset_metadata(dataset)["dataset_sha256"])
