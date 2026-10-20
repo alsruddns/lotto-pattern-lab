@@ -32,3 +32,4 @@ logs/
 *.history.jsonl
 *.pkl
 *.joblib
+reports/

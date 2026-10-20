@@ -28,6 +28,7 @@ from .pattern_library import (
     register_experiment_exact_matches,
 )
 from .pysr_backend import PySRConfig
+from .research_reports import save_completed_research_report
 from .research_rounds import (
     SUMMARY_SCHEMA_VERSION,
     ResearchRoundStore,
@@ -86,9 +87,7 @@ def _single_research_worker(function: Callable[..., dict[str, Any]]):
         checkpoint = project_path(kwargs.get("checkpoint_path", "checkpoints/research.json"))
         with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
             Path(f"{checkpoint}.launch").unlink(missing_ok=True)
-            with interprocess_lock(
-                GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"
-            ):
+            with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
                 return function(*args, **kwargs)
 
     return wrapped
@@ -681,9 +680,7 @@ def run_research_schedule(
                     candidate_revalidation.update(
                         {
                             "status": (
-                                "queued"
-                                if queued["eligible_candidate_count"]
-                                else "no_candidates"
+                                "queued" if queued["eligible_candidate_count"] else "no_candidates"
                             ),
                             "eligible_candidate_count": queued["eligible_candidate_count"],
                             "registered_job_count": queued["registered_job_count"],
@@ -809,13 +806,9 @@ def run_research_schedule(
                     "attempt": state["attempts"],
                     "experiment_id": state.get("in_progress", {}).get("experiment_id"),
                     "research_id": state["research_id"],
-                    "engine": in_progress.get(
-                        "engine", engines[run_index % len(engines)]
-                    ),
+                    "engine": in_progress.get("engine", engines[run_index % len(engines)]),
                     "feature_profile": in_progress.get("feature_profile", config.feature_profile),
-                    "stage": in_progress.get(
-                        "stage", progress_event.get("run", "engine_start")
-                    ),
+                    "stage": in_progress.get("stage", progress_event.get("run", "engine_start")),
                     "failed_at": datetime.now(UTC).isoformat(),
                     "error_type": type(error).__name__,
                     "error": str(error),
@@ -875,6 +868,20 @@ def run_research_schedule(
         state["total_elapsed_seconds"] = baseline_elapsed + elapsed_this_session
         _atomic_json(checkpoint, state)
         round_store.update(str(state["research_id"]), _round_metadata(state))
+    if state.get("status") == "completed":
+        try:
+            report_path = save_completed_research_report(state)
+            state["report_path"] = str(report_path)
+            state.pop("report_error", None)
+        except Exception as report_error:
+            state["report_error"] = {
+                "error_type": type(report_error).__name__,
+                "message": str(report_error),
+                "recorded_at": datetime.now(UTC).isoformat(),
+            }
+        with interprocess_lock(checkpoint, scope="research-control"):
+            _atomic_json(checkpoint, state)
+            round_store.update(str(state["research_id"]), _round_metadata(state))
     run_automatic_checkpoint_cleanup()
     if state.get("status") == "paused" and state.get("pause_reason") == (
         "pause_requested_at_experiment_boundary"
@@ -893,6 +900,8 @@ def _round_metadata(state: dict[str, Any]) -> dict[str, Any]:
         "last_updated_at": state.get("last_updated_at"),
         "total_elapsed_seconds": state.get("total_elapsed_seconds", state.get("elapsed_seconds")),
         "checkpoint_path": state.get("checkpoint_path"),
+        "report_path": state.get("report_path"),
+        "report_error": state.get("report_error"),
         "dataset_sha256": state.get("dataset_sha256"),
         "dataset_source_kind": state.get("dataset_source_kind"),
         "dataset_verification_status": state.get("dataset_verification_status"),

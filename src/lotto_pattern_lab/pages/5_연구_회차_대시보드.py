@@ -1201,6 +1201,28 @@ else:
 
     report = build_chatgpt_report(selected)
     full_report = build_chatgpt_report(selected, detailed=True)
+    saved_report_path = selected.get("report_path")
+    if saved_report_path:
+        saved_report = project_path(saved_report_path)
+        if saved_report.is_file():
+            st.download_button(
+                "\uc800\uc7a5\ub41c \uc5f0\uad6c \ubcf4\uace0\uc11c \ub2e4\uc6b4\ub85c\ub4dc",
+                saved_report.read_bytes(),
+                file_name=saved_report.name,
+                mime="text/markdown",
+                key="saved_research_report_download",
+            )
+        else:
+            report_error = selected.get("report_error")
+            if report_error:
+                st.warning(
+                    "\uc5f0\uad6c\ub294 \uc644\ub8cc\ub410\uc73c\ub098 \ubcf4\uace0\uc11c \uc800\uc7a5\uc740 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4. "  # noqa: E501
+                    f"{report_error.get('message', '')}"
+                )
+            else:
+                st.caption(
+                    "\uc774 \uc5f0\uad6c\uc758 \uc790\ub3d9 \ubcf4\uace0\uc11c\ub97c \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4."  # noqa: E501
+                )  # noqa: E501
     st.markdown("#### ChatGPT 분석 보고서")
     st.caption(
         "보고서에는 평가 점수와 번호 적중 횟수를 별도 항목으로 담고, "
