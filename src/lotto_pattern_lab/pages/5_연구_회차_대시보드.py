@@ -2,6 +2,7 @@
 
 from statistics import median
 
+import plotly.graph_objects as go
 import streamlit as st
 
 from lotto_pattern_lab.feature_schema import feature_mapping
@@ -16,6 +17,10 @@ from lotto_pattern_lab.presentation import (
     format_probability,
     pretty_formula,
 )
+from lotto_pattern_lab.randomized_controls import (
+    control_score_rows,
+    summarize_matched_random_controls,
+)
 from lotto_pattern_lab.report_clipboard import report_copy_button
 from lotto_pattern_lab.research import load_checkpoint
 from lotto_pattern_lab.research_rounds import (
@@ -28,6 +33,7 @@ from lotto_pattern_lab.research_rounds import (
     paired_comparison_summary,
     rebuild_dashboard_summary_from_store,
 )
+from lotto_pattern_lab.storage import ExperimentStore
 
 st.set_page_config(page_title="연구 회차 대시보드", layout="wide")
 st.title("연구 회차 대시보드")
@@ -411,6 +417,80 @@ else:
         hide_index=True,
         width="stretch",
     )
+    st.markdown("#### 실제 데이터와 무작위 대조 성능 분포")
+    completed_ids = list(selected.get("completed_experiment_ids", []))
+    if completed_ids:
+        comparison_id = st.selectbox(
+            "비교할 원본 실험",
+            completed_ids,
+            index=len(completed_ids) - 1,
+            key=f"random-control-experiment:{selected['research_id']}",
+        )
+        try:
+            comparison_experiment = ExperimentStore(experiment_directory).load(comparison_id)
+            control_report = summarize_matched_random_controls(comparison_experiment)
+            control_rows = []
+            for model_key, label in (
+                ("one_number", "한 번호 모델"),
+                ("six_number_set", "6개 집합 모델"),
+            ):
+                values = control_report["models"][model_key]
+                interval = values.get("control_95_interval")
+                mean_ci = values.get("control_mean_95_ci")
+                control_rows.append(
+                    {
+                        "모델": label,
+                        "관측 독립 테스트 점수": values.get("observed_test_score"),
+                        "무작위 평균 점수": values.get("control_mean"),
+                        "대조 분포 95% 구간": interval,
+                        "대조 평균 95% 구간": mean_ci,
+                        "관측-대조 평균": values.get("score_difference"),
+                        "경험적 p값": values.get("empirical_p_value"),
+                        "Holm 보정 p값": values.get("holm_adjusted_p_value"),
+                        "유효 반복 수": values.get("control_replicates"),
+                        "상태": values.get("interpretation_status"),
+                    }
+                )
+            st.dataframe(control_rows, hide_index=True, width="stretch")
+            selected_model = st.selectbox(
+                "대조 분포 모델",
+                ("six_number_set", "one_number"),
+                format_func=lambda key: (
+                    "6개 집합 모델" if key == "six_number_set" else "한 번호 모델"
+                ),
+                key=f"random-control-model:{comparison_id}",
+            )
+            selected_model_data = control_report["models"][selected_model]
+            scores = control_score_rows(comparison_experiment, selected_model)
+            if scores:
+                figure = go.Figure()
+                figure.add_trace(
+                    go.Histogram(
+                        x=[row["독립 테스트 점수"] for row in scores],
+                        name="무작위 대조 GP 탐색",
+                        marker_color="#6baed6",
+                    )
+                )
+                observed_score = selected_model_data.get("observed_test_score")
+                if observed_score is not None:
+                    figure.add_vline(
+                        x=observed_score,
+                        line_dash="dash",
+                        line_color="#d62728",
+                        annotation_text="실제 데이터 선택 공식",
+                    )
+                figure.update_layout(
+                    xaxis_title="독립 테스트 평가 점수",
+                    yaxis_title="대조 반복 수",
+                    bargap=0.08,
+                )
+                st.plotly_chart(figure, width="stretch")
+            for limitation in control_report["limitations"]:
+                st.caption(limitation)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            st.error(f"무작위 대조 결과를 불러오지 못했습니다: {error}")
+    else:
+        st.info("선택한 연구 회차에 비교할 완료 실험이 아직 없습니다.")
     st.caption(
         "평가 점수는 연구 내부의 선택·비교 지표이며 적중률이 아닙니다. "
         "적중률은 맞힌 번호 수를 활성 예측 수로 나눈 값으로 아래 표에 따로 표시합니다."

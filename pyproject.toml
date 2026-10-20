@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Tools for exploring patterns in Korean Lotto 6/45 draws."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["deap>=1.4.1", "numpy>=1.26", "streamlit>=1.40"]
+dependencies = ["deap>=1.4.1", "numpy>=1.26", "plotly>=5.18", "streamlit>=1.40"]
 
 [project.optional-dependencies]
 symbolic = ["pysr>=2.7.0,<3"]
