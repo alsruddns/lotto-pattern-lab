@@ -23,6 +23,7 @@ def validate_optimization_compatibility(
     current_engines: tuple[str, ...],
     current_dataset_range: list[int] | None,
     dataset_integrity: dict[str, Any] | None,
+    current_dataset_sha256: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Return normalized GP parameters only when saved study metadata is compatible."""
     if study.get("engine") != "intermittent_gp":
@@ -31,6 +32,12 @@ def validate_optimization_compatibility(
         return None, "이 설정은 GP 전용입니다. 현재 PySR 단독 실행에는 적용할 수 없습니다."
     if current_dataset_range is None or study.get("dataset_range") != current_dataset_range:
         return None, "현재 데이터 회차 범위가 최적화 연구의 저장 범위와 다릅니다."
+    if current_dataset_sha256 is not None and study.get(
+        "dataset_snapshot_sha256"
+    ) != current_dataset_sha256:
+        return None, (
+            "현재 데이터 스냅샷 해시가 최적화 연구의 저장값과 다르거나 기록되지 않았습니다."
+        )
     profile = study.get("feature_profile")
     if profile not in {"legacy", "bonus_lag_v1", "calendar_round"}:
         return None, "최적화 연구의 특징 프로파일을 확인할 수 없습니다."

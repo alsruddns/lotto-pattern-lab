@@ -21,6 +21,12 @@ from typing import Any
 import streamlit as st
 
 from lotto_pattern_lab.atomic_io import LockTimeoutError, interprocess_lock
+from lotto_pattern_lab.cumulative_research import (
+    CUMULATIVE_MODE,
+    INDEPENDENT_MODE,
+    recommend_optuna_settings,
+)
+from lotto_pattern_lab.data_audit import dataset_hashes
 from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
 from lotto_pattern_lab.feature_schema import feature_schema_version
 from lotto_pattern_lab.intermittent import IntermittentConfig
@@ -43,6 +49,7 @@ from lotto_pattern_lab.research import (
     request_pause,
     research_worker_active,
 )
+from lotto_pattern_lab.research_optimization import list_optimization_studies
 from lotto_pattern_lab.research_optimization_apply import (
     OPTUNA_TO_RESEARCH_KEYS,
     changed_optimization_settings,
@@ -125,6 +132,28 @@ def _worker_active(checkpoint_path: Path) -> bool:
             return False
     except LockTimeoutError:
         return True
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_elite_preview(
+    database_path: str,
+    experiment_directory: str,
+    database_signature: tuple[int, int] | None,
+    feature_profile: str,
+    max_lag: int,
+    max_candidates: int,
+    max_data_round: int | None,
+    require_temporal_provenance: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    del database_signature
+    return PatternLibrary(database_path).select_elite_candidates(
+        feature_profile=feature_profile,
+        max_lag=max_lag,
+        max_candidates=max_candidates,
+        max_data_round=max_data_round,
+        require_temporal_provenance=require_temporal_provenance,
+        experiment_directory=experiment_directory,
+    )
 
 
 def _validate_live_research_start(
@@ -325,6 +354,8 @@ def _research_command(
     resume: bool = False,
     research_id: str | None = None,
     candidate_replay_threshold: int = 5,
+    research_mode: str = "legacy",
+    optimization_origin: dict[str, Any] | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -369,7 +400,11 @@ def _research_command(
         str(config.elite_seed_ratio),
         "--candidate-replay-threshold",
         str(candidate_replay_threshold),
+        "--research-mode",
+        research_mode,
     ]
+    if optimization_origin:
+        command.extend(("--optimization-origin-json", json.dumps(optimization_origin)))
     if research_id:
         command.extend(("--research-id", research_id))
     for engine in engines:
@@ -491,6 +526,7 @@ def render_top_research_status() -> None:
         progress = min(1.0, elapsed / target) if target > 0 else 0.0
         current = monitor.get("in_progress") or {}
         summary = monitor.get("dashboard_summary") or {}
+        strategy = monitor.get("research_strategy") or {}
         failed = summary.get(
             "failed_experiment_count",
             sum(
@@ -532,6 +568,17 @@ def render_top_research_status() -> None:
             else None
         ) or current.get("stage") or "실험 경계 대기"
         progress_time = f"시간 제한 진행률 · {progress:.1%}" if target > 0 else "시간 제한 없음"
+        research_round_number = monitor.get("research_round", "확인 중")
+        source_research_count = len(strategy.get("source_research_ids", ()))
+        reused_formula_count = int(summary.get("inherited_pattern_count", 0) or 0)
+        new_formula_count = summary.get("new_pattern_count")
+        research_mode_label = (
+            "누적 진화 연구"
+            if monitor.get("research_mode") == CUMULATIVE_MODE
+            else "독립 탐색"
+            if monitor.get("research_mode") == INDEPENDENT_MODE
+            else "기존 방식"
+        )
     else:
         launch_state = {
             "environment_checking": "연구 환경 검사 중",
@@ -562,6 +609,15 @@ def render_top_research_status() -> None:
         stage = status
         progress_time = f"시간 제한 진행률 · {progress:.1%}" if target > 0 else "시간 제한 없음"
         monitor = {}
+        research_round_number = "등록 대기"
+        source_research_count = int(
+            st.session_state.get("research_launch_source_research_count", 0)
+        )
+        reused_formula_count = int(
+            st.session_state.get("research_launch_reuse_candidate_count", 0)
+        )
+        new_formula_count = None
+        research_mode_label = st.session_state.get("research_launch_mode", "확인 중")
 
     st.markdown(f"### {status}")
     stats = st.columns(4)
@@ -579,6 +635,12 @@ def render_top_research_status() -> None:
     )
     st.progress(progress)
     st.caption(progress_time)
+    st.caption(
+        f"연구 회차: {research_round_number} · {research_mode_label} · "
+        f"이전 연구: {format_count(source_research_count)}개 · "
+        f"실제 재사용 수식: {format_count(reused_formula_count)}개 · "
+        f"신규 유효 수식: {format_count(new_formula_count)}개"
+    )
 
     details = st.columns(2)
     details[0].write(f"현재 단계: {stage}")
@@ -680,9 +742,11 @@ with new_tab:
     st.session_state.setdefault("new_research_engine", ENGINE_OPTIONS[0])
     st.session_state.setdefault("new_profile", "legacy")
     st.session_state.setdefault("new_duration_minutes", 180)
+    # Keep the previous UI's Elite Seeding-on default while making the mode explicit.
+    st.session_state.setdefault("new_research_mode", CUMULATIVE_MODE)
     if "new_population_size" not in st.session_state:
         _apply_research_preset()
-    selector_columns = st.columns(3)
+    selector_columns = st.columns(4)
     engine_choice = selector_columns[0].selectbox(
         "탐색 엔진",
         ENGINE_OPTIONS,
@@ -721,6 +785,18 @@ with new_tab:
         ),
         on_change=_apply_research_preset,
     )
+    research_mode = selector_columns[3].selectbox(
+        "연구 방식",
+        (INDEPENDENT_MODE, CUMULATIVE_MODE),
+        format_func=lambda value: (
+            "독립 탐색" if value == INDEPENDENT_MODE else "누적 진화 연구"
+        ),
+        key="new_research_mode",
+        help=(
+            "독립 탐색은 과거 수식을 주입하지 않습니다. 누적 진화 연구는 호환되는 GP 수식을 "
+            "검증 점수와 다양성 기준으로 일부 초기 개체군에 재사용합니다."
+        ),
+    )
     current_data_range = (
         [new_dataset.records[0].round_number, new_dataset.records[-1].round_number]
         if new_dataset
@@ -730,11 +806,21 @@ with new_tab:
     st.session_state["research_current_profile"] = profile
     st.session_state["research_current_dataset_range"] = current_data_range
     st.session_state["research_current_dataset_integrity"] = new_integrity
+    current_dataset_hashes = (
+        dataset_hashes(new_dataset, max_lag=int(st.session_state.get("new_max_lag", 10)))
+        if new_dataset is not None
+        else None
+    )
+    current_dataset_snapshot = (
+        current_dataset_hashes["bonus_inclusive_sha256"] if current_dataset_hashes else None
+    )
+    st.session_state["research_current_dataset_sha256"] = current_dataset_snapshot
     current_research_settings = {
         **{key: st.session_state.get(key) for key in OPTUNA_TO_RESEARCH_KEYS.values()},
         "new_profile": profile,
         "new_research_engine": engine_choice,
         "new_duration_minutes": int(duration_minutes),
+        "new_research_mode": research_mode,
         "dataset_range": current_data_range,
     }
     st.session_state["research_current_settings"] = current_research_settings
@@ -801,9 +887,17 @@ with new_tab:
             st.rerun()
 
     selected_preset = GP_PRESETS[int(duration_minutes)]
+    strategy_recommendation = recommend_optuna_settings(
+        list_optimization_studies(),
+        feature_profile=profile,
+        dataset_range=current_data_range,
+        dataset_sha256=current_dataset_snapshot,
+        dataset_integrity=new_integrity,
+    )
     st.caption(
         f"현재 조건: {engine_choice} · {profile_names[profile]} · "
         f"{int(duration_minutes)}분 · "
+        f"{'누적 진화 연구' if research_mode == CUMULATIVE_MODE else '독립 탐색'} · "
         + (
             f"Optuna Trial #{optimization_context.get('trial_number')} 적용"
             if optimization_context
@@ -960,10 +1054,18 @@ with new_tab:
                 help="같은 환경에서 탐색을 재현하기 위한 난수 시드입니다.",
                 key="new_seed",
             )
-            elite_enabled = st.checkbox(
-                "Elite Seeding 사용",
+            elite_toggle = st.checkbox(
+                "GP Elite Seeding 사용",
                 help="호환되는 저장 패턴을 초기 후보에 포함합니다.",
                 key="new_elite_seeding_enabled",
+                disabled=(
+                    research_mode != CUMULATIVE_MODE or "intermittent_gp" not in engines
+                ),
+            )
+            elite_enabled = bool(
+                research_mode == CUMULATIVE_MODE
+                and "intermittent_gp" in engines
+                and elite_toggle
             )
             elite_ratio = st.slider(
                 "기존 패턴 계승 비율",
@@ -1264,6 +1366,10 @@ with new_tab:
         setting_rows = [
             {"설정": "탐색 엔진", "값": ", ".join(engines)},
             {"설정": "특징 프로파일", "값": profile},
+            {
+                "설정": "연구 방식",
+                "값": "누적 진화 연구" if research_mode == CUMULATIVE_MODE else "독립 탐색",
+            },
             {"설정": "프로파일 스키마", "값": feature_schema_version(profile)},
             {"설정": "연구 시간(분)", "값": duration_minutes},
             {"설정": "개체군 / 세대", "값": f"{population} / {generations}"},
@@ -1353,14 +1459,55 @@ with new_tab:
         preview: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
         if elite_enabled:
-            preview, skipped = library.select_elite_candidates(
+            preview, skipped = _cached_elite_preview(
+                str(library.path),
+                str(project_path("experiments")),
+                pattern_db_stat,
                 feature_profile=profile,
                 max_lag=int(max_lag),
                 max_candidates=2 * ceil(int(population) * float(elite_ratio)),
+                max_data_round=new_dataset.records[-1].round_number,
+                require_temporal_provenance=True,
             )
             st.caption(
-                f"호환 계승 후보 {len(preview)}개, 호환되지 않아 제외된 후보 {len(skipped)}개"
+                f"호환 가능한 이전 수식 {len(preview)}개를 확인했고, "
+                f"중복·호환성 문제로 제외한 후보는 {len(skipped)}개입니다. "
+                f"최대 예상 주입 수는 초기 개체군의 {elite_ratio:.0%}입니다."
             )
+            source_rounds = {
+                str(item.get("origin_research_id") or item.get("research_id"))
+                for item in preview
+                if item.get("origin_research_id") or item.get("research_id")
+            }
+            compatible_profiles = sorted(
+                {str(item.get("feature_profile", "legacy")) for item in preview}
+            )
+            duplicate_exclusions = sum(
+                "duplicate" in str(item.get("reason", "")).casefold() for item in skipped
+            )
+            st.caption(
+                f"재사용 가능한 이전 연구: {len(source_rounds)}개 · "
+                "호환 프로파일: "
+                f"{', '.join(compatible_profiles) if compatible_profiles else '없음'} · "
+                f"중복 제외: {duplicate_exclusions}개"
+            )
+        elif research_mode == CUMULATIVE_MODE and "intermittent_gp" in engines:
+            st.info("호환되는 이전 GP 수식이 없어 이번 초기 개체군에는 주입하지 않습니다.")
+        if research_mode == CUMULATIVE_MODE and "pysr_symbolic_regression" in engines:
+            st.caption(
+                "PySR에는 다른 연구의 수식을 자동 주입하지 않습니다. "
+                "PySR 후보는 별도 라이브러리에 기록되며, "
+                "현재 환경에서는 Julia 런타임이 확인되지 않았습니다."
+            )
+        if strategy_recommendation["available"]:
+            st.info(
+                f"Optuna 설정 참고: {strategy_recommendation['study_name']} "
+                f"Trial #{strategy_recommendation['trial_number']} · "
+                f"{strategy_recommendation['parameters']} · "
+                "현재 입력에는 자동 적용되지 않습니다."
+            )
+        else:
+            st.caption(strategy_recommendation["reason"])
         elite_seeds = tuple(preview)
     else:
         invalid_profile = True
@@ -1468,10 +1615,34 @@ with new_tab:
             research_id = str(uuid.uuid4())
             st.session_state["research_launch_id"] = research_id
             st.session_state["research_launch_engine"] = engine_choice
+            st.session_state["research_launch_mode"] = research_mode
+            st.session_state["research_launch_source_research_count"] = len(
+                {
+                    str(item.get("origin_research_id") or item.get("research_id"))
+                    for item in preview
+                    if item.get("origin_research_id") or item.get("research_id")
+                }
+            )
+            st.session_state["research_launch_reuse_candidate_count"] = len(preview)
             st.session_state["research_launch_seed"] = effective_config.seed
             st.session_state["research_launch_started_at"] = datetime.now(UTC).isoformat()
             st.session_state["research_target_duration_seconds"] = float(duration_minutes) * 60
             created_at = datetime.now(UTC).isoformat()
+            optimization_origin = None
+            if optimization_context:
+                optimization_origin = optimization_origin_record(
+                    study={
+                        "optuna_study_id": optimization_context.get("optuna_study_id"),
+                        "study_name": optimization_context["study_name"],
+                        "best_trial_number": optimization_context["trial_number"],
+                        "feature_profile": optimization_context["feature_profile"],
+                        "dataset_range": optimization_context["dataset_range"],
+                    },
+                    parameters=optimization_context["parameters"],
+                    research_settings=current_research_settings,
+                    applied_at=optimization_context["applied_at"],
+                    modified=optimization_context.get("modified_by_user", False),
+                )
             research_round = rounds.ensure_round(
                 research_id,
                 {
@@ -1479,6 +1650,12 @@ with new_tab:
                     "status": "queued",
                     "checkpoint_path": str(checkpoint_path.resolve()),
                     "dataset_sha256": dataset_digest(new_dataset),
+                    "dataset_snapshot_sha256": current_dataset_snapshot,
+                    "dataset_hash_algorithm": (
+                        current_dataset_hashes["algorithm_version"]
+                        if current_dataset_hashes
+                        else None
+                    ),
                     "dataset_source_kind": new_dataset.source_kind,
                     "dataset_verification_status": new_dataset.verification_status,
                     "dataset_round_range": [
@@ -1487,25 +1664,33 @@ with new_tab:
                     ],
                     "config": asdict(effective_config),
                     "engines": list(engines),
+                    "research_mode": research_mode,
+                    "research_strategy": {
+                        "mode": research_mode,
+                        "elite_seeding_enabled": effective_config.elite_seeding_enabled,
+                        "elite_seed_ratio": effective_config.elite_seed_ratio,
+                        "selected_pattern_ids": [
+                            str(item["pattern_id"]) for item in preview
+                        ],
+                        "source_research_ids": sorted(
+                            {
+                                str(item.get("origin_research_id") or item.get("research_id"))
+                                for item in preview
+                                if item.get("origin_research_id") or item.get("research_id")
+                            }
+                        ),
+                        "candidate_count": len(preview),
+                        "seed_source": (
+                            "pattern_library_validation_ranked"
+                            if effective_config.elite_seeding_enabled
+                            else "random_initialization"
+                        ),
+                        "optuna_origin": optimization_origin,
+                    },
                     "pysr_config": asdict(pysr_config) if pysr_config is not None else None,
-                    "optimization_origin": (
-                        optimization_origin_record(
-                            study={
-                                "optuna_study_id": optimization_context.get("optuna_study_id"),
-                                "study_name": optimization_context["study_name"],
-                                "best_trial_number": optimization_context["trial_number"],
-                                "feature_profile": optimization_context["feature_profile"],
-                                "dataset_range": optimization_context["dataset_range"],
-                            },
-                            parameters=optimization_context["parameters"],
-                            research_settings=current_research_settings,
-                            applied_at=optimization_context["applied_at"],
-                            modified=optimization_context.get("modified_by_user", False),
-                        )
-                        | {"state": "queued"}
-                        if optimization_context
-                        else None
-                    ),
+                    "optimization_origin": optimization_origin | {"state": "queued"}
+                    if optimization_origin
+                    else None,
                     "completed_runs": 0,
                     "target_duration_seconds": float(duration_minutes) * 60,
                     "completed_experiment_ids": [],
@@ -1522,6 +1707,8 @@ with new_tab:
                 pysr_config=pysr_config,
                 research_id=research_id,
                 candidate_replay_threshold=int(candidate_replay_threshold),
+                research_mode=research_mode,
+                optimization_origin=optimization_origin,
             )
             try:
                 st.session_state["research_launch_status"] = "background_starting"

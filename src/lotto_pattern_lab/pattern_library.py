@@ -415,6 +415,9 @@ class PatternLibrary:
         max_candidates: int,
         max_per_origin: int = 2,
         target_model_type: str = "main",
+        max_data_round: int | None = None,
+        require_temporal_provenance: bool = False,
+        experiment_directory: str | Path = "experiments",
     ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         """Rank eligible patterns from train/validation evidence only, preserving diversity."""
         if target_model_type not in {"main", "bonus_number"}:
@@ -426,7 +429,10 @@ class PatternLibrary:
         skipped: list[dict[str, str]] = []
         seen: set[str] = set()
         experiment_cache: dict[str, dict[str, Any] | None] = {}
-        for pattern in self.list_patterns(limit=100_000):
+        scan_limit = min(500, max(100, max_candidates * 10))
+        for pattern in self.list_elite_patterns(
+            limit=scan_limit, target_model_type=target_model_type
+        ):
             pattern_id = str(pattern["pattern_id"])
             pattern_type = pattern.get("model_type")
             if target_model_type == "main" and pattern_type == "bonus_number":
@@ -446,16 +452,149 @@ class PatternLibrary:
                 )
                 continue
             performance = pattern.get("performance", {})
-            if performance.get("validation_score") is None:
-                experiment_id = str(pattern.get("experiment_id", ""))
+            experiment_id = str(pattern.get("experiment_id", ""))
+            if require_temporal_provenance or performance.get("validation_score") is None:
                 if experiment_id not in experiment_cache:
                     try:
-                        experiment_cache[experiment_id] = ExperimentStore().load(
+                        experiment_cache[experiment_id] = ExperimentStore(
+                            experiment_directory
+                        ).load(
                             experiment_id, expand_details=False
                         )
                     except (OSError, ValueError, KeyError):
                         experiment_cache[experiment_id] = None
                 experiment = experiment_cache.get(experiment_id)
+                if require_temporal_provenance:
+                    if not experiment or experiment.get("status") != "completed":
+                        skipped.append(
+                            {"pattern_id": pattern_id, "reason": "source experiment is unavailable"}
+                        )
+                        continue
+                    split_data = experiment.get("splits") or {}
+                    if (
+                        experiment.get("independent_test_used_for_selection") is True
+                        or split_data.get("test_set_used_for_selection") is True
+                    ):
+                        skipped.append(
+                            {
+                                "pattern_id": pattern_id,
+                                "reason": "source independent test was used for selection",
+                            }
+                        )
+                        continue
+                    train_rounds = split_data.get("train_rounds") or []
+                    validation_rounds = split_data.get("validation_rounds") or []
+                    test_rounds = split_data.get("test_rounds") or []
+                    if not train_rounds or not validation_rounds or not test_rounds:
+                        skipped.append(
+                            {
+                                "pattern_id": pattern_id,
+                                "reason": "source time-ordered split provenance is missing",
+                            }
+                        )
+                        continue
+                    if not (
+                        max(train_rounds) < min(validation_rounds)
+                        and max(validation_rounds) < min(test_rounds)
+                    ):
+                        skipped.append(
+                            {
+                                "pattern_id": pattern_id,
+                                "reason": "source splits are not chronological",
+                            }
+                        )
+                        continue
+                    model_key = str(pattern.get("model", ""))
+                    model_record = experiment.get(model_key, {})
+                    candidates = model_record.get("candidates") or [
+                        model_record.get("selected", {})
+                    ]
+                    candidate_rank = int(pattern.get("candidate_rank", 1))
+                    if not 1 <= candidate_rank <= len(candidates):
+                        skipped.append(
+                            {"pattern_id": pattern_id, "reason": "source candidate rank is missing"}
+                        )
+                        continue
+                    source_candidate = candidates[candidate_rank - 1]
+                    outputs = int(pattern.get("outputs_per_event", 0))
+                    rule_index = int(pattern.get("rule_index", 1))
+                    source_formulas = source_candidate.get("formulas", [])
+                    formula_start = (rule_index - 1) * outputs
+                    if (
+                        outputs not in {1, 6}
+                        or rule_index not in {1, 2}
+                        or len(source_formulas) < formula_start + outputs
+                        or str(pattern.get("activation_condition"))
+                        != str(source_candidate.get("activation_condition"))
+                        or list(map(str, pattern.get("formulas", ())))
+                        != list(map(str, source_formulas[formula_start : formula_start + outputs]))
+                    ):
+                        skipped.append(
+                            {
+                                "pattern_id": pattern_id,
+                                "reason": "formula does not match its recorded source candidate",
+                            }
+                        )
+                        continue
+                    pattern["performance"] = {
+                        **pattern.get("performance", {}),
+                        **{
+                            key: source_candidate.get(key)
+                            for key in (
+                                "training_score",
+                                "validation_score",
+                                "training_hit_rate",
+                                "validation_hit_rate",
+                                "training_activation_rate",
+                                "validation_activation_rate",
+                            )
+                        },
+                    }
+                    control_model_key = (
+                        "one_number"
+                        if model_key == "one_number_model"
+                        else "six_number_set"
+                    )
+                    control_validation_scores = [
+                        float(control[control_model_key]["selected"]["validation_score"])
+                        for control in experiment.get("random_controls", [])
+                        if control.get(control_model_key, {}).get("selected", {}).get(
+                            "validation_score"
+                        )
+                        is not None
+                    ]
+                    selected_validation = pattern["performance"].get("validation_score")
+                    if selected_validation is not None and control_validation_scores:
+                        pattern["performance"]["random_control_validation_p_value"] = (
+                            1
+                            + sum(
+                                score >= float(selected_validation)
+                                for score in control_validation_scores
+                            )
+                        ) / (1 + len(control_validation_scores))
+                    if max_data_round is not None and max(test_rounds) > max_data_round:
+                        skipped.append(
+                            {
+                                "pattern_id": pattern_id,
+                                "reason": (
+                                    "source experiment used rounds beyond the current data snapshot"
+                                ),
+                            }
+                        )
+                        continue
+                    stored_range = pattern.get("input_range")
+                    if (
+                        stored_range
+                        and max_data_round is not None
+                        and int(stored_range[-1]) > max_data_round
+                    ):
+                        skipped.append(
+                            {
+                                "pattern_id": pattern_id,
+                                "reason": "pattern provenance exceeds current data",
+                            }
+                        )
+                        continue
                 if experiment:
                     model_key = str(pattern.get("model", ""))
                     model = experiment.get(model_key, {})
@@ -564,9 +703,23 @@ class PatternLibrary:
             stability_penalty = min(0.2, abs(training_score - validation_score) * 0.35)
             complexity_penalty = min(0.1, complexity * 0.0005)
             reuse_penalty = min(0.05, int(pattern.get("inheritance_count", 0)) * 0.005)
-            score = validation_score - stability_penalty - complexity_penalty - reuse_penalty
+            random_p = performance.get("random_control_validation_p_value")
+            random_control_penalty = (
+                min(0.05, max(0.0, float(random_p)) * 0.05)
+                if isinstance(random_p, (int, float)) and math.isfinite(float(random_p))
+                else 0.025
+            )
+            score = (
+                validation_score
+                - stability_penalty
+                - complexity_penalty
+                - reuse_penalty
+                - random_control_penalty
+            )
             pattern["elite_selection_score"] = score
-            pattern["elite_selection_policy"] = "validation_stability_complexity_diversity_v1"
+            pattern["elite_selection_policy"] = (
+                "validation_stability_complexity_random_control_diversity_v2"
+            )
             eligible.append((score, pattern_id, pattern))
         eligible.sort(key=lambda item: (-item[0], item[1]))
         selected: list[dict[str, Any]] = []
@@ -594,6 +747,41 @@ class PatternLibrary:
                     {"pattern_id": pattern_id, "reason": "elite candidate limit reached"}
                 )
         return selected, skipped
+
+    def list_elite_patterns(
+        self, *, limit: int, target_model_type: str = "main"
+    ) -> list[dict[str, Any]]:
+        """Read a bounded, score-ordered candidate window for Elite selection."""
+        if limit < 1:
+            return []
+        if target_model_type == "bonus_number":
+            model_filter = "model_type = 'bonus_number'"
+        elif target_model_type == "main":
+            model_filter = "(model_type IS NULL OR model_type != 'bonus_number')"
+        else:
+            raise ValueError("Target model type must be main or bonus_number.")
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT pattern_id, payload, status FROM patterns
+                    WHERE {model_filter}
+                    ORDER BY (validation_score IS NULL), validation_score DESC,
+                             (training_score IS NULL), training_score DESC,
+                             complexity ASC, created_at DESC
+                    LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+            bonus_rows = []
+            if target_model_type == "main":
+                bonus_rows = connection.execute(
+                    """SELECT pattern_id, payload, status FROM patterns
+                       WHERE model_type = 'bonus_number'
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (min(int(limit), 100),),
+                ).fetchall()
+        return [
+            {**json.loads(row["payload"]), "current_status": row["status"]}
+            for row in (*rows, *bonus_rows)
+        ]
 
     @retry_sqlite_operation("record pattern reuse")
     def record_elite_use(

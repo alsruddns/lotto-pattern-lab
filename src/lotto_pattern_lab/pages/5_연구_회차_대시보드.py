@@ -6,6 +6,12 @@ from statistics import median
 import plotly.graph_objects as go
 import streamlit as st
 
+from lotto_pattern_lab.cumulative_research import (
+    CUMULATIVE_MODE,
+    INDEPENDENT_MODE,
+    compare_research_modes,
+    cumulative_growth_summary,
+)
 from lotto_pattern_lab.feature_schema import feature_mapping
 from lotto_pattern_lab.hit_audit import audit_research_round, build_hit_audit_markdown
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
@@ -325,6 +331,89 @@ else:
         hide_index=True,
         width="stretch",
     )
+
+    growth = cumulative_growth_summary(rounds)
+    st.divider()
+    st.subheader("누적 연구 성장 분석")
+    st.caption(growth["growth_claim"])
+    growth_first = st.columns(5)
+    growth_first[0].metric("누적 연구 회차", format_count(growth["research_round_count"]))
+    growth_first[1].metric("누적 탐색 후보", format_count(growth["candidate_count"]))
+    growth_first[2].metric("신규 등록 수식 후보", format_count(growth["new_valid_formula_count"]))
+    growth_first[3].metric("재사용된 우수 수식", format_count(growth["reused_elite_formula_count"]))
+    growth_first[4].metric("기존 수식 변형", format_count(growth["modified_formula_count"]))
+    growth_second = st.columns(5)
+    growth_second[0].metric("중복 제외 수식", format_count(growth["duplicate_formula_count"]))
+    growth_second[1].metric("연구 시간", _duration(growth["runtime_seconds"]))
+    rate = growth["new_valid_formulas_per_hour"]
+    growth_second[2].metric(
+        "시간당 신규 수식", f"{rate:.2f}" if rate is not None else "평가 불가"
+    )
+    growth_second[3].metric(
+        "validation 평균",
+        format_decimal(growth["mean_validation_scores"]["six_number_set"], suffix="점"),
+    )
+    growth_second[4].metric(
+        "독립 테스트 평균",
+        format_decimal(
+            growth["mean_independent_test_scores"]["six_number_set"], suffix="점"
+        ),
+    )
+    efficiency_change = growth["efficiency_change_vs_comparable_previous"]
+    st.caption(
+        "이전 동일 데이터·설정 연구 대비 시간당 신규 등록 후보 변화: "
+        + (
+            f"{efficiency_change:+.1%}"
+            if efficiency_change is not None
+            else "비교 가능한 완료 연구가 부족합니다."
+        )
+    )
+    random_p_values = growth["random_control_median_p_values"]
+    one_p_value = (
+        random_p_values["one_number"]
+        if random_p_values["one_number"] is not None
+        else "평가 불가"
+    )
+    six_p_value = (
+        random_p_values["six_number_set"]
+        if random_p_values["six_number_set"] is not None
+        else "평가 불가"
+    )
+    st.caption(
+        f"무작위 대조 p 중앙값 · 한 번호: {one_p_value} · 6개 집합: {six_p_value}. "
+        "p 값은 효과 크기나 미래 추첨 예측력을 나타내지 않습니다."
+    )
+    mode_comparison = compare_research_modes(rounds)
+    st.markdown("#### 독립 탐색과 누적 진화 연구 비교")
+    if mode_comparison["available"]:
+        st.caption(mode_comparison["reason"])
+        st.dataframe(
+            [
+                {
+                    "공통 시드 수": item["paired_seed_count"],
+                    "validation 중앙값 차이": item["validation_median_delta"],
+                    "독립 테스트 중앙값 차이": item["independent_test_median_delta"],
+                    "신규 수식 중앙값 차이": item["new_formula_median_delta"],
+                    "복잡도 중앙값 차이": item["complexity_median_delta"],
+                    "실행 시간 중앙값 차이(초)": item["runtime_median_delta_seconds"],
+                    "독립 탐색 무작위 대조 p 중앙값 (6개 집합)": item[
+                        "random_control_median_p_values"
+                    ][INDEPENDENT_MODE]["six_number_set"],
+                    "누적 진화 무작위 대조 p 중앙값 (6개 집합)": item[
+                        "random_control_median_p_values"
+                    ][CUMULATIVE_MODE]["six_number_set"],
+                }
+                for item in mode_comparison["comparisons"]
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "무작위 대조 p 값은 대조 반복에 따른 통계 요약입니다. "
+            "개선 효과의 크기나 미래 당첨번호 예측력을 뜻하지 않습니다."
+        )
+    else:
+        st.info(mode_comparison["reason"])
 
     choices = {
         f"연구 {item['research_round']}회차 · {item['research_id'][:8]}": item for item in rounds

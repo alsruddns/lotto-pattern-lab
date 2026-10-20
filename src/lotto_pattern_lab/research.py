@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .atomic_io import AtomicWriteError, atomic_write_bytes, interprocess_lock
+from .data_audit import dataset_hashes
 from .dataset import DrawDataset, load_csv
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
 from .evaluation_cache import EvaluationCache
@@ -216,6 +217,8 @@ def run_research_schedule(
     max_runs: int | None = None,
     engines: tuple[str, ...] = DEFAULT_ENGINES,
     pysr_config: PySRConfig | None = None,
+    research_mode: str = "legacy",
+    optimization_origin: dict[str, Any] | None = None,
     candidate_replay_threshold: int = 5,
     candidate_replay_start_round: int = 753,
     candidate_replay_end_round: int = 1246,
@@ -228,6 +231,17 @@ def run_research_schedule(
     """
     if duration_seconds <= 0:
         raise ValueError("Research duration must be positive.")
+    if research_mode not in {"legacy", "independent", "cumulative"}:
+        raise ValueError("research_mode must be legacy, independent, or cumulative.")
+    if not resume and research_mode == "independent" and config.elite_seeding_enabled:
+        raise ValueError("독립 탐색에서는 이전 수식을 초기 개체군에 주입할 수 없습니다.")
+    if (
+        not resume
+        and research_mode == "cumulative"
+        and "intermittent_gp" in engines
+        and not config.elite_seeding_enabled
+    ):
+        raise ValueError("누적 진화 GP 연구에는 Elite Seeding 설정이 필요합니다.")
     if (retry_failed_runs or retry_seeds is not None) and not resume:
         raise ValueError("Retrying failed runs requires resume=True.")
     if retry_failed_runs and retry_seeds is not None:
@@ -249,6 +263,7 @@ def run_research_schedule(
     run_automatic_checkpoint_cleanup()
     pause_path = pause_request_path(checkpoint)
     data_hash = dataset_digest(dataset)
+    snapshot_hashes = dataset_hashes(dataset, max_lag=config.max_lag)
     config_payload = asdict(config)
     store = ExperimentStore(experiment_directory)
     library = PatternLibrary(pattern_database)
@@ -336,6 +351,9 @@ def run_research_schedule(
                 feature_profile=config.feature_profile,
                 max_lag=config.max_lag,
                 max_candidates=math.ceil(config.population_size * config.elite_seed_ratio) * 2,
+                max_data_round=dataset.records[-1].round_number,
+                require_temporal_provenance=research_mode == "cumulative",
+                experiment_directory=store.directory,
             )
         else:
             selected_patterns, skipped_patterns = [], []
@@ -358,6 +376,30 @@ def run_research_schedule(
             "status": "queued",
             "created_at": datetime.now(UTC).isoformat(),
             "dataset_sha256": data_hash,
+            "dataset_snapshot_sha256": snapshot_hashes["bonus_inclusive_sha256"],
+            "dataset_hash_algorithm": snapshot_hashes["algorithm_version"],
+            "research_mode": research_mode,
+            "research_strategy": {
+                "mode": research_mode,
+                "elite_seeding_enabled": config.elite_seeding_enabled,
+                "elite_seed_ratio": config.elite_seed_ratio,
+                "seed_source": (
+                    "pattern_library_validation_ranked"
+                    if research_mode == "cumulative" and config.elite_seeding_enabled
+                    else "random_initialization"
+                ),
+                "optuna_origin": optimization_origin,
+                "selected_pattern_ids": [item["pattern_id"] for item in selected_patterns],
+                "candidate_count": len(selected_patterns),
+                "source_research_ids": sorted(
+                    {
+                        str(item.get("origin_research_id") or item.get("research_id"))
+                        for item in selected_patterns
+                        if item.get("origin_research_id") or item.get("research_id")
+                    }
+                ),
+            },
+            "optimization_origin": optimization_origin,
             "dataset_path": str(project_path(dataset_path)) if dataset_path else None,
             "dataset_source_kind": dataset.source_kind,
             "dataset_verification_status": dataset.verification_status,
@@ -401,6 +443,9 @@ def run_research_schedule(
             "end_round": candidate_replay_end_round,
         },
     )
+    if optimization_origin and not resume:
+        state["optimization_origin"] = optimization_origin
+        state["research_strategy"]["optuna_origin"] = optimization_origin
     state.setdefault("candidate_revalidation", {"queued_jobs": 0, "job_ids": [], "errors": []})
     state["config"] = config_payload
     state.setdefault(
@@ -671,6 +716,8 @@ def run_research_schedule(
                 )
             )
             result["research_id"] = state["research_id"]
+            result["research_mode"] = state.get("research_mode", "legacy")
+            result["dataset_snapshot_sha256"] = state.get("dataset_snapshot_sha256")
             result["research_attempt"] = state["attempts"]
             if result.get("engine") == "pysr_symbolic_regression":
                 cache = EvaluationCache(pattern_database)
@@ -765,6 +812,16 @@ def run_research_schedule(
             result["candidate_revalidation"] = candidate_revalidation
             store.save(result)
             compact_summary = summarize_experiment(result, registered, exact_matches)
+            strategy_record = state.get("research_strategy")
+            if strategy_record is not None:
+                if used_pattern_ids:
+                    strategy_record["actual_reused_pattern_ids"] = sorted(
+                        set(strategy_record.get("actual_reused_pattern_ids", ()))
+                        | set(used_pattern_ids)
+                    )
+                strategy_record["actual_reused_formula_count"] = int(
+                    strategy_record.get("actual_reused_formula_count", 0)
+                ) + int(compact_summary.get("inherited_pattern_count", 0) or 0)
             dashboard_summary = state["dashboard_summary"]
             dashboard_summary["completed_experiment_count"] += 1
             for key in (
@@ -946,7 +1003,7 @@ def run_research_schedule(
 
 
 def _round_metadata(state: dict[str, Any]) -> dict[str, Any]:
-    return {
+    metadata = {
         "research_round": state.get("research_round"),
         "status": state.get("status"),
         "created_at": state.get("created_at"),
@@ -985,3 +1042,13 @@ def _round_metadata(state: dict[str, Any]) -> dict[str, Any]:
         "next_seed": state.get("rng_resume", {}).get("next_seed"),
         "discovered_exact_matches": state.get("discovered_exact_matches", []),
     }
+    for key in (
+        "dataset_snapshot_sha256",
+        "dataset_hash_algorithm",
+        "research_mode",
+        "research_strategy",
+        "optimization_origin",
+    ):
+        if key in state:
+            metadata[key] = state[key]
+    return metadata

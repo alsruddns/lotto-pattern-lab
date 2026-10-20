@@ -413,6 +413,9 @@ def render_optimization() -> None:
                     dataset_integrity=st.session_state.get(
                         "research_current_dataset_integrity"
                     ),
+                    current_dataset_sha256=st.session_state.get(
+                        "research_current_dataset_sha256"
+                    ),
                 )
                 if (
                     selected.get("status") != "completed"
@@ -469,6 +472,9 @@ def render_optimization() -> None:
                                 ),
                                 dataset_integrity=st.session_state.get(
                                     "research_current_dataset_integrity"
+                                ),
+                                current_dataset_sha256=st.session_state.get(
+                                    "research_current_dataset_sha256"
                                 ),
                             )
                             if apply_error or still_compatible != normalized:

@@ -185,6 +185,12 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     )
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--research-mode",
+        choices=("legacy", "independent", "cumulative"),
+        default="legacy",
+    )
+    parser.add_argument("--optimization-origin-json", default="null")
     parser.add_argument("--store", default="experiments")
     args = parser.parse_args(argv)
 
@@ -359,6 +365,8 @@ def _run_research_cli(argv: list[str]) -> None:
         retry_seeds=tuple(args.retry_seed) if args.retry_seed is not None else None,
         max_runs=args.max_runs,
         engines=tuple(args.engine or DEFAULT_ENGINES),
+        research_mode=args.research_mode,
+        optimization_origin=json.loads(args.optimization_origin_json),
         pysr_config=pysr_config
         if "pysr_symbolic_regression" in (args.engine or ())
         else None,

@@ -25,6 +25,7 @@ from lotto_pattern_lab.intermittent import (
 )
 from lotto_pattern_lab.pattern_library import PatternLibrary
 from lotto_pattern_lab.research import run_research_schedule
+from lotto_pattern_lab.storage import ExperimentStore
 
 
 def _seed(pattern_id: str = "source-pattern", **extra: object) -> dict[str, object]:
@@ -298,12 +299,49 @@ def test_elite_selection_uses_validation_not_independent_test(tmp_path) -> None:
 def test_research_checkpoint_reuses_selected_elites_and_next_seed(tmp_path) -> None:
     database = tmp_path / "patterns.sqlite"
     library = PatternLibrary(database)
+    experiment_store = ExperimentStore(tmp_path / "experiments")
+    experiment_store.save(
+        {
+            "experiment_id": "source-exp",
+            "status": "completed",
+            "config": {"feature_profile": "legacy"},
+            "feature_schema": {
+                "feature_profile": "legacy",
+                "feature_schema_version": 1,
+                "primitive_set_version": PRIMITIVE_SET_VERSION,
+                "feature_mapping": feature_mapping("legacy", 10),
+            },
+            "feature_variables": feature_mapping("legacy", 10),
+            "splits": {
+                "train_rounds": [800, 820],
+                "validation_rounds": [821, 829],
+                "test_rounds": [830, 839],
+            },
+            "one_number_model": {
+                "candidates": [
+                    {
+                        "activation_condition": "add(x0,1)",
+                        "formulas": ["x1"],
+                        "outputs_per_event": 1,
+                        "training_score": 0.4,
+                        "validation_score": 0.4,
+                        "validation_activation_rate": 0.6,
+                        "complexity": 2,
+                    }
+                ]
+            },
+        }
+    )
     source_id, _ = library.register_pattern(
         {
             "activation_condition": "add(x0,1)",
             "formulas": ["x1"],
             "outputs_per_event": 1,
             "rule_index": 1,
+            "experiment_id": "source-exp",
+            "model": "one_number_model",
+            "candidate_rank": 1,
+            "input_range": [800, 839],
             "feature_profile": "legacy",
             "feature_mapping": feature_mapping("legacy", 10),
             "performance": {
@@ -333,7 +371,11 @@ def test_research_checkpoint_reuses_selected_elites_and_next_seed(tmp_path) -> N
         experiment_directory=tmp_path / "experiments",
         pattern_database=database,
         max_runs=1,
+        research_mode="cumulative",
     )
+    assert first["research_mode"] == "cumulative"
+    assert first["dataset_snapshot_sha256"]
+    assert first["research_strategy"]["selected_pattern_ids"] == [source_id]
     assert first["elite_seeding"]["source_pattern_ids"] == [source_id]
     assert first["last_run_summary"]["patterns_registered"] > 0
     experiment = json.loads(
@@ -361,6 +403,7 @@ def test_research_checkpoint_reuses_selected_elites_and_next_seed(tmp_path) -> N
         max_runs=2,
     )
     assert resumed["elite_seeding"]["source_pattern_ids"] == [source_id]
+    assert resumed["research_mode"] == "cumulative"
     assert [item["seed"] for item in resumed["completed_experiments"]] == [201, 202]
 
 

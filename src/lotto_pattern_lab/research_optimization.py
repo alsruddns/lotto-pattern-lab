@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .atomic_io import atomic_write_bytes
+from .data_audit import dataset_hashes
 from .dataset import DrawDataset
 from .intermittent import IntermittentConfig
 from .intermittent_experiment import run_intermittent_experiment
@@ -260,14 +261,40 @@ def optimize_gp(
         sampler=optuna.samplers.TPESampler(seed=base_config.seed),
         load_if_exists=True,
     )
-    study.set_user_attr("mode", mode)
-    study.set_user_attr("engine", "intermittent_gp")
-    study.set_user_attr("feature_profile", base_config.feature_profile)
-    study.set_user_attr(
-        "dataset_range", [dataset.records[0].round_number, dataset.records[-1].round_number]
-    )
-    study.set_user_attr("final_test_used_for_selection", False)
-    study.set_user_attr("objective_policy_version", "validation_only_v1")
+    snapshot_hashes = dataset_hashes(dataset)
+    study_metadata = {
+        "mode": mode,
+        "engine": "intermittent_gp",
+        "feature_profile": base_config.feature_profile,
+        "dataset_range": [dataset.records[0].round_number, dataset.records[-1].round_number],
+        "dataset_snapshot_sha256": snapshot_hashes["bonus_inclusive_sha256"],
+        "dataset_hash_algorithm": snapshot_hashes["algorithm_version"],
+        "final_test_used_for_selection": False,
+        "objective_policy_version": "validation_only_v1",
+    }
+    if action == "new":
+        for key, value in study_metadata.items():
+            study.set_user_attr(key, value)
+    else:
+        stored = study.user_attrs
+        immutable_keys = (
+            "engine",
+            "feature_profile",
+            "dataset_range",
+            "dataset_snapshot_sha256",
+            "dataset_hash_algorithm",
+        )
+        mismatched = [
+            key
+            for key in immutable_keys
+            if stored.get(key) is not None and stored[key] != study_metadata[key]
+        ]
+        if mismatched:
+            raise ValueError(
+                "기존 Optuna 기록의 엔진·프로파일·데이터 스냅샷과 다릅니다. "
+                "기록을 변경하지 않고 실행을 중단했습니다: "
+                + ", ".join(mismatched)
+            )
     trial_store = ExperimentStore(Path(experiment_directory) / slug)
     started_at = datetime.now(UTC).isoformat()
 

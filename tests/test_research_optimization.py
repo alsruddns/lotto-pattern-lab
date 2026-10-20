@@ -160,3 +160,49 @@ def test_resume_requires_existing_optuna_database(tmp_path, monkeypatch) -> None
             action="resume",
             storage_directory=tmp_path / "missing",
         )
+
+
+def test_new_optuna_study_records_exact_dataset_snapshot_and_resume_is_immutable(
+    tmp_path, monkeypatch
+) -> None:
+    import hashlib
+
+    from lotto_pattern_lab.data_audit import dataset_hashes
+    from lotto_pattern_lab.dataset import make_random_dataset
+
+    dataset = make_random_dataset(30, seed=37)
+    config = IntermittentConfig(
+        population_size=8, generations=1, max_depth=2, workers=1, control_runs=0
+    )
+    monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
+    optimization.optimize_gp(
+        dataset,
+        config,
+        study_name="snapshot-study",
+        mode="quick",
+        action="new",
+        n_trials=1,
+        storage_directory=tmp_path,
+        experiment_directory=tmp_path / "experiments",
+    )
+    record = optimization.list_optimization_studies(tmp_path)[0]
+    assert record["dataset_snapshot_sha256"] == dataset_hashes(dataset)[
+        "bonus_inclusive_sha256"
+    ]
+    assert record["dataset_hash_algorithm"] == dataset_hashes(dataset)["algorithm_version"]
+
+    database = tmp_path / "snapshot-study.sqlite"
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    changed = make_random_dataset(30, seed=38)
+    with pytest.raises(ValueError, match="데이터 스냅샷"):
+        optimization.optimize_gp(
+            changed,
+            config,
+            study_name="snapshot-study",
+            mode="quick",
+            action="resume",
+            n_trials=1,
+            storage_directory=tmp_path,
+            experiment_directory=tmp_path / "experiments",
+        )
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
