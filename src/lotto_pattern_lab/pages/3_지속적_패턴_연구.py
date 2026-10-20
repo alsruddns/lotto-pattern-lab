@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,7 @@ from lotto_pattern_lab.research import (
     pause_request_path,
     request_pause,
 )
+from lotto_pattern_lab.research_optimization import optuna_status
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
 
@@ -2060,3 +2062,126 @@ with queue_tab:
         queue_store.set_queue_status(active_queue_id, "pause_requested")
         st.toast("현재 연구 완료 후 다음 예약 자동 실행을 중지합니다.", icon="⏹️")
         st.rerun()
+
+st.divider()
+st.header("연구 조건 자동 최적화")
+optimization_status = optuna_status()
+with st.expander("Optuna로 검증 구간 연구 조건 찾기", expanded=False):
+    if not optimization_status["available"]:
+        st.info(
+            "선택형 최적화 라이브러리가 설치되지 않았습니다. "
+            "설치 후 기존 연구 기능은 그대로 사용할 수 있습니다. "
+            + optimization_status["install_extra"]
+        )
+    st.caption(
+        "자동 최적화는 학습·검증 성능, 수식 복잡도, 일반화 차이를 사용합니다. "
+        "최종 독립 테스트 점수는 최적 조건 선택에 사용하지 않습니다."
+    )
+    optimization_data = [
+        path
+        for path in (
+            project_path("data/official/draws.csv"),
+            project_path("data/raw/lotto_draws_753_1246_with_bonus.csv"),
+            project_path("data/raw/lotto_draws_753_1246.csv"),
+        )
+        if path.is_file()
+    ]
+    if optimization_data:
+        mode = st.selectbox(
+            "최적화 모드",
+            ("quick", "standard", "deep"),
+            format_func=lambda value: {
+                "quick": "빠른 연구 · 탐색 점검용",
+                "standard": "표준 연구 · 권장",
+                "deep": "심층 연구 · 계산 부담 큼",
+            }[value],
+            help="빠른 1~5세대, 표준 2~20세대, 심층 5~100세대 탐색에서 조건을 비교합니다.",
+            key="optimization_mode",
+        )
+        selected_csv = st.selectbox(
+            "최적화 데이터",
+            optimization_data,
+            format_func=lambda value: str(value.relative_to(PROJECT_ROOT)),
+            key="optimization_csv",
+        )
+        trial_default = {"quick": 3, "standard": 10, "deep": 30}[mode]
+        trial_count = st.number_input(
+            "추가 Trial 수",
+            min_value=1,
+            max_value=500,
+            value=trial_default,
+            help="기존 Optuna 연구가 있으면 같은 이름의 연구에 추가해 이어서 탐색합니다.",
+            key="optimization_trials",
+        )
+        timeout_minutes = st.number_input(
+            "시간 제한(분)",
+            min_value=1,
+            max_value=1440,
+            value={"quick": 30, "standard": 180, "deep": 480}[mode],
+            key="optimization_timeout_minutes",
+        )
+        study_name = st.text_input(
+            "최적화 연구 이름",
+            value="gp-tuning",
+            help="영문, 숫자, 점, 밑줄, 하이픈으로 구분되는 이름을 사용합니다.",
+            key="optimization_study_name",
+        )
+        study_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", study_name).strip(".-")[:80]
+        optimization_state_path = project_path(
+            f"data/optimizations/{study_slug}.state.json"
+        )
+        optimization_active = (
+            bool(study_slug)
+            and optimization_state_path.parent.exists()
+            and _worker_active(optimization_state_path)
+        )
+        if optimization_state_path.is_file():
+            try:
+                saved_state = json.loads(optimization_state_path.read_text(encoding="utf-8"))
+                st.caption(
+                    f"저장된 연구 상태: {saved_state.get('status', '상태 미기록')} · "
+                    f"완료 Trial {saved_state.get('completed_trials', 0)}개 · "
+                    f"최고 목적값 {saved_state.get('best_value', '미기록')}"
+                )
+            except (OSError, ValueError):
+                st.warning("최적화 상태 파일을 읽지 못했습니다. SQLite 연구 기록은 보존됩니다.")
+        if st.button(
+            "자동 최적화 시작 또는 이어서 하기",
+            type="primary",
+            disabled=(
+                not optimization_status["available"] or optimization_active or not study_slug
+            ),
+            help="한 번에 하나의 최적화 작업만 실행합니다.",
+            key="start_gp_optimization",
+        ):
+            command = [
+                sys.executable,
+                "-m",
+                "lotto_pattern_lab",
+                "optimize",
+                "--csv",
+                str(selected_csv.resolve()),
+                "--study-name",
+                study_slug,
+                "--mode",
+                mode,
+                "--trials",
+                str(int(trial_count)),
+                "--timeout-seconds",
+                str(float(timeout_minutes) * 60),
+                "--feature-profile",
+                "bonus_lag_v1"
+                if "with_bonus" in selected_csv.name
+                else "legacy",
+            ]
+            try:
+                pid = _launch_worker(
+                    command,
+                    optimization_state_path,
+                    project_path(f"logs/{study_slug}_optimization.log"),
+                )
+                st.success(f"자동 최적화 작업을 시작했습니다 (PID {pid}).")
+            except (OSError, RuntimeError) as error:
+                st.error(f"자동 최적화를 시작하지 못했습니다: {error}")
+    else:
+        st.info("자동 최적화에 사용할 데이터 파일이 없습니다.")
