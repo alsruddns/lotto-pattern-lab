@@ -15,10 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from .atomic_io import AtomicWriteError, atomic_write_bytes, interprocess_lock
-from .dataset import DrawDataset
+from .dataset import DrawDataset, load_csv
 from .engines import ENGINE_REGISTRY, ResearchRunContext, get_engine
 from .evaluation_cache import EvaluationCache
 from .feature_schema import PRIMITIVE_SET_VERSION, feature_schema_version
+from .formula_replay_queue import enqueue_experiment_high_hit_candidates
 from .intermittent import IntermittentConfig
 from .paths import locate_checkpoint, project_path
 from .pattern_library import (
@@ -187,6 +188,9 @@ def run_research_schedule(
     max_runs: int | None = None,
     engines: tuple[str, ...] = DEFAULT_ENGINES,
     pysr_config: PySRConfig | None = None,
+    candidate_replay_threshold: int = 5,
+    candidate_replay_start_round: int = 753,
+    candidate_replay_end_round: int = 1246,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Run complete seeded experiments until time, count, or a stop request is reached.
@@ -202,6 +206,13 @@ def run_research_schedule(
         raise ValueError(f"Supported engines are: {', '.join(SUPPORTED_ENGINES)}")
     if "pysr_symbolic_regression" in engines and pysr_config is None:
         raise ValueError("PySR engine requires an explicit PySRConfig.")
+    if candidate_replay_threshold not in {3, 4, 5, 6}:
+        raise ValueError("후보 등록 기준은 3, 4, 5, 6개 중 하나여야 합니다.")
+    if (
+        candidate_replay_start_round < 1
+        or candidate_replay_end_round < candidate_replay_start_round
+    ):
+        raise ValueError("자동 재검증 회차 범위가 올바르지 않습니다.")
     checkpoint = project_path(checkpoint_path)
     run_automatic_checkpoint_cleanup()
     pause_path = pause_request_path(checkpoint)
@@ -255,6 +266,17 @@ def run_research_schedule(
         )
         if stored_pysr_config != requested_pysr_config:
             raise ValueError("Cannot resume: PySR configuration differs from the checkpoint.")
+        stored_replay = state.get(
+            "candidate_replay",
+            {"threshold": 5, "start_round": 753, "end_round": 1246},
+        )
+        requested_replay = {
+            "threshold": candidate_replay_threshold,
+            "start_round": candidate_replay_start_round,
+            "end_round": candidate_replay_end_round,
+        }
+        if stored_replay != requested_replay:
+            raise ValueError("Cannot resume: candidate replay settings differ from the checkpoint.")
         elite_state = state.get("elite_seeding") or {
             "enabled": False,
             "ratio": 0.2,
@@ -311,6 +333,12 @@ def run_research_schedule(
             "elite_seeding": elite_state,
             "engines": list(engines),
             "pysr_config": asdict(pysr_config) if pysr_config is not None else None,
+            "candidate_replay": {
+                "threshold": candidate_replay_threshold,
+                "start_round": candidate_replay_start_round,
+                "end_round": candidate_replay_end_round,
+            },
+            "candidate_revalidation": {"queued_jobs": 0, "job_ids": [], "errors": []},
             "completed_runs": 0,
             "attempts": 0,
             "completed_experiments": [],
@@ -328,6 +356,15 @@ def run_research_schedule(
             ),
         }
     state["checkpoint_path"] = str(checkpoint)
+    state.setdefault(
+        "candidate_replay",
+        {
+            "threshold": candidate_replay_threshold,
+            "start_round": candidate_replay_start_round,
+            "end_round": candidate_replay_end_round,
+        },
+    )
+    state.setdefault("candidate_revalidation", {"queued_jobs": 0, "job_ids": [], "errors": []})
     state["config"] = config_payload
     state.setdefault(
         "target_duration_seconds",
@@ -606,6 +643,65 @@ def run_research_schedule(
             exact_matches = register_experiment_exact_matches(result, library)
             result["pattern_library_candidates"] = registered
             result["full_set_match_discoveries"] = exact_matches
+            store.save(result)
+            candidate_revalidation = {
+                "experiment_id": result["experiment_id"],
+                "status": "skipped",
+                "reason": None,
+                "job_ids": [],
+                "eligible_candidate_count": 0,
+            }
+            if result.get("engine") == "intermittent_gp" and dataset_path:
+                try:
+                    source = project_path(dataset_path)
+                    if not source.is_file():
+                        raise FileNotFoundError(source)
+                    if dataset_digest(load_csv(source)) != data_hash:
+                        raise ValueError("자동 재검증 원본 데이터가 현재 연구 데이터와 다릅니다.")
+                    queued = enqueue_experiment_high_hit_candidates(
+                        result,
+                        dataset_path=source,
+                        candidate_replay_threshold=candidate_replay_threshold,
+                        start_round=candidate_replay_start_round,
+                        end_round=candidate_replay_end_round,
+                    )
+                    candidate_revalidation.update(
+                        {
+                            "status": (
+                                "queued"
+                                if queued["eligible_candidate_count"]
+                                else "no_candidates"
+                            ),
+                            "eligible_candidate_count": queued["eligible_candidate_count"],
+                            "registered_job_count": queued["registered_job_count"],
+                            "deduplicated_job_count": queued["deduplicated_job_count"],
+                            "job_ids": queued["job_ids"],
+                            "threshold": candidate_replay_threshold,
+                            "range": queued["range"],
+                        }
+                    )
+                    summary = state["candidate_revalidation"]
+                    summary["queued_jobs"] += queued["registered_job_count"]
+                    summary["job_ids"] = sorted(set(summary["job_ids"] + queued["job_ids"]))
+                except Exception as replay_error:
+                    candidate_revalidation.update(
+                        {"status": "registration_failed", "reason": str(replay_error)}
+                    )
+                    state["candidate_revalidation"].setdefault("errors", []).append(
+                        {
+                            "experiment_id": result["experiment_id"],
+                            "error_type": type(replay_error).__name__,
+                            "error": str(replay_error),
+                            "recorded_at": datetime.now(UTC).isoformat(),
+                        }
+                    )
+            elif result.get("engine") != "intermittent_gp":
+                candidate_revalidation["reason"] = (
+                    "현재 자동 후보 수집은 6개 집합 GP 결과에 한정됩니다."
+                )
+            else:
+                candidate_revalidation["reason"] = "기준 데이터 파일 경로가 지정되지 않았습니다."
+            result["candidate_revalidation"] = candidate_revalidation
             store.save(result)
             compact_summary = summarize_experiment(result, registered, exact_matches)
             dashboard_summary = state["dashboard_summary"]

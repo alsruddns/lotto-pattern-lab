@@ -18,7 +18,7 @@ from .paths import project_path
 from .pattern_library import pattern_fingerprint
 from .storage import ExperimentStore
 
-MAX_REPLAY_WORKERS = 4
+MAX_REPLAY_WORKERS = 1
 _EXECUTOR = ThreadPoolExecutor(max_workers=MAX_REPLAY_WORKERS, thread_name_prefix="formula-replay")
 _FUTURES: dict[str, Future] = {}
 _DISPATCH_LOCK = threading.RLock()
@@ -88,6 +88,7 @@ def enqueue_formula_replay(
     formula_id: str,
     start_round: int,
     end_round: int,
+    discovery_event: dict[str, Any] | None = None,
     directory: str | Path | None = None,
     dispatch: bool = True,
 ) -> dict[str, Any]:
@@ -134,6 +135,31 @@ def enqueue_formula_replay(
                 existing["duplicate_request_count"] = int(
                     existing.get("duplicate_request_count", 0)
                 ) + 1
+                if discovery_event is not None:
+                    discoveries = existing.setdefault("discovery_events", [])
+                    discovery_key = str(discovery_event.get("discovery_key", ""))
+                    if discovery_key and all(
+                        item.get("discovery_key") != discovery_key for item in discoveries
+                    ):
+                        discoveries.append(discovery_event)
+                        existing["discovery_count"] = len(discoveries)
+                        existing["repeated_hit_events"] = sum(
+                            int(item.get("hit_event_count", 0) or 0) for item in discoveries
+                        )
+                        existing["original_hit_rounds"] = sorted(
+                            {
+                                int(round_number)
+                                for item in discoveries
+                                for round_number in item.get("hit_rounds", [])
+                            }
+                        )
+                        existing["origin_experiment_ids"] = sorted(
+                            {
+                                str(item.get("experiment_id"))
+                                for item in discoveries
+                                if item.get("experiment_id")
+                            }
+                        )
                 _write_job(existing, jobs_root)
                 return {**existing, "deduplicated": True}
         model = experiment.get(model_key) or {}
@@ -172,6 +198,23 @@ def enqueue_formula_replay(
             "elapsed_seconds": 0.0,
             "estimated_remaining_seconds": None,
             "duplicate_request_count": 0,
+            "discovery_events": [discovery_event] if discovery_event else [],
+            "discovery_count": 1 if discovery_event else 0,
+            "repeated_hit_events": (
+                int(discovery_event.get("hit_event_count", 0) or 0)
+                if discovery_event
+                else 0
+            ),
+            "original_hit_rounds": (
+                sorted(set(map(int, discovery_event.get("hit_rounds", []))))
+                if discovery_event
+                else []
+            ),
+            "origin_experiment_ids": (
+                [str(discovery_event["experiment_id"])]
+                if discovery_event and discovery_event.get("experiment_id")
+                else []
+            ),
             "result_path": None,
             "error": None,
         }
@@ -179,6 +222,130 @@ def enqueue_formula_replay(
     if dispatch:
         _dispatch(jobs_root)
     return {**job, "deduplicated": False}
+
+
+def enqueue_experiment_high_hit_candidates(
+    experiment: dict[str, Any],
+    *,
+    dataset_path: str | Path,
+    candidate_replay_threshold: int = 5,
+    start_round: int = 753,
+    end_round: int = 1246,
+    directory: str | Path | None = None,
+) -> dict[str, Any]:
+    """Register saved six-number candidates as background replays after each experiment."""
+    if candidate_replay_threshold not in {3, 4, 5, 6}:
+        raise ValueError("후보 등록 기준은 3, 4, 5, 6개 중 하나여야 합니다.")
+    if start_round < 1 or end_round < start_round:
+        raise ValueError("자동 재검증 회차 범위가 올바르지 않습니다.")
+    model = experiment.get("six_number_set_model") or {}
+    profile = str(
+        (experiment.get("feature_schema") or {}).get(
+            "feature_profile", experiment.get("config", {}).get("feature_profile", "legacy")
+        )
+    )
+    experiment_snapshot = {
+        key: experiment.get(key)
+        for key in (
+            "experiment_id",
+            "research_id",
+            "experiment_type",
+            "status",
+            "config",
+            "feature_schema",
+        )
+    }
+    experiment_snapshot["six_number_set_model"] = {
+        key: model.get(key, []) for key in ("train_rounds", "validation_rounds", "test_rounds")
+    }
+    eligible: dict[str, tuple[dict[str, Any], list[dict[str, Any]], int]] = {}
+    for rank, candidate in enumerate(model.get("candidates", []), start=1):
+        hit_events = [
+            event
+            for event in candidate.get("activation_events", [])
+            if event.get("active")
+            and int(event.get("hit_count", 0) or 0) >= candidate_replay_threshold
+        ]
+        split_summary = candidate.get(f"at_least_{candidate_replay_threshold}_hits_by_split") or {}
+        qualifies_by_summary = any(int(value or 0) > 0 for value in split_summary.values())
+        if not hit_events and not qualifies_by_summary:
+            continue
+        normalized = pattern_fingerprint(
+            str(candidate.get("activation_condition", "")),
+            tuple(map(str, candidate.get("formulas", ()))),
+        )
+        candidate_key = hashlib.sha256(f"{profile}:{normalized}".encode()).hexdigest()
+        current = eligible.get(candidate_key)
+        if current is None:
+            eligible[candidate_key] = (candidate, hit_events, rank)
+        else:
+            current[1].extend(hit_events)
+            eligible[candidate_key] = (current[0], current[1], min(current[2], rank))
+
+    data_file = project_path(dataset_path)
+    data_digest = hashlib.sha256(data_file.read_bytes()).hexdigest()
+    jobs = []
+    for candidate_key, (candidate, hit_events, rank) in eligible.items():
+        experiment_id = str(experiment.get("experiment_id", "unknown"))
+        research_id = experiment.get("research_id")
+        formula_id = hashlib.sha256(
+            json.dumps(
+                {
+                    "gate": candidate.get("activation_condition"),
+                    "formulas": candidate.get("formulas"),
+                    "profile": profile,
+                    "candidate_key": candidate_key,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        hit_rounds = sorted(
+            {
+                int(event["round_number"])
+                for event in hit_events
+                if event.get("round_number") is not None
+            }
+        )
+        discovery_key = hashlib.sha256(
+            f"{experiment_id}:{candidate_key}:{candidate_replay_threshold}".encode()
+        ).hexdigest()
+        discovery = {
+            "discovery_key": discovery_key,
+            "discovered_at": datetime.now(UTC).isoformat(),
+            "experiment_id": experiment_id,
+            "research_id": research_id,
+            "candidate_rank": rank,
+            "threshold": candidate_replay_threshold,
+            "hit_event_count": len(hit_events),
+            "hit_rounds": hit_rounds,
+            "hit_rounds_complete": bool(hit_events),
+        }
+        jobs.append(
+            enqueue_formula_replay(
+                dataset_path=data_file,
+                dataset_sha256=data_digest,
+                experiment=experiment_snapshot,
+                model_key="six_number_set_model",
+                candidate=candidate,
+                formula_id=formula_id,
+                start_round=start_round,
+                end_round=end_round,
+                discovery_event=discovery,
+                directory=directory,
+            )
+        )
+    return {
+        "threshold": candidate_replay_threshold,
+        "eligible_candidate_count": len(eligible),
+        "registered_job_count": sum(not item.get("deduplicated") for item in jobs),
+        "deduplicated_job_count": sum(bool(item.get("deduplicated")) for item in jobs),
+        "discovery_count": len(jobs),
+        "job_ids": [item["job_id"] for item in jobs],
+        "dataset_sha256": data_digest,
+        "range": {"start": start_round, "end": end_round},
+    }
 
 
 def discover_high_hit_candidates(

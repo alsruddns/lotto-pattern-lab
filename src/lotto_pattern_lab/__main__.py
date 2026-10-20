@@ -223,6 +223,9 @@ def _run_research_cli(argv: list[str]) -> None:
         "--stop", action="store_true", help="request a stop at the next trial boundary"
     )
     parser.add_argument("--max-runs", type=int)
+    parser.add_argument(
+        "--candidate-replay-threshold", type=int, choices=(3, 4, 5, 6), default=5
+    )
     parser.add_argument("--engine", action="append", choices=SUPPORTED_ENGINES)
     parser.add_argument(
         "--feature-profile",
@@ -330,6 +333,7 @@ def _run_research_cli(argv: list[str]) -> None:
         pysr_config=pysr_config
         if "pysr_symbolic_regression" in (args.engine or ())
         else None,
+        candidate_replay_threshold=args.candidate_replay_threshold,
         progress=report,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))

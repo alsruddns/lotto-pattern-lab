@@ -308,6 +308,7 @@ def _research_command(
     pysr_config: PySRConfig | None = None,
     resume: bool = False,
     research_id: str | None = None,
+    candidate_replay_threshold: int = 5,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -350,6 +351,8 @@ def _research_command(
         config.feature_profile,
         "--elite-seed-ratio",
         str(config.elite_seed_ratio),
+        "--candidate-replay-threshold",
+        str(candidate_replay_threshold),
     ]
     if research_id:
         command.extend(("--research-id", research_id))
@@ -549,6 +552,17 @@ with new_tab:
     )
     with st.form("new_research_form"):
         with st.expander("고급 설정", expanded=False):
+            candidate_replay_threshold = st.selectbox(
+                "자동 전체 회차 재검증 후보 기준",
+                (3, 4, 5, 6),
+                index=2,
+                format_func=lambda value: f"{value}개 이상 일치",
+                help=(
+                    "연구 중 기준을 충족한 6개 집합 공식은 "
+                    "별도 백그라운드 재검증 작업에 등록됩니다."
+                ),
+                key="candidate_replay_threshold",
+            )
             population = st.number_input(
                 "개체군",
                 min_value=8,
@@ -1152,6 +1166,7 @@ with new_tab:
                 engines=engines,
                 pysr_config=pysr_config,
                 research_id=research_id,
+                candidate_replay_threshold=int(candidate_replay_threshold),
             )
             try:
                 pid = _launch_worker(

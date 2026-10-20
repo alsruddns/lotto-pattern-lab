@@ -5,6 +5,7 @@ import hashlib
 from lotto_pattern_lab.formula_replay_queue import (
     _execute_job,
     discover_high_hit_candidates,
+    enqueue_experiment_high_hit_candidates,
     enqueue_formula_replay,
     list_replay_jobs,
 )
@@ -160,3 +161,91 @@ def test_replay_worker_persists_progress_and_completion(tmp_path, monkeypatch) -
     assert saved["processed_rounds"] == 2
     assert saved["run_id"] == "run-worker"
     assert saved["result_summary"]["evaluable_round_count"] == 1
+
+
+def test_auto_replay_registers_only_candidates_at_threshold(tmp_path, monkeypatch) -> None:
+    import lotto_pattern_lab.formula_replay_queue as queue
+
+    source = tmp_path / "draws.csv"
+    source.write_text(
+        "round,n1,n2,n3,n4,n5,n6\n1,1,2,3,4,5,6\n2,2,3,4,5,6,7\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(queue, "_dispatch", lambda *_args: None)
+    candidates = [_candidate((10, 11)), _candidate((12,))]
+    candidates[0]["activation_events"] = [
+        {"round_number": 10, "hit_count": 5, "active": True},
+        {"round_number": 11, "hit_count": 4, "active": True},
+    ]
+    candidates[1]["activation_events"] = [
+        {"round_number": 12, "hit_count": 4, "active": True}
+    ]
+    experiment = {
+        "experiment_id": "auto-one",
+        "research_id": "research-one",
+        "engine": "intermittent_gp",
+        "experiment_type": "intermittent",
+        "status": "completed",
+        "config": {"feature_profile": "legacy", "max_lag": 10},
+        "feature_schema": {"feature_profile": "legacy"},
+        "six_number_set_model": {"candidates": candidates},
+    }
+
+    result = enqueue_experiment_high_hit_candidates(
+        experiment,
+        dataset_path=source,
+        candidate_replay_threshold=5,
+        start_round=1,
+        end_round=2,
+        directory=tmp_path / "jobs",
+    )
+
+    jobs = list_replay_jobs(tmp_path / "jobs")
+    assert result["eligible_candidate_count"] == 1
+    assert result["registered_job_count"] == 1
+    assert len(jobs) == 1
+    assert jobs[0]["discovery_events"][0]["hit_rounds"] == [10]
+    assert jobs[0]["discovery_events"][0]["threshold"] == 5
+
+
+def test_auto_replay_deduplicates_work_but_preserves_discovery_events(
+    tmp_path, monkeypatch
+) -> None:
+    import lotto_pattern_lab.formula_replay_queue as queue
+
+    source = tmp_path / "draws.csv"
+    source.write_text(
+        "round,n1,n2,n3,n4,n5,n6\n1,1,2,3,4,5,6\n2,2,3,4,5,6,7\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(queue, "_dispatch", lambda *_args: None)
+    candidate = _candidate((10, 11))
+    candidate["activation_events"] = [
+        {"round_number": 10, "hit_count": 5, "active": True},
+        {"round_number": 10, "hit_count": 5, "active": True},
+        {"round_number": 11, "hit_count": 5, "active": True},
+    ]
+    base = {
+        "engine": "intermittent_gp",
+        "experiment_type": "intermittent",
+        "status": "completed",
+        "config": {"feature_profile": "legacy", "max_lag": 10},
+        "feature_schema": {"feature_profile": "legacy"},
+        "six_number_set_model": {"candidates": [candidate]},
+    }
+    for experiment_id in ("auto-one", "auto-two", "auto-one"):
+        enqueue_experiment_high_hit_candidates(
+            {**base, "experiment_id": experiment_id, "research_id": "research"},
+            dataset_path=source,
+            candidate_replay_threshold=5,
+            start_round=1,
+            end_round=2,
+            directory=tmp_path / "jobs",
+        )
+
+    jobs = list_replay_jobs(tmp_path / "jobs")
+    assert len(jobs) == 1
+    assert jobs[0]["discovery_count"] == 2
+    assert jobs[0]["repeated_hit_events"] == 6
+    assert jobs[0]["original_hit_rounds"] == [10, 11]
+    assert jobs[0]["origin_experiment_ids"] == ["auto-one", "auto-two"]

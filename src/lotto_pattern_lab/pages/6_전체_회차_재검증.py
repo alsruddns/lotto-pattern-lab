@@ -245,6 +245,13 @@ if jobs:
         f"경과 {float(job.get('elapsed_seconds', 0) or 0):.1f}초 · "
         f"중복 요청 {job.get('duplicate_request_count', 0)}회"
     )
+    discoveries = job.get("discovery_events", [])
+    if discoveries:
+        source_experiments = ", ".join(job.get("origin_experiment_ids", [])) or "기록 없음"
+        st.caption(
+            f"연구 중 후보 발견 {len(discoveries)}건 · 원본 실험 {source_experiments} · "
+            f"발견 당시 고유 적중 회차 {len(job.get('original_hit_rounds', []))}회"
+        )
     remaining = job.get("estimated_remaining_seconds")
     if remaining is not None and job.get("status") == "running":
         st.caption(f"측정 기반 예상 잔여 시간: {float(remaining):.1f}초")
