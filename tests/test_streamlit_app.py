@@ -25,6 +25,18 @@ def test_replay_and_draw_management_pages_render_from_app_navigation() -> None:
         assert not app.exception, [exception.message for exception in app.exception]
 
 
+def test_formula_library_page_renders_similarity_and_lineage_sections() -> None:
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("8_*.py")
+    )
+    app = AppTest.from_file(page).run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.title[0].value == "수학 공식 라이브러리"
+    assert "수식 유사도 및 그룹" in [item.value for item in app.subheader]
+    assert "수식 계보" in [item.value for item in app.subheader]
+
+
 def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(research_queue, "QUEUE_DB", tmp_path / "queue.sqlite")
     page = next(
