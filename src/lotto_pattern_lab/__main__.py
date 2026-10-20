@@ -236,6 +236,17 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument("--research-id")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--retry-failed-runs",
+        action="store_true",
+        help="explicitly retry pending failed seeds from a completed checkpoint",
+    )
+    parser.add_argument(
+        "--retry-seed",
+        action="append",
+        type=int,
+        help="explicitly retry this pending failed seed; may be supplied more than once",
+    )
+    parser.add_argument(
         "--stop", action="store_true", help="request a stop at the next trial boundary"
     )
     parser.add_argument("--max-runs", type=int)
@@ -344,6 +355,8 @@ def _run_research_cli(argv: list[str]) -> None:
         dataset_path=args.csv,
         research_id=args.research_id,
         resume=args.resume,
+        retry_failed_runs=args.retry_failed_runs,
+        retry_seeds=tuple(args.retry_seed) if args.retry_seed is not None else None,
         max_runs=args.max_runs,
         engines=tuple(args.engine or DEFAULT_ENGINES),
         pysr_config=pysr_config

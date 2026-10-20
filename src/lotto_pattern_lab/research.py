@@ -73,6 +73,20 @@ def dataset_digest(dataset: DrawDataset) -> str:
     ).hexdigest()
 
 
+def _pysr_config_for_attempt(
+    config: PySRConfig | None, research_id: str, seed: int, attempt: int
+) -> PySRConfig | None:
+    if config is None:
+        return None
+    run_directory = config.run_directory
+    if run_directory is None:
+        run_name = f"seed-{seed}" if config.warm_start else f"seed-{seed}-attempt-{attempt}"
+        run_directory = str(project_path("artifacts/pysr_runs") / research_id / run_name)
+    if not isinstance(run_directory, str):
+        raise TypeError("PySR run_directory must be a string path or None.")
+    return replace(config, seed=seed, run_directory=run_directory)
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path = project_path(path)
     content = (json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode(
@@ -197,6 +211,8 @@ def run_research_schedule(
     experiment_directory: str | Path = "experiments",
     pattern_database: str | Path = "data/database/patterns.sqlite",
     resume: bool = False,
+    retry_failed_runs: bool = False,
+    retry_seeds: tuple[int, ...] | None = None,
     max_runs: int | None = None,
     engines: tuple[str, ...] = DEFAULT_ENGINES,
     pysr_config: PySRConfig | None = None,
@@ -212,6 +228,10 @@ def run_research_schedule(
     """
     if duration_seconds <= 0:
         raise ValueError("Research duration must be positive.")
+    if (retry_failed_runs or retry_seeds is not None) and not resume:
+        raise ValueError("Retrying failed runs requires resume=True.")
+    if retry_failed_runs and retry_seeds is not None:
+        raise ValueError("Choose retry_failed_runs or retry_seeds, not both.")
     if max_runs is not None and max_runs < 1:
         raise ValueError("max_runs must be positive when provided.")
     if not engines or any(engine not in SUPPORTED_ENGINES for engine in engines):
@@ -236,7 +256,12 @@ def run_research_schedule(
     if resume:
         state = load_checkpoint(checkpoint)
         if state.get("status") == "completed":
-            raise ValueError("Cannot resume a completed research run.")
+            retryable_seeds = state.get("pending_retry_seeds", [])
+            if not (retry_failed_runs or retry_seeds is not None) or not retryable_seeds:
+                raise ValueError(
+                    "Cannot resume a completed research run without explicitly requesting "
+                    "retry_failed_runs for pending failed seeds."
+                )
         if not state.get("research_id"):
             raise ValueError(f"Cannot resume: checkpoint has no research_id: {checkpoint}")
         recorded_path = state.get("checkpoint_path")
@@ -424,6 +449,24 @@ def run_research_schedule(
         ),
     }
     previous_status = state.get("status")
+    if retry_failed_runs or retry_seeds is not None:
+        if previous_status != "completed":
+            raise ValueError("Explicit failed-seed retries require a completed checkpoint.")
+        retryable_seeds = state.get("pending_retry_seeds", [])
+        if not retryable_seeds:
+            raise ValueError("No pending failed seeds are available to retry.")
+        if retry_seeds is not None:
+            if len(set(retry_seeds)) != len(retry_seeds):
+                raise ValueError("retry_seeds cannot contain duplicates.")
+            unavailable = set(retry_seeds) - {int(seed) for seed in retryable_seeds}
+            if unavailable:
+                raise ValueError(
+                    "Seeds are not pending retries in this checkpoint: "
+                    f"{sorted(unavailable)}"
+                )
+        state["target_duration_seconds"] = float(state["total_elapsed_seconds"]) + float(
+            duration_seconds
+        )
     if resume and state.get("in_progress"):
         interrupted = dict(state["in_progress"])
         interrupted.update(
@@ -515,7 +558,18 @@ def run_research_schedule(
             store.directory,
         )
     state["pending_retry_seeds"] = pending_seeds
-    retry_queue = list(pending_seeds)
+    retry_queue = (
+        [int(seed) for seed in retry_seeds]
+        if retry_seeds is not None
+        else list(pending_seeds)
+    )
+    retry_engine_by_seed = {
+        int(item["seed"]): str(item["engine"])
+        for item in state.get("failed_runs", [])
+        if item.get("seed") is not None
+        and int(item["seed"]) in pending_seeds
+        and item.get("engine") in engines
+    }
     started = time.monotonic()
     elite_seeds = tuple(state.get("elite_seeding", {}).get("selected_patterns", ()))
     for failed in state["failed_runs"]:
@@ -544,9 +598,18 @@ def run_research_schedule(
             state["status"] = "completed"
             state["stop_reason"] = "run_count_reached"
             break
+        if retry_seeds is not None and not retry_queue:
+            state["status"] = "completed"
+            state["stop_reason"] = "selected_failed_seed_retries_completed"
+            break
         run_index = int(state["attempts"])
         retry_seed = retry_queue.pop(0) if retry_queue else None
         run_seed = retry_seed if retry_seed is not None else int(state["rng_resume"]["next_seed"])
+        engine_id = (
+            retry_engine_by_seed.get(retry_seed, engines[run_index % len(engines)])
+            if retry_seed is not None
+            else engines[run_index % len(engines)]
+        )
         run_config = replace(config, seed=run_seed)
         state["attempts"] = run_index + 1
         if retry_seed is None:
@@ -555,7 +618,7 @@ def run_research_schedule(
             "seed": run_config.seed,
             "attempt": state["attempts"],
             "research_id": state["research_id"],
-            "engine": engines[run_index % len(engines)],
+            "engine": engine_id,
             "feature_profile": config.feature_profile,
             "stage": "engine_start",
             "started_at": datetime.now(UTC).isoformat(),
@@ -569,7 +632,7 @@ def run_research_schedule(
                 event.get("stage") or event.get("run") or "experiment_running"
             )
             state["current_progress"] = {
-                "engine": engines[run_index % len(engines)],
+                "engine": engine_id,
                 "research_id": state["research_id"],
                 "run_index": run_index + 1,
                 "event": event,
@@ -587,26 +650,9 @@ def run_research_schedule(
                 progress(state["current_progress"])
 
         try:
-            engine = get_engine(engines[(run_index) % len(engines)])
-            trial_pysr_config = (
-                replace(
-                    pysr_config,
-                    seed=run_seed,
-                    run_directory=(
-                        pysr_config.run_directory
-                        or str(
-                            project_path("artifacts/pysr_runs")
-                            / str(state["research_id"])
-                            / (
-                                f"seed-{run_seed}"
-                                if pysr_config.warm_start
-                                else f"seed-{run_seed}-attempt-{state['attempts']}"
-                            )
-                        ),
-                    ),
-                )
-                if pysr_config is not None
-                else None
+            engine = get_engine(engine_id)
+            trial_pysr_config = _pysr_config_for_attempt(
+                pysr_config, str(state["research_id"]), run_seed, state["attempts"]
             )
             result = engine.run(
                 ResearchRunContext(
@@ -806,7 +852,7 @@ def run_research_schedule(
                     "attempt": state["attempts"],
                     "experiment_id": state.get("in_progress", {}).get("experiment_id"),
                     "research_id": state["research_id"],
-                    "engine": in_progress.get("engine", engines[run_index % len(engines)]),
+                    "engine": in_progress.get("engine", engine_id),
                     "feature_profile": in_progress.get("feature_profile", config.feature_profile),
                     "stage": in_progress.get("stage", progress_event.get("run", "engine_start")),
                     "failed_at": datetime.now(UTC).isoformat(),

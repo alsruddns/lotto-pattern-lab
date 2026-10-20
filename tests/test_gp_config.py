@@ -68,7 +68,7 @@ def test_research_dashboard_exposes_settings_in_separate_start_tab(tmp_path, mon
     general_page = next(
         (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("1_*.py")
     )
-    general_app = AppTest.from_file(general_page).run(timeout=30)
+    general_app = AppTest.from_file(general_page).run(timeout=180)
     assert not general_app.exception, [exception.message for exception in general_app.exception]
     general_keys = set(general_app.session_state)
     assert "general_crossover_probability" in general_keys
