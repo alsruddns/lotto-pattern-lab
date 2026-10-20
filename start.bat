@@ -37,15 +37,32 @@ if errorlevel 1 (
     exit /b 1
 )
 
-netstat -ano -p tcp | findstr /R /C:":8501 .*LISTENING" >nul
-if not errorlevel 1 (
-    echo Streamlit이 이미 8501 포트에서 실행 중입니다.
-    echo 기존 AI 패턴 연구실 화면을 엽니다: http://localhost:8501
-    start "" "http://localhost:8501"
-    echo 기존 실행을 유지합니다. 이 창은 키를 누르면 닫힙니다.
-    pause >nul
-    exit /b 0
-)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\check_streamlit_server.ps1" -ProjectRoot "%CD%" -Port 8501
+set "SERVER_GUARD_EXIT=%ERRORLEVEL%"
+if "%SERVER_GUARD_EXIT%"=="0" goto already_running
+if "%SERVER_GUARD_EXIT%"=="1" goto port_conflict
+if not "%SERVER_GUARD_EXIT%"=="2" goto server_check_failed
+goto start_server
+
+:already_running
+echo 기존 AI 패턴 연구실 화면을 엽니다: http://localhost:8501
+start "" "http://localhost:8501"
+echo 같은 프로젝트의 기존 서버를 유지합니다. 이 창은 키를 누르면 닫힙니다.
+pause >nul
+exit /b 0
+
+:port_conflict
+echo 8501 포트를 다른 프로젝트 또는 프로그램이 사용 중입니다.
+echo 해당 프로세스를 종료하지 않았습니다. 위의 실행 경로를 확인하세요.
+pause >nul
+exit /b 1
+
+:server_check_failed
+echo 8501 포트 상태를 확인하지 못했습니다. 기존 서버를 종료하거나 새 서버를 시작하지 않았습니다.
+pause >nul
+exit /b 1
+
+:start_server
 
 echo AI 패턴 연구실을 시작합니다. 서버를 종료하려면 Ctrl+C를 누르세요.
 "%PYTHON%" -m streamlit run "%APP%" --server.port 8501 --server.headless false
