@@ -114,3 +114,32 @@ def test_optimization_history_tab_state_survives_rerun() -> None:
     app.run(timeout=60)
     assert not app.exception, [exception.message for exception in app.exception]
     assert app.session_state["optimization_workspace_tab"] == history_label
+
+
+def test_live_research_status_is_at_top_and_rerun_preserves_controls(tmp_path) -> None:
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
+    )
+    root = Path(__file__).resolve().parents[1]
+    missing_checkpoint = root / "checkpoints" / "ui-test-missing-checkpoint.json"
+    app = AppTest.from_file(page)
+    app.session_state["monitor_research_checkpoint"] = str(missing_checkpoint)
+    app.session_state["research_launch_status"] = "first_checkpoint_waiting"
+    app.session_state["research_launch_started_at"] = "2026-10-20T12:00:00+00:00"
+    app.session_state["research_target_duration_seconds"] = 3600
+    app.run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert any(item.value == "연구 진행 현황" for item in app.subheader)
+    metrics = {item.label for item in app.metric}
+    assert {"누적 실행 시간", "남은 연구 시간", "현재 시드"} <= metrics
+    assert any(
+        "첫 체크포인트 저장 대기 중" in item.value for item in app.markdown
+    )
+    assert "연구 진행 상태" not in {item.value for item in app.subheader}
+    assert any(button.key == "refresh_research_status" for button in app.button)
+
+    app.number_input(key="new_seed").set_value(54321).run(timeout=60)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.number_input(key="new_seed").value == 54321
+    assert app.session_state["research_workspace_tab"] == "지속적 패턴 연구"

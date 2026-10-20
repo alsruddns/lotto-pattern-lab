@@ -478,6 +478,11 @@ def run_research_schedule(
         )
         state["failed_runs"].append(interrupted)
         state.pop("in_progress", None)
+    session_started_at = datetime.now(UTC)
+    state["session_started_at"] = session_started_at.isoformat()
+    state["session_elapsed_base_seconds"] = float(state.get("total_elapsed_seconds", 0.0))
+    state.pop("finished_at", None)
+    state.pop("session_finished_at", None)
     state["status"] = "running"
     state["worker_pid"] = os.getpid()
     state["started_at"] = state.get("started_at", datetime.now(UTC).isoformat())
@@ -912,6 +917,9 @@ def run_research_schedule(
         elapsed_this_session = time.monotonic() - started
         state["elapsed_seconds"] = elapsed_this_session
         state["total_elapsed_seconds"] = baseline_elapsed + elapsed_this_session
+        state["session_finished_at"] = datetime.now(UTC).isoformat()
+        if state["status"] in {"completed", "failed", "interrupted"}:
+            state["finished_at"] = state["session_finished_at"]
         _atomic_json(checkpoint, state)
         round_store.update(str(state["research_id"]), _round_metadata(state))
     if state.get("status") == "completed":

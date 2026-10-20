@@ -50,6 +50,11 @@ from lotto_pattern_lab.research_optimization_apply import (
 )
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
+from lotto_pattern_lab.research_time import (
+    checkpoint_status_label,
+    format_hhmmss,
+    research_time_snapshot,
+)
 from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 
 GP_PRESETS = {
@@ -437,56 +442,204 @@ except sqlite3.OperationalError as error:
     st.stop()
 
 
+monitor_path_text = st.session_state.get("monitor_research_checkpoint")
+resume_records = _resume_records(rounds)
+if not monitor_path_text:
+    discovered = next((item for item in resume_records if item.get("_worker_active")), None)
+    if discovered:
+        monitor_path_text = str(discovered["_path"])
+        st.session_state["monitor_research_checkpoint"] = monitor_path_text
+
+
 @st.fragment(run_every="5s")
 def render_top_research_status() -> None:
     st.subheader("연구 진행 현황")
-    monitor_path_text = st.session_state.get("monitor_research_checkpoint")
-    candidates = _resume_records(rounds)
-    active_item = next((item for item in candidates if item.get("_worker_active")), None)
-    if not monitor_path_text and active_item:
-        monitor_path_text = str(active_item["_path"])
-    if not monitor_path_text:
-        st.info("현재 실행 중인 연구가 없습니다. 이 패널은 5초마다 갱신됩니다.")
+    st.caption("이 영역만 5초마다 자동 갱신됩니다.")
+    monitor_text = st.session_state.get("monitor_research_checkpoint")
+    phase = st.session_state.get("research_launch_status")
+    if not monitor_text:
+        phase_labels = {
+            "environment_checking": "연구 환경 검사 중",
+            "environment_passed": "연구 환경 검사 통과 · 실행 대기 중",
+            "background_starting": "백그라운드 연구 시작 중",
+            "process_verifying": "연구 프로세스 실행 확인 중",
+            "start_failed": "연구 프로세스 시작 실패",
+        }
+        label = phase_labels.get(phase, "실행 중인 연구가 없습니다.")
+        st.info(label)
+        if phase in {"background_starting", "process_verifying"}:
+            st.caption("프로세스와 첫 체크포인트를 확인하고 있습니다.")
+        if st.button("상태 새로고침", key="refresh_research_status_empty"):
+            st.rerun(scope="fragment")
         return
-    monitor_path = project_path(monitor_path_text)
-    if not monitor_path.is_relative_to(PROJECT_ROOT) or not monitor_path.is_file():
-        st.warning("개발 환경의 체크포인트를 찾을 수 없습니다.")
+
+    monitor_path = project_path(monitor_text)
+    if not monitor_path.is_relative_to(PROJECT_ROOT):
+        st.error("공식 프로젝트 밖의 체크포인트 경로는 표시하지 않습니다.")
         return
-    try:
-        monitor = load_checkpoint(monitor_path)
-    except (OSError, ValueError) as error:
-        st.error(f"체크포인트를 읽지 못했습니다: {error}")
-        return
-    elapsed = float(monitor.get("total_elapsed_seconds", monitor.get("elapsed_seconds", 0)))
-    target = float(monitor.get("target_duration_seconds", 0))
-    remaining = max(0.0, target - elapsed) if target else None
-    progress = min(1.0, elapsed / target) if target else 0.0
-    current = monitor.get("in_progress", {})
-    engine_names = {
-        "intermittent_gp": "GP",
-        "pysr_symbolic_regression": "PySR",
-    }
-    engines = [engine_names.get(value, value) for value in monitor.get("engines", [])]
-    cols = st.columns(5)
-    cols[0].metric("연구 상태", str(monitor.get("status", "미수집")))
-    cols[1].metric("완료 실험", format_count(monitor.get("completed_runs", 0)))
-    cols[2].metric("실패 실험", format_count(len(monitor.get("failed_runs", []))))
-    cols[3].metric("실행 엔진", ", ".join(engines) or "미수집")
-    cols[4].metric(
-        "누적 / 남은 시간",
-        f"{format_duration(elapsed)} / {format_duration(remaining)}",
+    checkpoint_saved = monitor_path.is_file()
+    worker_active = _worker_active(monitor_path)
+    global_worker_active = research_worker_active()
+    if checkpoint_saved:
+        try:
+            monitor = load_checkpoint(monitor_path)
+        except (OSError, ValueError) as error:
+            st.error(f"체크포인트를 읽지 못했습니다: {error}")
+            return
+        elapsed, remaining = research_time_snapshot(monitor, worker_active=worker_active)
+        target = float(monitor.get("target_duration_seconds", 0) or 0)
+        progress = min(1.0, elapsed / target) if target > 0 else 0.0
+        current = monitor.get("in_progress") or {}
+        summary = monitor.get("dashboard_summary") or {}
+        failed = summary.get(
+            "failed_experiment_count",
+            sum(
+                not item.get("resolved_by_experiment_id")
+                for item in monitor.get("failed_runs", [])
+            ),
+        )
+        completed = int(monitor.get("completed_runs", 0))
+        engine_names = {
+            "intermittent_gp": "GP",
+            "pysr_symbolic_regression": "PySR",
+        }
+        engine = (
+            current.get("engine")
+            or monitor.get("last_run_summary", {}).get("engine")
+            or (monitor.get("engines") or [None])[0]
+        )
+        engine_label = engine_names.get(engine, engine or "확인 중")
+        state_labels = {
+            "queued": "대기 중",
+            "running": "연구 실행 중" if worker_active else "프로세스 확인 필요",
+            "pause_requested": "일시 정지 요청 중",
+            "paused": "일시 정지",
+            "completed": "완료 (실패 실험 포함)" if failed else "완료",
+            "failed": "실패",
+            "interrupted": "중단",
+        }
+        status = state_labels.get(monitor.get("status"), str(monitor.get("status", "확인 중")))
+        if monitor.get("status") == "running" and not worker_active:
+            status = "중단 가능성 · 연구 프로세스가 확인되지 않음"
+        seed = current.get("seed")
+        if seed is None and monitor.get("status") in {"running", "pause_requested"}:
+            seed = monitor.get("rng_resume", {}).get("next_seed")
+        seed = seed if seed is not None else "—"
+        event = monitor.get("current_progress", {}).get("event", {})
+        stage = (
+            event.get("stage") or event.get("run")
+            if isinstance(event, dict)
+            else None
+        ) or current.get("stage") or "실험 경계 대기"
+        progress_time = f"시간 제한 진행률 · {progress:.1%}" if target > 0 else "시간 제한 없음"
+    else:
+        launch_state = {
+            "environment_checking": "연구 환경 검사 중",
+            "environment_passed": "연구 환경 검사 통과 · 실행 대기 중",
+            "background_starting": "백그라운드 연구 시작 중",
+            "process_verifying": "연구 프로세스 실행 확인 중",
+            "first_checkpoint_waiting": "연구 프로세스 실행 확인 · 첫 체크포인트 저장 대기 중",
+            "start_unconfirmed": "시작 요청 전달 · 프로세스 확인 대기 중",
+            "start_failed": "연구 프로세스 시작 실패 · 체크포인트 미저장",
+        }
+        status = launch_state.get(phase, "첫 체크포인트 저장 대기 중")
+        launch_started = st.session_state.get("research_launch_started_at")
+        launch_target = st.session_state.get("research_target_duration_seconds")
+        elapsed, remaining = research_time_snapshot(
+            {
+                "status": "running",
+                "session_started_at": launch_started,
+                "session_elapsed_base_seconds": 0,
+                "target_duration_seconds": launch_target,
+            }
+        )
+        target = float(launch_target or 0)
+        progress = min(1.0, elapsed / target) if target > 0 else 0.0
+        completed = 0
+        failed = 0
+        engine_label = st.session_state.get("research_launch_engine", "확인 중")
+        seed = st.session_state.get("research_launch_seed", "—")
+        stage = status
+        progress_time = f"시간 제한 진행률 · {progress:.1%}" if target > 0 else "시간 제한 없음"
+        monitor = {}
+
+    st.markdown(f"### {status}")
+    stats = st.columns(4)
+    stats[0].metric("완료 실험", format_count(completed))
+    stats[1].metric("실패 실험", format_count(failed))
+    stats[2].metric("실행 엔진", engine_label)
+    stats[3].metric(
+        "현재 시드", format_count(seed) if isinstance(seed, (int, float)) else str(seed)
+    )
+    times = st.columns(2)
+    times[0].metric("누적 실행 시간", format_hhmmss(elapsed))
+    times[1].metric(
+        "남은 연구 시간",
+        format_hhmmss(remaining) if remaining is not None else "시간 제한 없음",
     )
     st.progress(progress)
-    progress_event = monitor.get("current_progress", {}).get("event", {})
-    detail = ""
-    if isinstance(progress_event, dict):
-        detail = progress_event.get("stage") or progress_event.get("run") or ""
-    st.caption(
-        f"현재 시드: "
-        f"{current.get('seed', monitor.get('rng_resume', {}).get('next_seed', '미수집'))} · "
-        f"마지막 체크포인트: {monitor.get('last_updated_at', '미수집')} · "
-        f"단계: {detail or '실험 경계 대기'} · {monitor_path}"
+    st.caption(progress_time)
+
+    details = st.columns(2)
+    details[0].write(f"현재 단계: {stage}")
+    details[1].write(
+        f"체크포인트: {checkpoint_status_label(checkpoint_saved, monitor.get('last_updated_at'))}"
     )
+
+    research_id = monitor.get("research_id") or st.session_state.get("research_launch_id")
+    pid = monitor.get("worker_pid") or st.session_state.get("research_launch_pid")
+    with st.expander("연구 실행 상세 정보", expanded=False):
+        st.write(f"연구 ID: {research_id or '확인 중'}")
+        st.write(f"PID: {pid or '확인 중'}")
+        st.write(f"체크포인트 경로: {monitor_path}")
+        st.write(f"프로세스 실행 확인: {'예' if worker_active else '아니오'}")
+        st.write(f"연구 실행 슬롯: {'점유 중' if global_worker_active else '사용 가능'}")
+        if checkpoint_saved and monitor.get("report_path"):
+            st.write(f"최종 연구 결과: {monitor['report_path']}")
+        if checkpoint_saved and monitor.get("status") in {"completed", "failed", "paused"}:
+            st.write(f"최종 상태: {status}")
+            st.write(f"최종 실행 시간: {format_hhmmss(elapsed)}")
+            st.write(f"완료 실험: {format_count(completed)} · 실패 실험: {format_count(failed)}")
+    if checkpoint_saved and monitor.get("status") in {"completed", "failed"}:
+        with st.expander("연구 결과 보기", expanded=False):
+            st.write(f"최종 상태: {status}")
+            st.write(f"실제 총 실행 시간: {format_hhmmss(elapsed)}")
+            st.write(f"완료 실험: {format_count(completed)} · 실패 실험: {format_count(failed)}")
+            experiments = monitor.get("completed_experiments", [])
+            if experiments:
+                st.dataframe(
+                    [
+                        {
+                            "시드": item.get("seed"),
+                            "상태": item.get("status", "completed"),
+                            "실험 ID": item.get("experiment_id"),
+                        }
+                        for item in experiments
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
+            if monitor.get("report_path"):
+                st.write(f"연구 보고서: {monitor['report_path']}")
+    actions = st.columns(2)
+    if actions[0].button("상태 새로고침", key="refresh_research_status"):
+        st.rerun(scope="fragment")
+    pause_pending = checkpoint_saved and pause_request_path(monitor_path).is_file()
+    if (
+        checkpoint_saved
+        and monitor.get("status") == "running"
+        and worker_active
+        and not pause_pending
+    ):
+        if actions[1].button("연구 일시 정지", key="request_research_pause"):
+            try:
+                request_pause(monitor_path)
+                st.info(PAUSE_MESSAGE)
+                st.rerun(scope="fragment")
+            except (OSError, ValueError, LockTimeoutError) as error:
+                st.error(f"일시 정지 요청을 저장하지 못했습니다: {error}")
+    elif pause_pending or (checkpoint_saved and monitor.get("status") == "pause_requested"):
+        actions[1].info(PAUSE_MESSAGE)
 
 
 render_top_research_status()
@@ -1214,6 +1367,7 @@ with new_tab:
         elite_seeds = ()
 
     if preflight_submitted or (submitted and not preflight_ready):
+        st.session_state["research_launch_status"] = "environment_checking"
         if new_dataset is None or effective_config is None or invalid_profile:
             report = {
                 "status": "failed",
@@ -1249,6 +1403,9 @@ with new_tab:
         st.session_state["research_preflight_report"] = report
         st.session_state["research_preflight_input_key"] = preflight_disk_key
         st.session_state["research_preflight_checked_at"] = datetime.now(UTC).isoformat()
+        st.session_state["research_launch_status"] = (
+            "environment_passed" if report.get("status") == "passed" else "start_failed"
+        )
         try:
             save_preflight_cache(preflight_disk_key, report)
         except OSError as error:
@@ -1300,12 +1457,20 @@ with new_tab:
             checkpoint_path = checkpoint_dir / (
                 f"research_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"
             )
+            st.session_state["research_launch_status"] = "environment_checking"
             try:
                 _validate_live_research_start(checkpoint_dir, csv_path, new_dataset)
             except (OSError, RuntimeError, ValueError) as error:
+                st.session_state["research_launch_status"] = "start_failed"
                 st.error(f"실행 직전 환경 확인 실패: {error}")
                 st.stop()
+            st.session_state["research_launch_status"] = "environment_passed"
             research_id = str(uuid.uuid4())
+            st.session_state["research_launch_id"] = research_id
+            st.session_state["research_launch_engine"] = engine_choice
+            st.session_state["research_launch_seed"] = effective_config.seed
+            st.session_state["research_launch_started_at"] = datetime.now(UTC).isoformat()
+            st.session_state["research_target_duration_seconds"] = float(duration_minutes) * 60
             created_at = datetime.now(UTC).isoformat()
             research_round = rounds.ensure_round(
                 research_id,
@@ -1359,6 +1524,7 @@ with new_tab:
                 candidate_replay_threshold=int(candidate_replay_threshold),
             )
             try:
+                st.session_state["research_launch_status"] = "background_starting"
                 with st.status("연구 작업을 시작하고 있습니다.", expanded=True) as start_status:
                     st.write("연구 설정과 최적화 출처를 저장했습니다.")
                     st.write("백그라운드 연구 프로세스를 시작하는 중입니다.")
@@ -1366,6 +1532,8 @@ with new_tab:
                         command, checkpoint_path, checkpoint_dir / "research_worker.log"
                     )
                     st.session_state["monitor_research_checkpoint"] = str(checkpoint_path)
+                    st.session_state["research_launch_pid"] = pid
+                    st.session_state["research_launch_status"] = "process_verifying"
                     started = False
                     for _ in range(20):
                         if _worker_active(checkpoint_path):
@@ -1373,6 +1541,7 @@ with new_tab:
                             break
                         time.sleep(0.1)
                     if started:
+                        st.session_state["research_launch_status"] = "first_checkpoint_waiting"
                         started_at = datetime.now(UTC).isoformat()
                         origin = None
                         if optimization_context:
@@ -1418,6 +1587,7 @@ with new_tab:
                             f"{engine_choice} · {profile_names[profile]} · {duration_minutes:,}분"
                         )
                     else:
+                        st.session_state["research_launch_status"] = "start_unconfirmed"
                         start_status.update(
                             label="실행 요청 전달됨 · 시작 확인 중", state="running"
                         )
@@ -1427,6 +1597,7 @@ with new_tab:
                             "잠시 후 상태를 확인하세요."
                         )
             except (OSError, RuntimeError) as error:
+                st.session_state["research_launch_status"] = "start_failed"
                 rounds.update(
                     research_id,
                     {
@@ -1443,7 +1614,7 @@ with new_tab:
                 st.error(f"연구 워커를 시작하지 못했습니다: {error}")
 
 with resume_tab:
-    resume_items = _resume_records(rounds)
+    resume_items = resume_records
     if not resume_items:
         st.info("이어 실행할 수 있는 paused, failed, interrupted 연구가 없습니다.")
         selected_resume = None
@@ -1566,71 +1737,6 @@ with resume_tab:
                 st.rerun()
             except (OSError, RuntimeError) as error:
                 st.error(f"연구를 재개하지 못했습니다: {error}")
-
-monitor_path_text = st.session_state.get("monitor_research_checkpoint")
-if not monitor_path_text:
-    active_item = next((item for item in resume_items if item.get("_worker_active")), None)
-    if active_item:
-        monitor_path_text = str(active_item["_path"])
-if monitor_path_text:
-    monitor_path = project_path(monitor_path_text)
-    st.divider()
-    st.subheader("연구 진행 상태")
-    if monitor_path.is_file():
-        try:
-            monitor = load_checkpoint(monitor_path)
-        except (OSError, ValueError) as error:
-            st.error(f"체크포인트를 읽지 못했습니다: {error}")
-        else:
-            elapsed = float(monitor.get("total_elapsed_seconds", monitor.get("elapsed_seconds", 0)))
-            target = float(monitor.get("target_duration_seconds", 0))
-            remaining = max(0.0, target - elapsed) if target else None
-            completed = int(monitor.get("completed_runs", 0))
-            attempts = int(monitor.get("attempts", 0))
-            cols = st.columns(4)
-            cols[0].metric(
-                "회차 / 상태", f"{monitor.get('research_round', '?')} / {monitor.get('status')}"
-            )
-            cols[1].metric(
-                "현재 시드",
-                monitor.get("in_progress", {}).get(
-                    "seed", monitor.get("rng_resume", {}).get("next_seed", "—")
-                ),
-            )
-            cols[2].metric("완료 / 실패", f"{completed} / {len(monitor.get('failed_runs', []))}")
-            cols[3].metric(
-                "누적 / 남은 시간",
-                f"{elapsed / 60:.1f} / {remaining / 60:.1f}분"
-                if remaining is not None
-                else f"{elapsed / 60:.1f}분",
-            )
-            progress_event = monitor.get("current_progress", {}).get("event", {})
-            st.write(f"현재 단계: {progress_event or '실험 경계 대기'}")
-            st.progress(min(1.0, elapsed / target) if target else 0.0)
-            st.caption(f"완료 실험 {completed}; 시도 {attempts}")
-            st.caption(f"마지막 저장: {monitor.get('last_updated_at', '미수집')}")
-            last_error = monitor.get("failed_runs", [])
-            st.caption(f"마지막 오류: {last_error[-1].get('error') if last_error else '없음'}")
-            pause_pending = pause_request_path(monitor_path).is_file()
-            if monitor.get("status") == "running" and not pause_pending:
-                if st.button("일시정지", key="request_research_pause"):
-                    try:
-                        request_pause(monitor_path)
-                        st.info(PAUSE_MESSAGE)
-                        st.rerun()
-                    except (OSError, ValueError, LockTimeoutError) as error:
-                        st.error(f"일시정지 요청을 저장하지 못했습니다: {error}")
-            elif (
-                monitor.get("status") == "pause_requested"
-                or pause_request_path(monitor_path).exists()
-            ):
-                st.info(PAUSE_MESSAGE)
-            elif monitor.get("status") == "paused":
-                st.success("일시정지되었습니다. ‘기존 연구 이어서 하기’에서 재개할 수 있습니다.")
-    else:
-        st.info(f"첫 체크포인트 저장을 기다리는 중: {monitor_path}")
-    if st.button("상태 새로고침", key="refresh_research_status"):
-        st.rerun()
 
 st.divider()
 st.subheader("패턴 라이브러리")
