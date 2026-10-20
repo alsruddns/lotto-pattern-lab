@@ -22,6 +22,7 @@ from .pysr_backend import PySRConfig
 from .research import DEFAULT_ENGINES, SUPPORTED_ENGINES, request_stop, run_research_schedule
 from .research_optimization import optimize_gp
 from .storage import ExperimentStore
+from .tabular_models import run_tabular_model
 
 GP_DEFAULTS = GPConfig()
 
@@ -41,6 +42,9 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "optimize":
         _run_optimization_cli(sys.argv[2:])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "model":
+        _run_model_cli(sys.argv[2:])
         return
     _run_draw_cli(sys.argv[1:])
 
@@ -394,6 +398,46 @@ def _run_optimization_cli(argv: list[str]) -> None:
             progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+def _run_model_cli(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        description="Run one optional supervised six-number baseline model."
+    )
+    parser.add_argument("--csv", required=True)
+    parser.add_argument("--model", choices=("random_forest", "xgboost", "torch_mlp"), required=True)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=GP_DEFAULTS.seed)
+    parser.add_argument("--max-lag", type=int, default=10)
+    args = parser.parse_args(argv)
+    result = run_tabular_model(
+        load_csv(project_path(args.csv)),
+        args.model,
+        config=IntermittentConfig(
+            workers=min(max(1, args.workers), 4),
+            seed=args.seed,
+            max_lag=args.max_lag,
+            control_runs=0,
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                key: result[key]
+                for key in (
+                    "experiment_id",
+                    "engine",
+                    "model_path",
+                    "training_seconds",
+                    "validation",
+                    "independent_test",
+                    "split_rounds",
+                )
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

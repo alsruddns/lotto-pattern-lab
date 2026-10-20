@@ -38,6 +38,11 @@ from lotto_pattern_lab.research_features import (
 )
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
 from lotto_pattern_lab.storage import ExperimentStore
+from lotto_pattern_lab.tabular_models import (
+    evaluate_weighted_ensemble,
+    run_tabular_model,
+    validation_ensemble_weights,
+)
 
 
 def _dated_dataset(length: int = 35) -> DrawDataset:
@@ -48,6 +53,76 @@ def _dated_dataset(length: int = 35) -> DrawDataset:
         for index, record in enumerate(source.records)
     )
     return DrawDataset(records, "synthetic", "Synthetic numbers with explicit date fixtures.")
+
+
+def test_random_forest_baseline_uses_chronological_splits_and_saves_model(tmp_path) -> None:
+    from lotto_pattern_lab.tabular_models import model_availability
+
+    if not model_availability()["random_forest"]["available"]:
+        pytest.skip("scikit-learn is an optional dependency")
+    result = run_tabular_model(
+        _dated_dataset(48),
+        "random_forest",
+        config=IntermittentConfig(
+            workers=1,
+            seed=27,
+            max_lag=4,
+            train_ratio=0.6,
+            validation_ratio=0.2,
+        ),
+        directory=tmp_path / "model-experiments",
+        model_directory=tmp_path / "models",
+    )
+
+    assert result["target_type"] == "six_number_set"
+    assert result["split_rounds"]["test_used_for_selection"] is False
+    assert Path(result["model_path"]).is_file()
+    assert result["independent_test"]["evaluation_round_count"] > 0
+    assert all(
+        len(row["predicted_numbers"]) == 6
+        for row in result["independent_test"]["predictions"]
+    )
+    assert all(len(row["number_scores"]) == 45 for row in result["validation"]["predictions"])
+
+
+def test_ensemble_weights_come_from_validation_and_test_rounds_are_not_tuned() -> None:
+    def predictions(round_number: int, scores: list[float]) -> dict:
+        numbers = sorted((np.argsort(scores, kind="stable")[-6:] + 1).tolist())
+        return {
+            "round_number": round_number,
+            "predicted_numbers": numbers,
+            "winning_numbers": [1, 2, 3, 4, 5, 6],
+            "number_scores": scores,
+        }
+
+    import numpy as np
+
+    scores_a = [float(45 - value) for value in range(45)]
+    scores_b = [float(value) for value in range(45)]
+    model_results = {
+        "random_forest": {
+            "validation": {
+                "average_hits": 2.0,
+                "predictions": [predictions(10, scores_a)],
+            },
+            "independent_test": {"predictions": [predictions(20, scores_a)]},
+        },
+        "xgboost": {
+            "validation": {
+                "average_hits": 1.0,
+                "predictions": [predictions(10, scores_b)],
+            },
+            "independent_test": {"predictions": [predictions(20, scores_b)]},
+        },
+    }
+
+    weights = validation_ensemble_weights(model_results)
+    test_result = evaluate_weighted_ensemble(model_results, weights)
+
+    assert weights == {"random_forest": pytest.approx(2 / 3), "xgboost": pytest.approx(1 / 3)}
+    assert test_result["weight_selection_phase"] == "validation"
+    assert test_result["independent_test_used_for_weight_selection"] is False
+    assert test_result["evaluation_round_count"] == 1
 
 
 def test_calendar_round_features_require_dates_and_use_known_target_date() -> None:

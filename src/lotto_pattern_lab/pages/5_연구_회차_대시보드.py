@@ -34,6 +34,7 @@ from lotto_pattern_lab.research_rounds import (
     rebuild_dashboard_summary_from_store,
 )
 from lotto_pattern_lab.storage import ExperimentStore
+from lotto_pattern_lab.tabular_models import model_availability
 
 st.set_page_config(page_title="연구 회차 대시보드", layout="wide")
 st.title("연구 회차 대시보드")
@@ -417,6 +418,60 @@ else:
         hide_index=True,
         width="stretch",
     )
+    st.markdown("#### 추가 기계학습 기준 모델")
+    availability_rows = []
+    for model_id, model_label in (
+        ("random_forest", "Random Forest"),
+        ("xgboost", "XGBoost"),
+        ("torch_mlp", "PyTorch MLP"),
+    ):
+        model_state = model_availability()[model_id]
+        availability_rows.append(
+            {
+                "모델": model_label,
+                "설치 상태": "사용 가능" if model_state["available"] else "선택 의존성 미설치",
+                "설치 선택 항목": model_state["install_extra"],
+            }
+        )
+    st.dataframe(availability_rows, hide_index=True, width="stretch")
+    st.caption(
+        "추가 기준 모델은 45개 번호의 출현 여부 점수를 학습해 상위 6개를 출력합니다. "
+        "훈련과 검증으로 설정을 정하고 독립 테스트는 최종 평가에만 사용합니다."
+    )
+    model_result_paths = sorted(
+        project_path("experiments/model_comparisons").glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:100]
+    model_result_rows = []
+    for path in model_result_paths:
+        try:
+            import json
+
+            record = json.loads(path.read_text(encoding="utf-8"))
+            test = record.get("independent_test", {})
+            model_result_rows.append(
+                {
+                    "실험 ID": record.get("experiment_id"),
+                    "모델": record.get("engine"),
+                    "평가 회차": test.get("evaluation_round_count"),
+                    "평균 적중": test.get("average_hits"),
+                    "3개 이상": test.get("at_least_3"),
+                    "4개 이상": test.get("at_least_4"),
+                    "5개 이상": test.get("at_least_5"),
+                    "6개 일치": test.get("exactly_6"),
+                    "독립 테스트 사용": "최종 평가만",
+                }
+            )
+        except (OSError, ValueError):
+            continue
+    if model_result_rows:
+        st.dataframe(model_result_rows, hide_index=True, width="stretch")
+    else:
+        st.info(
+            "저장된 추가 모델 비교가 없습니다. "
+            "선택형 모델 실행 기록은 기존 GP 기록과 분리됩니다."
+        )
     st.markdown("#### 실제 데이터와 무작위 대조 성능 분포")
     completed_ids = list(selected.get("completed_experiment_ids", []))
     if completed_ids:
