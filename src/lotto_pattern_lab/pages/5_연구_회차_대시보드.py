@@ -1,5 +1,6 @@
 """Research-round list, detailed research results, and ChatGPT report export."""
 
+import sqlite3
 from statistics import median
 
 import plotly.graph_objects as go
@@ -33,8 +34,24 @@ from lotto_pattern_lab.research_rounds import (
     paired_comparison_summary,
     rebuild_dashboard_summary_from_store,
 )
+from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 from lotto_pattern_lab.storage import ExperimentStore
 from lotto_pattern_lab.tabular_models import model_availability
+
+
+def _stop_on_database_error(operation: str, error: sqlite3.OperationalError) -> None:
+    database = project_path("data/database/patterns.sqlite")
+    log_database_failure(operation, database, error)
+    if is_database_locked(error):
+        st.error("연구 데이터베이스가 다른 저장 작업에서 사용 중입니다.")
+    else:
+        st.error("연구 데이터베이스를 읽거나 저장하지 못했습니다.")
+    st.caption("화면 상태와 연구 기록은 유지됩니다. 잠시 뒤 다시 시도할 수 있습니다.")
+    st.code(str(error), language="text")
+    if st.button("대시보드 데이터 다시 불러오기", key=f"retry_{operation}"):
+        st.rerun()
+    st.stop()
+
 
 st.set_page_config(page_title="연구 회차 대시보드", layout="wide")
 st.title("연구 회차 대시보드")
@@ -129,10 +146,13 @@ def _feature_rows(formulas: list[str], profile: str, max_lag: int) -> list[dict[
 
 checkpoint_directory = project_path("checkpoints")
 experiment_directory = project_path("experiments")
-rounds_store = ResearchRoundStore()
-pattern_library = PatternLibrary()
-rounds_store.migrate_legacy(checkpoint_directory, experiment_directory)
-rounds = rounds_store.list()
+try:
+    rounds_store = ResearchRoundStore()
+    pattern_library = PatternLibrary()
+    rounds_store.migrate_legacy(checkpoint_directory, experiment_directory)
+    rounds = rounds_store.list()
+except sqlite3.OperationalError as error:
+    _stop_on_database_error("research_dashboard_initialization", error)
 
 
 def _hit_total(summary: dict, metric: str) -> int | str:
@@ -205,7 +225,10 @@ def hydrate_round(
         with st.spinner("실험 상세 기록에서 회차 통계를 다시 계산하고 있습니다..."):
             summary = rebuild_dashboard_summary_from_store(hydrated, experiment_directory)
         hydrated["dashboard_summary"] = summary
-    pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
+    try:
+        pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
+    except sqlite3.OperationalError as error:
+        _stop_on_database_error("research_pattern_count_lookup", error)
     summary.update(pattern_counts)
     summary["registration_metrics_available"] = True
     summary["registration_count_source"] = "pattern_library"
@@ -213,7 +236,10 @@ def hydrate_round(
         summary["exact_match_count"] = len(hydrated.get("discovered_exact_matches", []))
     if reaggregate:
         summary["summary_schema_version"] = SUMMARY_SCHEMA_VERSION
-        rounds_store.update(str(hydrated["research_id"]), {"dashboard_summary": summary})
+        try:
+            rounds_store.update(str(hydrated["research_id"]), {"dashboard_summary": summary})
+        except sqlite3.OperationalError as error:
+            _stop_on_database_error("research_dashboard_summary_update", error)
     hydrated["experiment_summaries"] = summary.get("experiment_summaries", [])
     return hydrated
 
@@ -863,6 +889,8 @@ else:
             )
             try:
                 pattern_detail = pattern_library.get_pattern(selected_pattern_id)
+            except sqlite3.OperationalError as error:
+                _stop_on_database_error("pattern_detail_lookup", error)
             except KeyError:
                 pattern_detail = next(
                     (

@@ -7,6 +7,7 @@ import io
 import json
 import re
 import runpy
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from lotto_pattern_lab.research_optimization_apply import (
     OPTUNA_TO_RESEARCH_KEYS,
     validate_optimization_compatibility,
 )
+from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 
 st.set_page_config(page_title="지속적 패턴 연구", layout="wide")
 _pending_optimization = st.session_state.pop("optimization_apply_pending", None)
@@ -49,10 +51,24 @@ research_tab, optimization_tab = st.tabs(
     on_change="rerun",
 )
 with research_tab:
-    _continuous_runtime = runpy.run_path(
-        str(PROJECT_ROOT / "src/lotto_pattern_lab/continuous_research_view.py"),
-        run_name="lotto_pattern_lab_continuous_research_view",
-    )
+    try:
+        _continuous_runtime = runpy.run_path(
+            str(PROJECT_ROOT / "src/lotto_pattern_lab/continuous_research_view.py"),
+            run_name="lotto_pattern_lab_continuous_research_view",
+        )
+    except sqlite3.OperationalError as error:
+        log_database_failure(
+            "continuous research page render", "data/database/patterns.sqlite", error
+        )
+        if is_database_locked(error):
+            st.error("연구 데이터베이스가 다른 작업에서 잠겨 있습니다.")
+        else:
+            st.error("연구 데이터베이스 처리 중 오류가 발생했습니다.")
+        st.caption("저장된 연구 상태는 유지됩니다. 상세 오류를 확인한 뒤 다시 시도하세요.")
+        st.code(str(error), language="text")
+        if st.button("연구 화면 다시 불러오기", key="retry_continuous_page_database"):
+            st.rerun()
+        st.stop()
 globals().update(
     {
         name: _continuous_runtime[name]

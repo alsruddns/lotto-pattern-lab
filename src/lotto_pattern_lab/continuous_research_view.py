@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ from lotto_pattern_lab.research_optimization_apply import (
 )
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
+from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 
 GP_PRESETS = {
     30: {"population": 32, "generations": 10, "max_depth": 5, "controls": 3},
@@ -418,7 +420,21 @@ st.caption(
 
 checkpoint_dir = project_path("checkpoints")
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
-rounds = ResearchRoundStore()
+try:
+    rounds = ResearchRoundStore()
+except sqlite3.OperationalError as error:
+    log_database_failure(
+        "continuous research initialization", "data/database/patterns.sqlite", error
+    )
+    if is_database_locked(error):
+        st.error("연구 기록 데이터베이스가 다른 저장 작업에서 사용 중입니다.")
+    else:
+        st.error("연구 기록 데이터베이스를 열지 못했습니다.")
+    st.caption("연구 상태는 유지됩니다. 잠시 뒤 다시 시도하거나 상세 오류를 확인하세요.")
+    st.code(str(error), language="text")
+    if st.button("데이터베이스 연결 다시 시도", key="retry_continuous_database"):
+        st.rerun()
+    st.stop()
 
 
 @st.fragment(run_every="5s")
@@ -1172,7 +1188,15 @@ with new_tab:
             hide_index=True,
             width="stretch",
         )
-        library = PatternLibrary()
+        try:
+            library = PatternLibrary()
+        except sqlite3.OperationalError as error:
+            log_database_failure("research pattern preview", "data/database/patterns.sqlite", error)
+            st.error("수식 라이브러리 데이터베이스가 사용 중이어서 미리보기를 불러오지 못했습니다.")
+            st.code(str(error), language="text")
+            if st.button("미리보기 다시 시도", key="retry_pattern_preview"):
+                st.rerun()
+            st.stop()
         preview: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
         if elite_enabled:
@@ -1610,7 +1634,20 @@ if monitor_path_text:
 
 st.divider()
 st.subheader("패턴 라이브러리")
-patterns = PatternLibrary().list_patterns()
+try:
+    patterns = PatternLibrary().list_patterns()
+except sqlite3.OperationalError as error:
+    log_database_failure(
+        "continuous research pattern listing", "data/database/patterns.sqlite", error
+    )
+    if is_database_locked(error):
+        st.error("수식 라이브러리가 다른 저장 작업에서 사용 중입니다. 잠시 후 다시 불러오세요.")
+    else:
+        st.error("수식 라이브러리를 불러오지 못했습니다.")
+    st.code(str(error), language="text")
+    if st.button("수식 라이브러리 다시 시도", key="retry_pattern_library_listing"):
+        st.rerun()
+    st.stop()
 if patterns:
     selected_profile = st.selectbox(
         "프로파일 필터",

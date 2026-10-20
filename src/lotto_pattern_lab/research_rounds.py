@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import statistics
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from .presentation import (
     format_probability,
     pretty_formula,
 )
+from .sqlite_support import retry_sqlite_operation, run_with_busy_retry
 from .storage import ExperimentStore
 
 SUMMARY_SCHEMA_VERSION = 2
@@ -108,7 +111,54 @@ class ResearchRoundStore:
     def __init__(self, database: str | Path = "data/database/patterns.sqlite") -> None:
         self.path = project_path(database)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if run_with_busy_retry(
+            "check research round schema", self.path, self._schema_needs_initialization
+        ):
+            run_with_busy_retry(
+                "research round schema initialization", self.path, self._initialize_schema
+            )
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path, timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=2000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _schema_needs_initialization(self) -> bool:
         with self._connect() as connection:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            indexes = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            return not {
+                "research_rounds",
+                "research_round_experiments",
+                "research_round_migrations",
+            } <= tables or not {
+                "research_rounds_created_idx",
+                "research_round_experiments_research_idx",
+            } <= indexes
+
+    def _initialize_schema(self) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS research_rounds (
                     round_number INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,12 +188,6 @@ class ResearchRoundStore:
                     applied_at TEXT NOT NULL
                 )"""
             )
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
 
     @staticmethod
     def _sync_experiments(
@@ -188,6 +232,7 @@ class ResearchRoundStore:
             "experiment_ids",
             "next_seed",
             "dashboard_summary",
+            "optimization_origin",
             "failed_run_summary",
             "failed_runs",
             "discovered_exact_matches",
@@ -224,29 +269,51 @@ class ResearchRoundStore:
     def migrate_legacy(
         self, checkpoint_directory: str | Path, experiment_directory: str | Path
     ) -> None:
+        if run_with_busy_retry(
+            "check legacy research-round migration", self.path, self._legacy_migration_complete
+        ):
+            return
         candidates = legacy_research_records(checkpoint_directory, experiment_directory)
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            migrated = connection.execute(
-                "SELECT 1 FROM research_round_migrations WHERE migration_key='legacy_v1'"
-            ).fetchone()
-            if migrated:
-                return
-            for record in candidates:
-                exists = connection.execute(
-                    "SELECT 1 FROM research_rounds WHERE research_id=?",
-                    (record["research_id"],),
+
+        def migrate() -> None:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                migrated = connection.execute(
+                    "SELECT 1 FROM research_round_migrations WHERE migration_key='legacy_v1'"
                 ).fetchone()
-                if not exists:
-                    self._insert(connection, record)
-                self._sync_experiments(
-                    connection,
-                    str(record["research_id"]),
-                    list(record.get("completed_experiment_ids", record.get("experiment_ids", []))),
+                if migrated:
+                    return
+                self._migrate_records(connection, candidates)
+                connection.execute(
+                    "INSERT INTO research_round_migrations VALUES ('legacy_v1', ?)",
+                    (datetime.now(UTC).isoformat(),),
                 )
-            connection.execute(
-                "INSERT INTO research_round_migrations VALUES ('legacy_v1', ?)",
-                (datetime.now(UTC).isoformat(),),
+
+        run_with_busy_retry("legacy research-round migration", self.path, migrate)
+
+    def _legacy_migration_complete(self) -> bool:
+        with self._connect() as connection:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM research_round_migrations WHERE migration_key='legacy_v1'"
+                ).fetchone()
+                is not None
+            )
+
+    def _migrate_records(
+        self, connection: sqlite3.Connection, candidates: list[dict[str, Any]]
+    ) -> None:
+        for record in candidates:
+            exists = connection.execute(
+                "SELECT 1 FROM research_rounds WHERE research_id=?",
+                (record["research_id"],),
+            ).fetchone()
+            if not exists:
+                self._insert(connection, record)
+            self._sync_experiments(
+                connection,
+                str(record["research_id"]),
+                list(record.get("completed_experiment_ids", record.get("experiment_ids", []))),
             )
 
     def ensure_round(
@@ -257,53 +324,55 @@ class ResearchRoundStore:
         experiment_directory: str | Path,
     ) -> int:
         now = datetime.now(UTC).isoformat()
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            migrated = connection.execute(
-                "SELECT 1 FROM research_round_migrations WHERE migration_key='legacy_v1'"
-            ).fetchone()
-            if not migrated:
-                candidates = legacy_research_records(checkpoint_directory, experiment_directory)
-                for record in candidates:
-                    exists = connection.execute(
-                        "SELECT 1 FROM research_rounds WHERE research_id=?",
-                        (record["research_id"],),
-                    ).fetchone()
-                    if not exists:
-                        self._insert(connection, record)
+        migration_done = run_with_busy_retry(
+            "check legacy research-round migration", self.path, self._legacy_migration_complete
+        )
+        candidates = (
+            legacy_research_records(checkpoint_directory, experiment_directory)
+            if not migration_done
+            else []
+        )
+
+        def ensure() -> int:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                migrated = connection.execute(
+                    "SELECT 1 FROM research_round_migrations WHERE migration_key='legacy_v1'"
+                ).fetchone()
+                if not migrated:
+                    self._migrate_records(connection, candidates)
+                    connection.execute(
+                        "INSERT INTO research_round_migrations VALUES ('legacy_v1', ?)",
+                        (now,),
+                    )
+                row = connection.execute(
+                    "SELECT round_number FROM research_rounds WHERE research_id=?",
+                    (research_id,),
+                ).fetchone()
+                if row:
                     self._sync_experiments(
                         connection,
-                        str(record["research_id"]),
-                        list(
-                            record.get("completed_experiment_ids", record.get("experiment_ids", []))
-                        ),
+                        research_id,
+                        list(metadata.get("completed_experiment_ids", [])),
                     )
-                connection.execute(
-                    "INSERT INTO research_round_migrations VALUES ('legacy_v1', ?)", (now,)
-                )
-            row = connection.execute(
-                "SELECT round_number FROM research_rounds WHERE research_id=?", (research_id,)
-            ).fetchone()
-            if row:
-                self._sync_experiments(
+                    return int(row["round_number"])
+                self._insert(
                     connection,
-                    research_id,
-                    list(metadata.get("completed_experiment_ids", [])),
+                    {
+                        **metadata,
+                        "research_id": research_id,
+                        "created_at": metadata.get("created_at") or now,
+                    },
                 )
+                row = connection.execute(
+                    "SELECT round_number FROM research_rounds WHERE research_id=?",
+                    (research_id,),
+                ).fetchone()
                 return int(row["round_number"])
-            self._insert(
-                connection,
-                {
-                    **metadata,
-                    "research_id": research_id,
-                    "created_at": metadata.get("created_at") or now,
-                },
-            )
-            row = connection.execute(
-                "SELECT round_number FROM research_rounds WHERE research_id=?", (research_id,)
-            ).fetchone()
-            return int(row["round_number"])
 
+        return run_with_busy_retry("ensure research round", self.path, ensure)
+
+    @retry_sqlite_operation("update research round metadata")
     def update(self, research_id: str, metadata: dict[str, Any]) -> None:
         with self._connect() as connection:
             row = connection.execute(

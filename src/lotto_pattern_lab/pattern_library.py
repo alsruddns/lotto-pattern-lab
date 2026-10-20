@@ -6,6 +6,8 @@ import json
 import math
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from .feature_schema import (
     remap_formula_features,
 )
 from .paths import project_path
+from .sqlite_support import retry_sqlite_operation, run_with_busy_retry
 
 _COMMUTATIVE = {"add", "mul", "min2", "max2", "bit_xor", "bit_and", "bit_or"}
 PATTERN_STATUSES = {
@@ -91,50 +94,122 @@ class PatternLibrary:
     def __init__(self, path: str | Path = "data/database/patterns.sqlite") -> None:
         self.path = project_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS patterns (
-                    pattern_id TEXT PRIMARY KEY,
-                    fingerprint TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    status TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS observations (
-                    observation_id TEXT PRIMARY KEY,
-                    pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
-                    round_number INTEGER NOT NULL,
-                    phase TEXT NOT NULL,
-                    observed_at TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    UNIQUE(pattern_id, round_number, phase)
-                );
-                CREATE INDEX IF NOT EXISTS observations_pattern_idx
-                    ON observations(pattern_id, round_number);
-                CREATE TABLE IF NOT EXISTS pattern_events (
-                    event_id TEXT PRIMARY KEY,
-                    pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
-                    created_at TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                );
-                """
+        if run_with_busy_retry(
+            "check pattern library schema", self.path, self._schema_needs_migration
+        ):
+            run_with_busy_retry(
+                "pattern library schema migration", self.path, self._initialize_schema
             )
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path, timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=2000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _schema_needs_migration(self) -> bool:
+        with self._connect() as connection:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            indexes = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            required_tables = {
+                "patterns",
+                "observations",
+                "pattern_events",
+                "pattern_lineage",
+                "pattern_schema_versions",
+            }
+            if not required_tables <= tables:
+                return True
+            if not {
+                "observations_pattern_idx",
+                "pattern_lineage_parent_idx",
+                "pattern_lineage_child_idx",
+            } <= indexes:
+                return True
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(patterns)")
+            }
+            if not set(_PATTERN_COLUMNS) <= columns:
+                return True
+            version = connection.execute(
+                "SELECT MAX(version) FROM pattern_schema_versions"
+            ).fetchone()[0]
+            if int(version or 0) > PATTERN_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Pattern database schema {version} is newer than supported "
+                    f"schema {PATTERN_SCHEMA_VERSION}."
+                )
+            return int(version or 0) < PATTERN_SCHEMA_VERSION
+
+    def _initialize_schema(self) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             self._migrate_schema(connection)
 
     def _migrate_schema(self, connection: sqlite3.Connection) -> None:
         """Add lineage and searchable metadata while retaining every existing row."""
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS patterns (
+                pattern_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS observations (
+                observation_id TEXT PRIMARY KEY,
+                pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
+                round_number INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(pattern_id, round_number, phase)
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS observations_pattern_idx "
+            "ON observations(pattern_id, round_number)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS pattern_events (
+                event_id TEXT PRIMARY KEY,
+                pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )"""
+        )
         columns = {
             str(row["name"]) for row in connection.execute("PRAGMA table_info(patterns)").fetchall()
         }
+        missing_columns = set(_PATTERN_COLUMNS) - columns
         for name, sql_type in _PATTERN_COLUMNS.items():
             if name not in columns:
                 connection.execute(f"ALTER TABLE patterns ADD COLUMN {name} {sql_type}")
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS pattern_lineage (
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS pattern_lineage (
                 lineage_id TEXT PRIMARY KEY,
                 parent_pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
                 child_pattern_id TEXT NOT NULL REFERENCES patterns(pattern_id),
@@ -146,80 +221,91 @@ class PatternLibrary:
                 child_formula TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(parent_pattern_id, child_pattern_id, research_id, method)
-            );
-            CREATE INDEX IF NOT EXISTS pattern_lineage_parent_idx
-                ON pattern_lineage(parent_pattern_id, created_at);
-            CREATE INDEX IF NOT EXISTS pattern_lineage_child_idx
-                ON pattern_lineage(child_pattern_id, created_at);
-            CREATE TABLE IF NOT EXISTS pattern_schema_versions (
+            )"""
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS pattern_lineage_parent_idx "
+            "ON pattern_lineage(parent_pattern_id, created_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS pattern_lineage_child_idx "
+            "ON pattern_lineage(child_pattern_id, created_at)"
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS pattern_schema_versions (
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
-            );
-            """
+            )"""
         )
-        rows = connection.execute("SELECT pattern_id, payload, created_at FROM patterns").fetchall()
-        for row in rows:
-            payload = json.loads(row["payload"])
-            config = payload.get("experiment_config", {})
-            profile = payload.get("feature_profile") or config.get("feature_profile", "legacy")
-            outputs = int(payload.get("outputs_per_event", 0))
-            model_type = payload.get("model_type") or (
-                "one_number" if outputs == 1 else "six_number_set" if outputs == 6 else None
+        version_rows = connection.execute(
+            "SELECT MAX(version) FROM pattern_schema_versions"
+        ).fetchone()
+        current_version = int(version_rows[0] or 0)
+        if current_version > PATTERN_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Pattern database schema {current_version} is newer than supported "
+                f"schema {PATTERN_SCHEMA_VERSION}."
             )
-            performance = payload.get("performance", {})
-            values = {
-                "model_type": model_type,
-                "feature_profile": profile,
-                "feature_schema_version": int(
-                    payload.get("feature_schema_version", FEATURE_SCHEMA_VERSION)
-                ),
-                "primitive_set_version": payload.get(
-                    "primitive_set_version", PRIMITIVE_SET_VERSION
-                ),
-                "origin_research_id": payload.get("origin_research_id")
-                or payload.get("research_id"),
-                "last_used_research_id": payload.get("last_used_research_id"),
-                "discovered_at": payload.get("discovered_at", row["created_at"]),
-                "inheritance_count": int(payload.get("inheritance_count", 0)),
-                "child_count": int(payload.get("child_count", 0)),
-                "formula": json.dumps(payload.get("formulas", []), ensure_ascii=False),
-                "activation_condition": payload.get("activation_condition"),
-                "training_score": performance.get("training_score"),
-                "validation_score": performance.get("validation_score"),
-                "independent_test_score": performance.get("test_score"),
-                "complexity": payload.get("complexity"),
-                "activation_rate": performance.get("validation_activation_rate"),
-                "code_version": payload.get("code_version", CODE_VERSION),
-            }
-            payload.setdefault("model_type", model_type)
-            payload.setdefault("feature_profile", profile)
-            payload.setdefault("feature_schema_version", FEATURE_SCHEMA_VERSION)
-            payload.setdefault("primitive_set_version", PRIMITIVE_SET_VERSION)
-            payload.setdefault("origin_research_id", values["origin_research_id"])
-            payload.setdefault("discovered_at", row["created_at"])
-            payload.setdefault("inheritance_count", values["inheritance_count"])
-            payload.setdefault("child_count", values["child_count"])
-            payload.setdefault("code_version", CODE_VERSION)
-            assignments = ", ".join(f"{column}=?" for column in values)
-            connection.execute(
-                f"UPDATE patterns SET {assignments}, payload=? WHERE pattern_id=?",
-                (
-                    *values.values(),
-                    json.dumps(payload, ensure_ascii=False, allow_nan=False),
-                    row["pattern_id"],
-                ),
-            )
+        if current_version < PATTERN_SCHEMA_VERSION or missing_columns:
+            rows = connection.execute("SELECT * FROM patterns").fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                config = payload.get("experiment_config", {})
+                profile = payload.get("feature_profile") or config.get("feature_profile", "legacy")
+                outputs = int(payload.get("outputs_per_event", 0))
+                model_type = payload.get("model_type") or (
+                    "one_number" if outputs == 1 else "six_number_set" if outputs == 6 else None
+                )
+                performance = payload.get("performance", {})
+                values = {
+                    "model_type": model_type,
+                    "feature_profile": profile,
+                    "feature_schema_version": int(
+                        payload.get("feature_schema_version", FEATURE_SCHEMA_VERSION)
+                    ),
+                    "primitive_set_version": payload.get(
+                        "primitive_set_version", PRIMITIVE_SET_VERSION
+                    ),
+                    "origin_research_id": payload.get("origin_research_id")
+                    or payload.get("research_id"),
+                    "last_used_research_id": payload.get("last_used_research_id"),
+                    "discovered_at": payload.get("discovered_at", row["created_at"]),
+                    "inheritance_count": int(payload.get("inheritance_count", 0)),
+                    "child_count": int(payload.get("child_count", 0)),
+                    "formula": json.dumps(payload.get("formulas", []), ensure_ascii=False),
+                    "activation_condition": payload.get("activation_condition"),
+                    "training_score": performance.get("training_score"),
+                    "validation_score": performance.get("validation_score"),
+                    "independent_test_score": performance.get("test_score"),
+                    "complexity": payload.get("complexity"),
+                    "activation_rate": performance.get("validation_activation_rate"),
+                    "code_version": payload.get("code_version", CODE_VERSION),
+                }
+                payload.setdefault("model_type", model_type)
+                payload.setdefault("feature_profile", profile)
+                payload.setdefault("feature_schema_version", FEATURE_SCHEMA_VERSION)
+                payload.setdefault("primitive_set_version", PRIMITIVE_SET_VERSION)
+                payload.setdefault("origin_research_id", values["origin_research_id"])
+                payload.setdefault("discovered_at", row["created_at"])
+                payload.setdefault("inheritance_count", values["inheritance_count"])
+                payload.setdefault("child_count", values["child_count"])
+                payload.setdefault("code_version", CODE_VERSION)
+                serialized_payload = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+                if all(row[key] == value for key, value in values.items()) and row[
+                    "payload"
+                ] == serialized_payload:
+                    continue
+                assignments = ", ".join(f"{column}=?" for column in values)
+                connection.execute(
+                    f"UPDATE patterns SET {assignments}, payload=? WHERE pattern_id=?",
+                    (*values.values(), serialized_payload, row["pattern_id"]),
+                )
         connection.execute(
             "INSERT OR IGNORE INTO pattern_schema_versions VALUES (?, ?)",
             (PATTERN_SCHEMA_VERSION, datetime.now(UTC).isoformat()),
         )
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
-
+    @retry_sqlite_operation("register discovered pattern")
     def register_pattern(self, payload: dict[str, Any]) -> tuple[str, bool]:
         activation = str(payload["activation_condition"])
         formulas = tuple(str(formula) for formula in payload["formulas"])
@@ -509,6 +595,7 @@ class PatternLibrary:
                 )
         return selected, skipped
 
+    @retry_sqlite_operation("record pattern reuse")
     def record_elite_use(
         self, pattern_ids: list[str], research_id: str, dataset_sha256: str
     ) -> None:
@@ -550,6 +637,7 @@ class PatternLibrary:
                     ),
                 )
 
+    @retry_sqlite_operation("record formula lineage")
     def record_lineage(
         self,
         parent_pattern_id: str,
@@ -618,6 +706,7 @@ class PatternLibrary:
                 ).fetchall()
         return [{**dict(row), "operators": json.loads(row["operators"])} for row in rows]
 
+    @retry_sqlite_operation("record pattern observation")
     def record_observation(
         self,
         pattern_id: str,
@@ -645,6 +734,7 @@ class PatternLibrary:
             )
             return bool(cursor.rowcount)
 
+    @retry_sqlite_operation("update pattern status")
     def set_status(self, pattern_id: str, status: str, reason: str) -> None:
         if status not in PATTERN_STATUSES:
             raise ValueError(f"Unknown pattern status: {status}")
