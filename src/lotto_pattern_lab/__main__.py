@@ -362,6 +362,9 @@ def _run_optimization_cli(argv: list[str]) -> None:
     parser.add_argument("--csv", required=True)
     parser.add_argument("--study-name", required=True)
     parser.add_argument("--mode", choices=("quick", "standard", "deep"), default="standard")
+    parser.add_argument(
+        "--action", choices=("new", "resume", "add_trials"), default="resume"
+    )
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)
@@ -398,6 +401,7 @@ def _run_optimization_cli(argv: list[str]) -> None:
                 config,
                 study_name=args.study_name,
                 mode=args.mode,
+                action=args.action,
                 n_trials=args.trials,
                 timeout_seconds=args.timeout_seconds,
                 storage_directory=args.storage_directory,

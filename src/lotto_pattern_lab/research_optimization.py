@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sqlite3
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -21,12 +22,127 @@ from .storage import ExperimentStore
 OPTIMIZATION_SCHEMA_VERSION = 1
 
 
+def list_optimization_studies(
+    storage_directory: str | Path = "data/optimizations",
+) -> list[dict[str, Any]]:
+    """Read Optuna studies and sidecar state without opening databases for writing."""
+    root = project_path(storage_directory)
+    if not root.is_dir():
+        return []
+    records: dict[str, dict[str, Any]] = {}
+    for state_path in root.glob("*.state.json"):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            name = str(state.get("study_name") or state_path.name.removesuffix(".state.json"))
+            records[name] = {
+                **state,
+                "study_name": name,
+                "state_path": str(state_path),
+                "database_path": str(root / f"{_study_slug(name)}.sqlite"),
+                "database_available": False,
+                "best_parameters": {},
+            }
+        except (OSError, ValueError, TypeError):
+            records[state_path.name.removesuffix(".state.json")] = {
+                "study_name": state_path.name.removesuffix(".state.json"),
+                "status": "state_unreadable",
+                "state_path": str(state_path),
+                "database_path": str(
+                    root / f"{state_path.name.removesuffix('.state.json')}.sqlite"
+                ),
+                "database_available": False,
+                "best_parameters": {},
+            }
+
+    for database_path in root.glob("*.sqlite"):
+        try:
+            uri = database_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+                rows = connection.execute(
+                    "SELECT study_id, study_name FROM studies ORDER BY study_id"
+                ).fetchall()
+                for study_id, name_value in rows:
+                    name = str(name_value)
+                    record = records.setdefault(
+                        name,
+                        {
+                            "study_name": name,
+                            "status": "기록 확인 필요",
+                            "completed_trials": 0,
+                            "best_parameters": {},
+                        },
+                    )
+                    record.update(database_path=str(database_path), database_available=True)
+                    for key, value in connection.execute(
+                        "SELECT key, value_json FROM study_user_attributes WHERE study_id=?",
+                        (study_id,),
+                    ).fetchall():
+                        try:
+                            record[str(key)] = json.loads(value)
+                        except (TypeError, ValueError):
+                            record[str(key)] = value
+                    trials = connection.execute(
+                        """SELECT t.trial_id, t.number, t.state, tv.value
+                           FROM trials t LEFT JOIN trial_values tv ON tv.trial_id=t.trial_id
+                           WHERE t.study_id=? AND tv.objective=0""",
+                        (study_id,),
+                    ).fetchall()
+                    timing = connection.execute(
+                        "SELECT MIN(datetime_start), MAX(datetime_complete) "
+                        "FROM trials WHERE study_id=?",
+                        (study_id,),
+                    ).fetchone()
+                    if timing and timing[0]:
+                        record.setdefault("started_at", str(timing[0]))
+                    if timing and timing[1]:
+                        record.setdefault("finished_at", str(timing[1]))
+                    completed = [
+                        row for row in trials if row[2] == "COMPLETE" and row[3] is not None
+                    ]
+                    record["completed_trials"] = len(completed)
+                    directions = connection.execute(
+                        "SELECT direction FROM study_directions "
+                        "WHERE study_id=? ORDER BY objective",
+                        (study_id,),
+                    ).fetchall()
+                    maximize = not directions or directions[0][0] == "MAXIMIZE"
+                    if completed:
+                        best = (max if maximize else min)(completed, key=lambda row: float(row[3]))
+                        record.update(best_trial_number=int(best[1]), best_value=float(best[3]))
+                        params = connection.execute(
+                            """SELECT param_name, param_value FROM trial_params
+                               WHERE trial_id=? ORDER BY param_name""",
+                            (best[0],),
+                        ).fetchall()
+                        record["best_parameters"] = {
+                            str(key): (
+                                int(value)
+                                if str(key)
+                                in {"population_size", "generations", "max_depth", "max_lag"}
+                                and float(value).is_integer()
+                                else float(value)
+                            )
+                            for key, value in params
+                        }
+                    elif trials:
+                        record["best_trial_number"] = None
+                        record["best_value"] = None
+                    record.setdefault("mode", "기록 없음")
+                    record.setdefault("status", "completed" if completed else "진행 기록 없음")
+                    record["last_modified"] = datetime.fromtimestamp(
+                        database_path.stat().st_mtime, UTC
+                    ).isoformat()
+        except (OSError, sqlite3.Error):
+            continue
+    return sorted(records.values(), key=lambda item: str(item.get("study_name", "")).casefold())
+
+
 def optuna_status() -> dict[str, Any]:
     available = importlib.util.find_spec("optuna") is not None
     return {
         "available": available,
         "status": "available" if available else "optional_dependency_missing",
-        "install_extra": ".venv\\Scripts\\python.exe -m pip install -e \".[optimization]\"",
+        "install_extra": '.venv\\Scripts\\python.exe -m pip install -e ".[optimization]"',
     }
 
 
@@ -95,6 +211,7 @@ def optimize_gp(
     *,
     study_name: str,
     mode: str = "standard",
+    action: str = "resume",
     n_trials: int = 10,
     timeout_seconds: float | None = None,
     storage_directory: str | Path = "data/optimizations",
@@ -104,14 +221,15 @@ def optimize_gp(
     """Run/resume a persisted Optuna study; study best-trial selection uses validation only."""
     if mode not in {"quick", "standard", "deep"}:
         raise ValueError("최적화 모드는 quick, standard, deep 중 하나여야 합니다.")
+    if action not in {"new", "resume", "add_trials"}:
+        raise ValueError("최적화 실행 방식은 new, resume, add_trials 중 하나여야 합니다.")
     if n_trials < 1:
         raise ValueError("최적화 Trial 수는 1 이상이어야 합니다.")
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ValueError("시간 제한은 0보다 커야 합니다.")
     if not optuna_status()["available"]:
         raise RuntimeError(
-            "Optuna가 설치되지 않았습니다. 선택 기능 설치 명령: "
-            + optuna_status()["install_extra"]
+            "Optuna가 설치되지 않았습니다. 선택 기능 설치 명령: " + optuna_status()["install_extra"]
         )
     import optuna
 
@@ -121,6 +239,12 @@ def optimize_gp(
     study_db = storage_root / f"{slug}.sqlite"
     storage_uri = f"sqlite:///{study_db.as_posix()}"
     state_file = storage_root / f"{slug}.state.json"
+    if action == "new" and (study_db.exists() or state_file.exists()):
+        raise FileExistsError(
+            "같은 이름의 최적화 기록이 이미 있습니다. 기존 연구 이어하기를 선택하세요."
+        )
+    if action in {"resume", "add_trials"} and not study_db.is_file():
+        raise FileNotFoundError("이어서 실행할 Optuna SQLite 연구 기록을 찾지 못했습니다.")
     study = optuna.create_study(
         study_name=slug,
         storage=storage_uri,
@@ -136,6 +260,7 @@ def optimize_gp(
     study.set_user_attr("final_test_used_for_selection", False)
     study.set_user_attr("objective_policy_version", "validation_only_v1")
     trial_store = ExperimentStore(Path(experiment_directory) / slug)
+    started_at = datetime.now(UTC).isoformat()
 
     def write_state(event: dict[str, Any]) -> None:
         atomic_write_bytes(
@@ -150,7 +275,10 @@ def optimize_gp(
             "status": "running",
             "completed_trials": len(study.trials),
             "requested_additional_trials": n_trials,
+            "starting_trial_count": len(study.trials),
             "study_database": str(study_db),
+            "action": action,
+            "started_at": started_at,
             "updated_at": datetime.now(UTC).isoformat(),
         }
     )
@@ -175,6 +303,7 @@ def optimize_gp(
             "last_trial_number": trial.number,
             "last_trial_state": str(trial.state),
             "study_database": str(study_db),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         write_state({**event, "status": "running"})
         if progress:
@@ -199,6 +328,7 @@ def optimize_gp(
                 "error_type": type(error).__name__,
                 "error": str(error),
                 "study_database": str(study_db),
+                "finished_at": datetime.now(UTC).isoformat(),
             }
         )
         raise
@@ -218,6 +348,9 @@ def optimize_gp(
             "completed_trials": len(study.trials),
             "best_trial_number": best_trial.number if best_trial else None,
             "best_value": best_trial.value if best_trial else None,
+            "best_parameters": best_trial.params if best_trial else {},
+            "started_at": started_at,
+            "finished_at": datetime.now(UTC).isoformat(),
             "study_database": str(study_db),
         }
     )

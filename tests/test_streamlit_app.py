@@ -56,11 +56,17 @@ def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypat
     app = AppTest.from_file(page).run(timeout=60)
 
     assert not app.exception, [exception.message for exception in app.exception]
-    assert [tab.label for tab in app.tabs] == [
-        "새 연구 시작",
-        "기존 연구 이어서 하기",
-        "연구 예약 실행",
-    ]
+    tab_labels = [tab.label for tab in app.tabs]
+    assert "지속적 패턴 연구" in tab_labels
+    assert "연구 조건 자동 최적화" in tab_labels
+    assert all(
+        label in tab_labels
+        for label in [
+            "새 연구 시작",
+            "기존 연구 이어서 하기",
+            "연구 예약 실행",
+        ]
+    )
     labels = [button.label for button in app.button]
     assert "연구 환경 사전 검사" in labels
     assert "새 연구 시작" in labels
@@ -71,3 +77,19 @@ def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypat
     if resume_selector.value == "962a0a57-92c3-4e88-a04f-5cf4b836ba29":
         resume_button = next(button for button in app.button if button.label == "이어서 하기")
         assert not resume_button.disabled
+
+
+def test_optimization_tab_shows_history_and_separates_new_and_resume() -> None:
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
+    )
+    app = AppTest.from_file(page).run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    labels = [tab.label for tab in app.tabs]
+    assert "연구 조건 자동 최적화" in labels
+    assert "새 자동 최적화" in labels
+    assert "기존 연구 이어하기" in labels
+    assert "최적화 이력" in labels
+    assert "새 자동 최적화 시작" in [button.label for button in app.button]
+    assert "기존 자동 최적화 이어서 하기" in [button.label for button in app.button]

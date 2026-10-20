@@ -70,3 +70,93 @@ def test_optimizer_fails_clearly_when_optional_optuna_is_missing(tmp_path, monke
             n_trials=1,
             storage_directory=tmp_path / "storage",
         )
+
+
+def test_optimization_history_reads_sqlite_and_json_without_mutating_files(tmp_path) -> None:
+    import hashlib
+    import json
+    import sqlite3
+
+    root = tmp_path / "data" / "optimizations"
+    root.mkdir(parents=True)
+    database = root / "study.sqlite"
+    state = root / "study.state.json"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE studies (study_id INTEGER PRIMARY KEY, study_name TEXT);
+            CREATE TABLE study_user_attributes (study_id INTEGER, key TEXT, value_json TEXT);
+            CREATE TABLE study_directions (study_id INTEGER, direction TEXT, objective INTEGER);
+            CREATE TABLE trials (
+                trial_id INTEGER PRIMARY KEY, study_id INTEGER, number INTEGER,
+                state TEXT, datetime_start TEXT, datetime_complete TEXT
+            );
+            CREATE TABLE trial_values (trial_id INTEGER, objective INTEGER, value REAL);
+            CREATE TABLE trial_params (trial_id INTEGER, param_name TEXT, param_value REAL);
+            INSERT INTO studies VALUES (1, 'saved-study');
+            INSERT INTO study_user_attributes VALUES (1, 'feature_profile', '"bonus_lag_v1"');
+            INSERT INTO study_user_attributes VALUES (1, 'dataset_range', '[753, 1246]');
+            INSERT INTO study_directions VALUES (1, 'MAXIMIZE', 0);
+            INSERT INTO trials VALUES (1, 1, 0, 'COMPLETE', '2026-01-01', '2026-01-02');
+            INSERT INTO trial_values VALUES (1, 0, 0.25);
+            INSERT INTO trial_params VALUES (1, 'population_size', 56);
+            """
+        )
+    state.write_text(
+        json.dumps({"study_name": "saved-study", "status": "completed"}), encoding="utf-8"
+    )
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (database, state)
+    }
+
+    records = optimization.list_optimization_studies(root)
+
+    assert len(records) == 1
+    assert records[0]["completed_trials"] == 1
+    assert records[0]["best_trial_number"] == 0
+    assert records[0]["best_value"] == 0.25
+    assert records[0]["best_parameters"] == {"population_size": 56}
+    assert records[0]["feature_profile"] == "bonus_lag_v1"
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (database, state)
+    } == before
+
+
+def test_new_optimization_refuses_to_reuse_existing_name_without_touching_state(
+    tmp_path, monkeypatch
+) -> None:
+    import hashlib
+
+    from lotto_pattern_lab.dataset import make_random_dataset
+
+    root = tmp_path / "optimizations"
+    root.mkdir()
+    state_path = root / "duplicate.state.json"
+    state_path.write_text('{"status":"completed"}', encoding="utf-8")
+    before = hashlib.sha256(state_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
+
+    with pytest.raises(FileExistsError, match="이미 있습니다"):
+        optimization.optimize_gp(
+            make_random_dataset(20, seed=35),
+            IntermittentConfig(population_size=8, generations=1),
+            study_name="duplicate",
+            action="new",
+            storage_directory=root,
+        )
+
+    assert hashlib.sha256(state_path.read_bytes()).hexdigest() == before
+
+
+def test_resume_requires_existing_optuna_database(tmp_path, monkeypatch) -> None:
+    from lotto_pattern_lab.dataset import make_random_dataset
+
+    monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
+    with pytest.raises(FileNotFoundError, match="SQLite"):
+        optimization.optimize_gp(
+            make_random_dataset(20, seed=36),
+            IntermittentConfig(population_size=8, generations=1),
+            study_name="missing-study",
+            action="resume",
+            storage_directory=tmp_path / "missing",
+        )
