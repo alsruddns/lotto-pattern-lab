@@ -17,15 +17,37 @@ import streamlit as st
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
 from lotto_pattern_lab.research import research_worker_active
 from lotto_pattern_lab.research_optimization import list_optimization_studies, optuna_status
+from lotto_pattern_lab.research_optimization_apply import (
+    OPTUNA_TO_RESEARCH_KEYS,
+    validate_optimization_compatibility,
+)
 
 st.set_page_config(page_title="지속적 패턴 연구", layout="wide")
 _pending_optimization = st.session_state.pop("optimization_apply_pending", None)
 if _pending_optimization:
-    for _key, _value in _pending_optimization.items():
+    for _key, _value in _pending_optimization["values"].items():
         st.session_state[_key] = _value
+    st.session_state["optimization_applied_context"] = _pending_optimization["context"]
     st.session_state["optimization_applied_notice"] = True
+    st.session_state["research_workspace_tab"] = "지속적 패턴 연구"
+if st.session_state.pop("optimization_reset_pending", False):
+    for _key in (
+        "new_research_engine",
+        "new_profile",
+        "new_duration_minutes",
+        *OPTUNA_TO_RESEARCH_KEYS.values(),
+    ):
+        st.session_state.pop(_key, None)
+    st.session_state.pop("optimization_applied_context", None)
+    st.session_state["optimization_reset_notice"] = True
+    st.session_state["research_workspace_tab"] = "지속적 패턴 연구"
 
-research_tab, optimization_tab = st.tabs(["지속적 패턴 연구", "연구 조건 자동 최적화"])
+research_tab, optimization_tab = st.tabs(
+    ["지속적 패턴 연구", "연구 조건 자동 최적화"],
+    key="research_workspace_tab",
+    default=st.session_state.get("research_workspace_tab", "지속적 패턴 연구"),
+    on_change="rerun",
+)
 with research_tab:
     _continuous_runtime = runpy.run_path(
         str(PROJECT_ROOT / "src/lotto_pattern_lab/continuous_research_view.py"),
@@ -59,6 +81,9 @@ def format_duration(seconds: object) -> str:
 
 def render_optimization() -> None:
     st.title("연구 조건 자동 최적화")
+    apply_failure = st.session_state.pop("optimization_apply_failure", None)
+    if apply_failure:
+        st.error(f"최적화 설정을 적용하지 못했습니다: {apply_failure}")
     st.caption(
         "여러 연구 조건을 자동으로 시험하여 검증 성능과 수식 복잡도를 고려한 설정을 찾습니다. "
         "점수는 내부 평가값이며 실제 당첨 확률을 뜻하지 않습니다."
@@ -358,37 +383,53 @@ def render_optimization() -> None:
                     file_name=f"{selected_name}_best_parameters.json",
                     mime="application/json",
                 )
-                compatible = {
-                    "population_size": "new_population_size",
-                    "generations": "new_generations",
-                    "crossover_probability": "new_crossover_probability",
-                    "mutation_probability": "new_mutation_probability",
-                    "max_depth": "new_max_depth",
-                    "max_lag": "new_max_lag",
-                    "min_activation_rate": "new_min_activation_rate",
-                }
-                unsupported = sorted(set(parameters) - set(compatible))
                 profile = selected.get("feature_profile")
-                if profile not in {"legacy", "bonus_lag_v1", "calendar_round"}:
-                    st.warning(
-                        "저장된 특징 프로파일을 확인할 수 없어 이 설정을 적용할 수 없습니다."
-                    )
-                elif unsupported:
-                    st.warning(
-                        "현재 연구 화면과 호환되지 않는 파라미터가 있습니다: "
-                        + ", ".join(unsupported)
-                    )
+                normalized, compatibility_error = validate_optimization_compatibility(
+                    selected,
+                    current_engines=tuple(
+                        st.session_state.get("research_current_engine_ids", ())
+                    ),
+                    current_dataset_range=st.session_state.get(
+                        "research_current_dataset_range"
+                    ),
+                    dataset_integrity=st.session_state.get(
+                        "research_current_dataset_integrity"
+                    ),
+                )
+                if (
+                    selected.get("status") != "completed"
+                    or selected.get("best_trial_number") is None
+                ):
+                    compatibility_error = "최고 Trial이 완료된 최적화 연구만 적용할 수 있습니다."
+                if compatibility_error:
+                    st.warning(f"설정을 적용할 수 없습니다: {compatibility_error}")
                 else:
-                    preview = {key: parameters[key] for key in compatible if key in parameters}
-                    st.write("지속적 연구에 적용될 설정 미리보기")
-                    st.json(preview)
+                    current_settings = st.session_state.get("research_current_settings", {})
+                    preview_rows = [
+                        {
+                            "GP 파라미터": source,
+                            "현재 값": current_settings.get(target),
+                            "적용 값": normalized[source],
+                        }
+                        for source, target in OPTUNA_TO_RESEARCH_KEYS.items()
+                    ]
+                    st.write("적용 전후 비교")
+                    st.dataframe(preview_rows, hide_index=True, width="stretch")
+                    if "pysr_symbolic_regression" in st.session_state.get(
+                        "research_current_engine_ids", ()
+                    ):
+                        st.info(
+                            "비교 모드에서는 7개 최적화 값이 GP에만 적용됩니다. "
+                            "PySR 전용 특징과 탐색 설정은 별도로 유지됩니다."
+                        )
                     if st.button(
                         "이 설정으로 지속적 패턴 연구 시작",
                         type="primary",
                         key="apply_optimization_settings",
                     ):
                         st.session_state["optimization_apply_confirmation"] = {
-                            "study_name": selected_name
+                            "study_name": selected_name,
+                            "parameters": normalized,
                         }
                     if (
                         st.session_state.get("optimization_apply_confirmation", {}).get(
@@ -396,15 +437,59 @@ def render_optimization() -> None:
                         )
                         == selected_name
                     ):
-                        st.warning("확인 후 설정이 반영됩니다. 연구는 자동으로 시작하지 않습니다.")
+                        st.warning(
+                            "최종 확인 후 적용됩니다. 연구는 자동으로 시작하지 않습니다."
+                        )
                         if st.button("설정 적용 확인", key="confirm_optimization_apply"):
-                            pending = {
-                                target: parameters[source]
-                                for source, target in compatible.items()
-                                if source in parameters
-                            }
-                            pending["new_profile"] = profile
-                            st.session_state["optimization_apply_pending"] = pending
+                            still_compatible, apply_error = validate_optimization_compatibility(
+                                selected,
+                                current_engines=tuple(
+                                    st.session_state.get("research_current_engine_ids", ())
+                                ),
+                                current_dataset_range=st.session_state.get(
+                                    "research_current_dataset_range"
+                                ),
+                                dataset_integrity=st.session_state.get(
+                                    "research_current_dataset_integrity"
+                                ),
+                            )
+                            if apply_error or still_compatible != normalized:
+                                st.session_state["optimization_apply_failure"] = (
+                                    apply_error
+                                    or "확인 단계에서 최고 Trial의 값이 달라졌습니다."
+                                )
+                            else:
+                                current_settings = dict(
+                                    st.session_state.get("research_current_settings", {})
+                                )
+                                control_values = {
+                                    OPTUNA_TO_RESEARCH_KEYS[key]: value
+                                    for key, value in normalized.items()
+                                }
+                                control_values["new_profile"] = profile
+                                settings_snapshot = {
+                                    **current_settings,
+                                    **control_values,
+                                }
+                                context = {
+                                    "study_name": selected_name,
+                                    "optuna_study_id": selected.get("optuna_study_id"),
+                                    "trial_number": int(selected["best_trial_number"]),
+                                    "parameters": normalized,
+                                    "research_settings": settings_snapshot,
+                                    "expected_controls": control_values,
+                                    "feature_profile": profile,
+                                    "dataset_range": list(selected["dataset_range"]),
+                                    "applied_at": datetime.now(UTC).isoformat(),
+                                    "modified_by_user": False,
+                                    "started_research_ids": [],
+                                    "application_verified": False,
+                                }
+                                st.session_state["optimization_apply_pending"] = {
+                                    "values": control_values,
+                                    "context": context,
+                                }
+                                st.session_state["research_workspace_tab"] = "지속적 패턴 연구"
                             st.session_state.pop("optimization_apply_confirmation", None)
                             st.rerun()
             else:

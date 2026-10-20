@@ -73,6 +73,7 @@ def list_optimization_studies(
                         },
                     )
                     record.update(database_path=str(database_path), database_available=True)
+                    record["optuna_study_id"] = int(study_id)
                     for key, value in connection.execute(
                         "SELECT key, value_json FROM study_user_attributes WHERE study_id=?",
                         (study_id,),
@@ -81,6 +82,13 @@ def list_optimization_studies(
                             record[str(key)] = json.loads(value)
                         except (TypeError, ValueError):
                             record[str(key)] = value
+                    if (
+                        "engine" not in record
+                        and record.get("objective_policy_version") == "validation_only_v1"
+                    ):
+                        # This policy version is written only by optimize_gp in this package.
+                        record["engine"] = "intermittent_gp"
+                        record["engine_metadata_source"] = "optimizer implementation metadata"
                     trials = connection.execute(
                         """SELECT t.trial_id, t.number, t.state, tv.value
                            FROM trials t LEFT JOIN trial_values tv ON tv.trial_id=t.trial_id
@@ -253,6 +261,7 @@ def optimize_gp(
         load_if_exists=True,
     )
     study.set_user_attr("mode", mode)
+    study.set_user_attr("engine", "intermittent_gp")
     study.set_user_attr("feature_profile", base_config.feature_profile)
     study.set_user_attr(
         "dataset_range", [dataset.records[0].round_number, dataset.records[-1].round_number]

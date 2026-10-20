@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -40,6 +41,11 @@ from lotto_pattern_lab.research import (
     pause_request_path,
     request_pause,
     research_worker_active,
+)
+from lotto_pattern_lab.research_optimization_apply import (
+    OPTUNA_TO_RESEARCH_KEYS,
+    changed_optimization_settings,
+    optimization_origin_record,
 )
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
@@ -404,8 +410,8 @@ def _research_command(
 
 
 st.title("지속적 패턴 연구")
-if st.session_state.pop("optimization_applied_notice", False):
-    st.success("최적화 설정을 반영했습니다. 입력값을 확인한 뒤 새 연구를 시작하세요.")
+if st.session_state.pop("optimization_reset_notice", False):
+    st.info("기본 연구 설정으로 되돌렸습니다.")
 st.caption(
     "새 연구는 별도 체크포인트로 시작하고, 저장된 연구는 당시 설정을 유지해 이어서 실행합니다."
 )
@@ -507,7 +513,8 @@ with new_tab:
     st.session_state.setdefault("new_duration_minutes", 180)
     if "new_population_size" not in st.session_state:
         _apply_research_preset()
-    engine_choice = st.selectbox(
+    selector_columns = st.columns(3)
+    engine_choice = selector_columns[0].selectbox(
         "탐색 엔진",
         ENGINE_OPTIONS,
         key="new_research_engine",
@@ -526,7 +533,7 @@ with new_tab:
         "calendar_round": "회차·날짜 특징",
         "bonus_lag_v1": "보너스 번호 포함 특징",
     }
-    profile = st.selectbox(
+    profile = selector_columns[1].selectbox(
         "특징 프로파일",
         ("legacy", "calendar_round", "bonus_lag_v1"),
         format_func=lambda value: profile_names[value],
@@ -534,7 +541,7 @@ with new_tab:
         help="날짜나 보너스 번호 특징을 쓰려면 데이터에 해당 정보가 있어야 합니다.",
         on_change=_apply_research_preset,
     )
-    duration_minutes = st.selectbox(
+    duration_minutes = selector_columns[2].selectbox(
         "연구 시간 프리셋",
         (30, 60, 120, 180, 360, 480),
         format_func=lambda value: f"{value}분",
@@ -545,16 +552,122 @@ with new_tab:
         ),
         on_change=_apply_research_preset,
     )
-    st.caption("자동 추천값은 시작점이며 최적 성능이 입증된 설정은 아닙니다.")
-    selected_preset = GP_PRESETS[int(duration_minutes)]
-    st.info(
-        f"GP 권장값: 개체군 {selected_preset['population']}, "
-        f"세대 {selected_preset['generations']}, 최대 깊이 {selected_preset['max_depth']}, "
-        f"무작위 대조 {selected_preset['controls']}회. 공통값: 교차 0.65, 돌연변이 0.25, "
-        "학습/검증 60%/20%, 과거 참조 10회, 최소 활성률 10%, 숨겨진 상태 3개, "
-        "CPU 최대 4개, Elite Seeding 20%, 시드 12345."
+    current_data_range = (
+        [new_dataset.records[0].round_number, new_dataset.records[-1].round_number]
+        if new_dataset
+        else None
     )
-    with st.form("new_research_form"):
+    st.session_state["research_current_engine_ids"] = list(engines)
+    st.session_state["research_current_profile"] = profile
+    st.session_state["research_current_dataset_range"] = current_data_range
+    st.session_state["research_current_dataset_integrity"] = new_integrity
+    current_research_settings = {
+        **{key: st.session_state.get(key) for key in OPTUNA_TO_RESEARCH_KEYS.values()},
+        "new_profile": profile,
+        "new_research_engine": engine_choice,
+        "new_duration_minutes": int(duration_minutes),
+        "dataset_range": current_data_range,
+    }
+    st.session_state["research_current_settings"] = current_research_settings
+    optimization_context = st.session_state.get("optimization_applied_context")
+    if optimization_context:
+        applied_settings = optimization_context.get("research_settings", {})
+        modified = changed_optimization_settings(applied_settings, current_research_settings)
+        optimization_context["modified_by_user"] = modified
+        expected_params = optimization_context.get("parameters", {})
+        if not optimization_context.get("application_verified"):
+            expected_controls = optimization_context.get("expected_controls", {})
+            actual_controls = {
+                key: st.session_state.get(key) for key in expected_controls
+            }
+            values_match = (
+                bool(expected_controls)
+                and actual_controls == expected_controls
+                and profile == optimization_context.get("feature_profile")
+            )
+            optimization_context["application_verified"] = values_match
+            if not values_match:
+                optimization_context["application_error"] = (
+                    "일부 Optuna 값이 연구 입력란에 반영되지 않았습니다."
+                )
+        else:
+            values_match = bool(optimization_context.get("application_verified"))
+        st.session_state["optimization_applied_context"] = optimization_context
+        started_label = (
+            "연구 시작됨"
+            if optimization_context.get("started_research_ids")
+            else "아직 연구 시작 전"
+        )
+        if not values_match:
+            st.error(
+                "최적화 설정 적용에 실패했습니다. "
+                + optimization_context.get("application_error", "입력값을 다시 확인하세요.")
+            )
+        elif modified:
+            st.warning("Optuna 최적화 설정을 기반으로 사용자가 일부 값을 변경했습니다.")
+        elif not optimization_context.get("started_research_ids"):
+            st.success("최적화 설정이 적용되었습니다. 연구 조건을 확인한 후 연구를 시작하세요.")
+        else:
+            st.success("최적화 설정이 적용된 연구 실행 기록이 있습니다.")
+        if values_match:
+            st.markdown(
+                f"**Optuna 최적화 설정 적용 완료** · "
+                f"Study ID `{optimization_context.get('optuna_study_id')}` · "
+                f"`{optimization_context.get('study_name')}` / "
+                f"Trial #{optimization_context.get('trial_number')} · "
+                f"{len(expected_params)}개 파라미터 · "
+                f"프로파일 `{optimization_context.get('feature_profile')}` · "
+                f"데이터 {optimization_context.get('dataset_range')}회차 · "
+                f"적용 시각 {optimization_context.get('applied_at')} · {started_label}"
+            )
+        with st.expander("최적화 설정 상세 보기", expanded=False):
+            st.write(f"특징 프로파일: `{optimization_context.get('feature_profile')}`")
+            st.write(f"데이터 회차 범위: `{optimization_context.get('dataset_range')}`")
+            st.write("적용된 Optuna 파라미터")
+            st.json(expected_params)
+            st.write("적용 당시 연구 설정")
+            st.json(applied_settings)
+        if st.button("기본 설정으로 되돌리기", key="reset_optimization_applied_settings"):
+            st.session_state["optimization_reset_pending"] = True
+            st.rerun()
+
+    selected_preset = GP_PRESETS[int(duration_minutes)]
+    st.caption(
+        f"현재 조건: {engine_choice} · {profile_names[profile]} · "
+        f"{int(duration_minutes)}분 · "
+        + (
+            f"Optuna Trial #{optimization_context.get('trial_number')} 적용"
+            if optimization_context
+            else "기본 연구 설정"
+        )
+    )
+    action_columns = st.columns([1, 1, 3])
+    preflight_submitted = action_columns[0].button(
+        "연구 환경 사전 검사",
+        key="run_new_research_preflight",
+        help="현재 데이터와 설정으로 실행 환경을 검사합니다.",
+    )
+    submitted = action_columns[1].button(
+        "새 연구 시작",
+        type="primary",
+        key="start_new_research_now",
+        disabled=research_worker_active(),
+        help="시작을 누르면 유효한 검사가 없을 때 자동 검사 후 새 연구를 시작합니다.",
+    )
+    if research_worker_active():
+        action_columns[2].warning("다른 연구 작업이 실행 중이어서 시작할 수 없습니다.")
+    elif new_dataset is None:
+        action_columns[2].error("기준 데이터 파일을 읽지 못해 연구를 시작할 수 없습니다.")
+
+    with st.expander("자동 연구 기본값 안내", expanded=False):
+        st.caption("자동 추천값은 시작점이며 최적 성능이 입증된 설정은 아닙니다.")
+        st.write(
+            f"GP 권장값: 개체군 {selected_preset['population']}, "
+            f"세대 {selected_preset['generations']}, 최대 깊이 {selected_preset['max_depth']}, "
+            f"무작위 대조 {selected_preset['controls']}회. "
+            "비교 모드에서는 아래 별도 PySR 설정이 적용됩니다."
+        )
+    with st.container():
         with st.expander("고급 설정", expanded=False):
             candidate_replay_threshold = st.selectbox(
                 "자동 전체 회차 재검증 후보 기준",
@@ -625,6 +738,30 @@ with new_tab:
                 help="예측 입력에서 참조할 과거 회차의 최대 수입니다.",
                 key="new_max_lag",
             )
+            st.session_state.setdefault("new_pysr_profile", profile)
+            st.session_state.setdefault("new_pysr_max_lag", int(max_lag))
+            if len(engines) > 1:
+                st.caption(
+                    "비교 모드: Optuna 값은 GP 설정에만 적용됩니다. "
+                    "PySR은 아래 별도 특징 설정을 사용합니다."
+                )
+                pysr_profile = st.selectbox(
+                    "PySR 특징 프로파일",
+                    ("legacy", "calendar_round", "bonus_lag_v1"),
+                    format_func=lambda value: profile_names[value],
+                    key="new_pysr_profile",
+                    help="비교 모드에서 PySR에만 전달되는 특징 프로파일입니다.",
+                )
+                pysr_max_lag = st.number_input(
+                    "PySR 최대 과거 참조",
+                    min_value=1,
+                    max_value=10,
+                    key="new_pysr_max_lag",
+                    help="비교 모드에서 PySR이 참조할 과거 회차 수입니다.",
+                )
+            else:
+                pysr_profile = profile
+                pysr_max_lag = int(max_lag)
             col1, col2, col3 = st.columns(3)
             controls = col1.number_input(
                 "무작위 대조 반복",
@@ -668,7 +805,9 @@ with new_tab:
                 key="new_elite_seed_ratio",
             )
             pysr_targets = ("main_positions", "one_number") + (
-                ("bonus",) if profile in {"bonus_lag_v1", "calendar_round"} else ()
+                ("bonus",)
+                if pysr_profile in {"bonus_lag_v1", "calendar_round"}
+                else ()
             )
             pysr_target = st.selectbox(
                 "PySR 탐색 목표",
@@ -829,6 +968,8 @@ with new_tab:
                     "elite_ratio": elite_ratio,
                 },
                 "pysr": {
+                    "feature_profile": pysr_profile,
+                    "max_lag": pysr_max_lag,
                     "target": pysr_target,
                     "binary_operators": pysr_binary_operators,
                     "unary_operators": pysr_unary_operators,
@@ -857,13 +998,11 @@ with new_tab:
                 st.session_state["research_preflight_input_key"] = preflight_disk_key
                 st.session_state["research_preflight_checked_at"] = disk_cache["checked_at"]
                 cache_loaded_from_disk = True
-        preflight_submitted = st.form_submit_button("연구 환경 사전 검사")
         saved_preflight = st.session_state.get("research_preflight_report", {})
         preflight_ready = (
             st.session_state.get("research_preflight_input_key") == preflight_disk_key
             and saved_preflight.get("status") == "passed"
         )
-        submitted = st.form_submit_button("새 연구 시작", type="primary")
 
     effective_config = None
     config_error = None
@@ -895,10 +1034,10 @@ with new_tab:
         try:
             pysr_config = PySRConfig(
                 target=pysr_target,
-                feature_profile=profile,
+                feature_profile=pysr_profile,
                 train_ratio=float(pysr_train_ratio),
                 validation_ratio=float(pysr_validation_ratio),
-                max_lag=int(max_lag),
+                max_lag=int(pysr_max_lag),
                 timeout_seconds=float(pysr_timeout),
                 niterations=int(pysr_iterations),
                 population_size=int(pysr_population),
@@ -1123,6 +1262,16 @@ with new_tab:
             st.error("현재 엔진·설정 조합의 사전 검사가 완료되지 않아 연구를 시작하지 않았습니다.")
         elif new_dataset is None or effective_config is None or invalid_profile:
             st.error("데이터 또는 설정 검증을 통과하지 못해 연구를 시작하지 않았습니다.")
+        elif optimization_context and (
+            not optimization_context.get("application_verified")
+            or "intermittent_gp" not in engines
+            or profile != optimization_context.get("feature_profile")
+            or current_data_range != optimization_context.get("dataset_range")
+        ):
+            st.error(
+                "적용한 Optuna 설정과 현재 연구 조건이 호환되지 않습니다. "
+                "GP 포함 엔진, 동일한 특징 프로파일과 데이터 범위를 선택한 뒤 다시 확인하세요."
+            )
         else:
             checkpoint_path = checkpoint_dir / (
                 f"research_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"
@@ -1150,6 +1299,24 @@ with new_tab:
                     "config": asdict(effective_config),
                     "engines": list(engines),
                     "pysr_config": asdict(pysr_config) if pysr_config is not None else None,
+                    "optimization_origin": (
+                        optimization_origin_record(
+                            study={
+                                "optuna_study_id": optimization_context.get("optuna_study_id"),
+                                "study_name": optimization_context["study_name"],
+                                "best_trial_number": optimization_context["trial_number"],
+                                "feature_profile": optimization_context["feature_profile"],
+                                "dataset_range": optimization_context["dataset_range"],
+                            },
+                            parameters=optimization_context["parameters"],
+                            research_settings=current_research_settings,
+                            applied_at=optimization_context["applied_at"],
+                            modified=optimization_context.get("modified_by_user", False),
+                        )
+                        | {"state": "queued"}
+                        if optimization_context
+                        else None
+                    ),
                     "completed_runs": 0,
                     "target_duration_seconds": float(duration_minutes) * 60,
                     "completed_experiment_ids": [],
@@ -1168,13 +1335,73 @@ with new_tab:
                 candidate_replay_threshold=int(candidate_replay_threshold),
             )
             try:
-                pid = _launch_worker(
-                    command, checkpoint_path, checkpoint_dir / "research_worker.log"
-                )
-                st.session_state["monitor_research_checkpoint"] = str(checkpoint_path)
-                st.success(
-                    f"연구 {research_round}회차를 시작했습니다 (PID {pid}; ID {research_id})."
-                )
+                with st.status("연구 작업을 시작하고 있습니다.", expanded=True) as start_status:
+                    st.write("연구 설정과 최적화 출처를 저장했습니다.")
+                    st.write("백그라운드 연구 프로세스를 시작하는 중입니다.")
+                    pid = _launch_worker(
+                        command, checkpoint_path, checkpoint_dir / "research_worker.log"
+                    )
+                    st.session_state["monitor_research_checkpoint"] = str(checkpoint_path)
+                    started = False
+                    for _ in range(20):
+                        if _worker_active(checkpoint_path):
+                            started = True
+                            break
+                        time.sleep(0.1)
+                    if started:
+                        started_at = datetime.now(UTC).isoformat()
+                        origin = None
+                        if optimization_context:
+                            origin = optimization_origin_record(
+                                study={
+                                    "optuna_study_id": optimization_context.get("optuna_study_id"),
+                                    "study_name": optimization_context["study_name"],
+                                    "best_trial_number": optimization_context["trial_number"],
+                                    "feature_profile": optimization_context["feature_profile"],
+                                    "dataset_range": optimization_context["dataset_range"],
+                                },
+                                parameters=optimization_context["parameters"],
+                                research_settings=current_research_settings,
+                                applied_at=optimization_context["applied_at"],
+                                modified=optimization_context.get("modified_by_user", False),
+                            )
+                            origin.update(
+                                {
+                                    "state": "running",
+                                    "started_at": started_at,
+                                    "research_id": research_id,
+                                }
+                            )
+                        rounds.update(
+                            research_id,
+                            {
+                                "status": "running",
+                                "worker_pid": pid,
+                                "started_at": started_at,
+                                "optimization_origin": origin,
+                            },
+                        )
+                        if optimization_context:
+                            started_ids = optimization_context.setdefault(
+                                "started_research_ids", []
+                            )
+                            if research_id not in started_ids:
+                                started_ids.append(research_id)
+                            st.session_state["optimization_applied_context"] = optimization_context
+                        start_status.update(label="연구 실행 중", state="complete")
+                        st.success(
+                            f"연구가 실행 중입니다 · ID `{research_id}` · PID {pid} · "
+                            f"{engine_choice} · {profile_names[profile]} · {duration_minutes:,}분"
+                        )
+                    else:
+                        start_status.update(
+                            label="실행 요청 전달됨 · 시작 확인 중", state="running"
+                        )
+                        st.info(
+                            f"실행 요청을 전달했습니다 (PID {pid}, 연구 ID `{research_id}`). "
+                            "작업 프로세스의 실제 시작은 아직 확인되지 않았습니다. "
+                            "잠시 후 상태를 확인하세요."
+                        )
             except (OSError, RuntimeError) as error:
                 rounds.update(
                     research_id,
