@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 
+import plotly.graph_objects as go
 import streamlit as st
 
 from lotto_pattern_lab.dataset import load_csv
@@ -19,6 +20,7 @@ from lotto_pattern_lab.formula_replay_queue import (
 )
 from lotto_pattern_lab.paths import project_path
 from lotto_pattern_lab.storage import ExperimentStore
+from lotto_pattern_lab.temporal_analysis import analyze_temporal_performance
 
 st.set_page_config(page_title="전체 회차 재검증", layout="wide")
 st.title("전체 회차 재검증")
@@ -307,6 +309,64 @@ if jobs:
                         if row.get("match_count") is not None and row["match_count"] >= minimum_hits
                     ]
                 st.dataframe(display_rows, hide_index=True, width="stretch")
+                with st.expander("구간별 성능 변화 분석", expanded=False):
+                    window_size = st.selectbox(
+                        "이동 구간 크기",
+                        (30, 50, 100),
+                        index=1,
+                        help="각 점은 선택한 수의 연속 평가 회차를 요약합니다.",
+                        key=f"temporal-window:{job['job_id']}",
+                    )
+                    temporal = analyze_temporal_performance(
+                        rows, window_size=int(window_size)
+                    )
+                    st.caption(
+                        f"평가 가능 {temporal['evaluable_round_count']}회 · "
+                        f"구간 {temporal['window_count']}개 · "
+                        "전체 회차 재적용의 사후 분석"
+                    )
+                    if temporal["windows"]:
+                        temporal_frame = temporal["windows"]
+                        chart = go.Figure()
+                        chart.add_trace(
+                            go.Scatter(
+                                x=[item["end_round"] for item in temporal_frame],
+                                y=[item["average_hits_per_target"] for item in temporal_frame],
+                                mode="lines+markers",
+                                name="대상 회차당 평균 적중",
+                            )
+                        )
+                        chart.add_trace(
+                            go.Scatter(
+                                x=[item["end_round"] for item in temporal_frame],
+                                y=[item["gate_activation_rate"] for item in temporal_frame],
+                                mode="lines+markers",
+                                name="게이트 활성 비율",
+                                yaxis="y2",
+                            )
+                        )
+                        chart.update_layout(
+                            xaxis_title="회차",
+                            yaxis_title="대상 회차당 평균 적중 수",
+                            yaxis2={
+                                "title": "게이트 활성 비율",
+                                "overlaying": "y",
+                                "side": "right",
+                                "range": [0, 1],
+                            },
+                            legend={"orientation": "h"},
+                        )
+                        st.plotly_chart(chart, width="stretch")
+                        st.dataframe(temporal_frame, hide_index=True, width="stretch")
+                        if temporal["descriptive_change_points"]:
+                            st.dataframe(
+                                temporal["descriptive_change_points"],
+                                hide_index=True,
+                                width="stretch",
+                            )
+                    else:
+                        st.info("선택한 구간 크기만큼 평가 가능한 과거 회차가 없습니다.")
+                    st.caption(temporal["interpretation"])
                 st.download_button(
                     "회차별 결과 CSV 다운로드",
                     data=csv_buffer.getvalue().encode("utf-8-sig"),
