@@ -57,7 +57,10 @@ from lotto_pattern_lab.research_optimization_apply import (
 )
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
-from lotto_pattern_lab.research_startup import research_startup_message
+from lotto_pattern_lab.research_startup import (
+    research_startup_message,
+    worker_start_failure_metadata,
+)
 from lotto_pattern_lab.research_time import (
     checkpoint_status_label,
     format_hhmmss,
@@ -301,7 +304,9 @@ def _resume_records(rounds: ResearchRoundStore) -> list[dict[str, Any]]:
     return sorted(records, key=lambda item: int(item.get("research_round", 0)), reverse=True)
 
 
-def _launch_worker(command: list[str], checkpoint_path: Path, log_path: Path) -> int:
+def _launch_worker(
+    command: list[str], checkpoint_path: Path, log_path: Path
+) -> subprocess.Popen[bytes]:
     checkpoint_path = checkpoint_path.resolve()
     launch_path = Path(f"{checkpoint_path}.launch")
     with interprocess_lock(checkpoint_path, timeout=0, scope="research-launch"):
@@ -341,7 +346,32 @@ def _launch_worker(command: list[str], checkpoint_path: Path, log_path: Path) ->
             raise
         finally:
             log_file.close()
-        return int(process.pid)
+        return process
+
+
+def _launch_checkpoint_state(checkpoint_path: Path, research_id: str) -> dict[str, Any] | None:
+    """Return a checkpoint only when it is valid and belongs to this launch."""
+    if not checkpoint_path.is_file():
+        return None
+    try:
+        state = load_checkpoint(checkpoint_path)
+    except (OSError, ValueError):
+        return None
+    return state if state.get("research_id") == research_id else None
+
+
+def _mark_worker_start_failed(
+    rounds: ResearchRoundStore,
+    research_id: str,
+    worker_pid: int,
+    exit_code: int,
+    log_path: Path,
+) -> None:
+    """Record a launch failure only after the child exited before writing its checkpoint."""
+    rounds.update(
+        research_id,
+        worker_start_failure_metadata(worker_pid, exit_code, log_path),
+    )
 
 
 def _research_command(
@@ -1778,55 +1808,90 @@ with new_tab:
                     ) as start_status:
                         st.write("연구 설정과 최적화 출처를 저장했습니다.")
                         st.write("백그라운드 연구 프로세스를 시작하는 중입니다.")
-                        pid = _launch_worker(
+                        worker = _launch_worker(
                             command, checkpoint_path, checkpoint_dir / "research_worker.log"
                         )
+                        pid = int(worker.pid)
                         st.session_state["monitor_research_checkpoint"] = str(checkpoint_path)
                         st.session_state["research_launch_pid"] = pid
                         st.session_state["research_launch_status"] = "process_verifying"
                         started = False
+                        checkpoint_state = None
                         for _ in range(20):
                             if _worker_active(checkpoint_path):
                                 started = True
                                 break
+                            checkpoint_state = _launch_checkpoint_state(
+                                checkpoint_path, research_id
+                            )
+                            if checkpoint_state is not None:
+                                started = True
+                                break
+                            if worker.poll() is not None:
+                                break
                             time.sleep(0.1)
                         if started:
-                            st.session_state["research_launch_status"] = "first_checkpoint_waiting"
-                            started_at = datetime.now(UTC).isoformat()
-                            origin = None
-                            if optimization_context:
-                                origin = optimization_origin_record(
-                                    study={
-                                        "optuna_study_id": optimization_context.get(
-                                            "optuna_study_id"
-                                        ),
-                                        "study_name": optimization_context["study_name"],
-                                        "best_trial_number": optimization_context["trial_number"],
-                                        "feature_profile": optimization_context["feature_profile"],
-                                        "dataset_range": optimization_context["dataset_range"],
-                                    },
-                                    parameters=optimization_context["parameters"],
-                                    research_settings=current_research_settings,
-                                    applied_at=optimization_context["applied_at"],
-                                    modified=optimization_context.get("modified_by_user", False),
-                                )
-                                origin.update(
-                                    {
-                                        "state": "running",
-                                        "started_at": started_at,
-                                        "research_id": research_id,
-                                    }
-                                )
-                            rounds.update(
-                                research_id,
-                                {
-                                    "status": "running",
-                                    "worker_pid": pid,
-                                    "started_at": started_at,
-                                    "optimization_origin": origin,
-                                },
+                            persisted_status = (
+                                checkpoint_state.get("status") if checkpoint_state else None
                             )
-                            if optimization_context:
+                            if checkpoint_state:
+                                rounds.update(research_id, _round_metadata(checkpoint_state))
+                                if persisted_status in {
+                                    "running",
+                                    "completed",
+                                    "failed",
+                                    "paused",
+                                    "interrupted",
+                                }:
+                                    st.session_state["research_launch_status"] = persisted_status
+                            else:
+                                st.session_state["research_launch_status"] = (
+                                    "first_checkpoint_waiting"
+                                )
+                                started_at = datetime.now(UTC).isoformat()
+                                origin = None
+                                if optimization_context:
+                                    origin = optimization_origin_record(
+                                        study={
+                                            "optuna_study_id": optimization_context.get(
+                                                "optuna_study_id"
+                                            ),
+                                            "study_name": optimization_context["study_name"],
+                                            "best_trial_number": optimization_context[
+                                                "trial_number"
+                                            ],
+                                            "feature_profile": optimization_context[
+                                                "feature_profile"
+                                            ],
+                                            "dataset_range": optimization_context[
+                                                "dataset_range"
+                                            ],
+                                        },
+                                        parameters=optimization_context["parameters"],
+                                        research_settings=current_research_settings,
+                                        applied_at=optimization_context["applied_at"],
+                                        modified=optimization_context.get(
+                                            "modified_by_user", False
+                                        ),
+                                    )
+                                    origin.update(
+                                        {
+                                            "state": "running",
+                                            "started_at": started_at,
+                                            "research_id": research_id,
+                                        }
+                                    )
+                                rounds.update(
+                                    research_id,
+                                    {
+                                        "status": "running",
+                                        "worker_pid": pid,
+                                        "started_at": started_at,
+                                        "optimization_origin": origin,
+                                    },
+                                )
+                                persisted_status = "running"
+                            if optimization_context and persisted_status == "running":
                                 started_ids = optimization_context.setdefault(
                                     "started_research_ids", []
                                 )
@@ -1835,22 +1900,58 @@ with new_tab:
                                 st.session_state["optimization_applied_context"] = (
                                     optimization_context
                                 )
-                            start_status.update(label="연구 실행 중", state="complete")
-                            st.success(
-                                f"연구가 실행 중입니다 · ID `{research_id}` · PID {pid} · "
-                                f"{engine_choice} · {profile_names[profile]} · "
-                                f"{duration_minutes:,}분"
-                            )
+                            if persisted_status in {
+                                "completed",
+                                "failed",
+                                "paused",
+                                "interrupted",
+                            }:
+                                st.session_state["research_launch_status"] = persisted_status
+                                start_status.update(
+                                    label=f"워커 종료 상태 확인: {persisted_status}",
+                                    state="complete",
+                                )
+                                st.info(
+                                    f"연구 ID `{research_id}`의 체크포인트에서 "
+                                    f"최종 상태 {persisted_status}를 확인했습니다."
+                                )
+                            else:
+                                start_status.update(label="연구 실행 중", state="complete")
+                                st.success(
+                                    f"연구가 실행 중입니다 · ID `{research_id}` · PID {pid} · "
+                                    f"{engine_choice} · {profile_names[profile]} · "
+                                    f"{duration_minutes:,}분"
+                                )
                         else:
-                            st.session_state["research_launch_status"] = "start_unconfirmed"
-                            start_status.update(
-                                label="실행 요청 전달됨 · 시작 확인 중", state="running"
-                            )
-                            st.info(
-                                f"실행 요청을 전달했습니다 (PID {pid}, 연구 ID `{research_id}`). "
-                                "작업 프로세스의 실제 시작은 아직 확인되지 않았습니다. "
-                                "잠시 후 상태를 확인하세요."
-                            )
+                            exit_code = worker.poll()
+                            if exit_code is not None:
+                                _mark_worker_start_failed(
+                                    rounds,
+                                    research_id,
+                                    pid,
+                                    int(exit_code),
+                                    checkpoint_dir / "research_worker.log",
+                                )
+                                st.session_state["research_launch_status"] = "start_failed"
+                                start_status.update(
+                                    label="연구 워커가 체크포인트 생성 전에 종료됨",
+                                    state="error",
+                                )
+                                st.error(
+                                    f"연구 워커가 체크포인트를 쓰기 전에 종료했습니다 "
+                                    f"(exit code {exit_code}). worker 로그를 확인하세요."
+                                )
+                            else:
+                                st.session_state["research_launch_status"] = "start_unconfirmed"
+                                start_status.update(
+                                    label="실행 요청 전달됨 · 시작 확인 중", state="running"
+                                )
+                                st.info(
+                                    f"실행 요청을 전달했습니다 "
+                                    f"(PID {pid}, 연구 ID `{research_id}`). "
+                                    "작업 프로세스의 실제 시작은 아직 확인되지 않았습니다. "
+                                    "잠시 후 상태를 확인하세요."
+                                )
                 except (OSError, RuntimeError) as error:
                     st.session_state["research_launch_status"] = "start_failed"
                     rounds.update(
@@ -1986,7 +2087,8 @@ with resume_tab:
                 resume=True,
             )
             try:
-                pid = _launch_worker(command, path, checkpoint_dir / "research_worker.log")
+                worker = _launch_worker(command, path, checkpoint_dir / "research_worker.log")
+                pid = int(worker.pid)
                 st.session_state["monitor_research_checkpoint"] = str(path)
                 st.success(f"연구 {state.get('research_round')}회차를 재개했습니다 (PID {pid}).")
                 st.rerun()

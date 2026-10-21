@@ -267,6 +267,12 @@ def _run_research_cli(argv: list[str]) -> None:
     )
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--research-mode",
+        choices=("legacy", "independent", "cumulative"),
+        default="legacy",
+    )
+    parser.add_argument("--optimization-origin-json", default="null")
     parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)
     parser.add_argument("--generations", type=int, default=GP_DEFAULTS.generations)
     parser.add_argument("--crossover", type=float, default=GP_DEFAULTS.crossover_probability)
