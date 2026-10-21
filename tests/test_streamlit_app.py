@@ -71,7 +71,8 @@ def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypat
     subheaders = {item.value for item in app.subheader}
     assert "\ud328\ud134 \ub77c\uc774\ube0c\ub7ec\ub9ac" not in subheaders
     labels = [button.label for button in app.button]
-    assert "연구 환경 사전 검사" in labels
+    assert any(button.key == "run_new_research_preflight" for button in app.button)
+    assert "\ud658\uacbd \uc804\uccb4 \uc7ac\uac80\uc0ac" in labels
     assert "새 연구 시작" in labels
     start_button = next(button for button in app.button if button.label == "새 연구 시작")
     assert not start_button.disabled

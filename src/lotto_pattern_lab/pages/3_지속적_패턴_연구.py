@@ -17,8 +17,10 @@ from typing import Any
 
 import streamlit as st
 
+from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.optimization_process_state import launch_optimization_worker
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
+from lotto_pattern_lab.preflight import get_or_run_research_preflight
 from lotto_pattern_lab.research import research_worker_active
 from lotto_pattern_lab.research_optimization import (
     estimate_optimization_remaining_seconds,
@@ -852,6 +854,19 @@ def _start_optimization(
         conflict = _execution_conflict(records)
         if conflict:
             raise RuntimeError(conflict)
+        gp_config = IntermittentConfig(
+            feature_profile=profile,
+            workers=1,
+            control_runs=0,
+        )
+        with st.spinner("GP/Optuna 실행 환경을 확인하고 있습니다."):
+            preflight = get_or_run_research_preflight(
+                dataset, gp_config, ("intermittent_gp",)
+            )
+        if preflight["report"].get("status") != "passed":
+            raise RuntimeError(
+                f"GP/Optuna 실행 환경 검사 실패: {preflight['report'].get('engines')}"
+            )
         run_id = str(uuid.uuid4())
         command = [
             sys.executable,
@@ -925,6 +940,7 @@ def _start_existing_optimization(
         if path.is_file()
     ]
     selected = None
+    selected_dataset = None
     for candidate in candidates:
         try:
             from lotto_pattern_lab.dataset import load_csv
@@ -932,6 +948,7 @@ def _start_existing_optimization(
             ds = load_csv(candidate)
             if expected_range == [ds.records[0].round_number, ds.records[-1].round_number]:
                 selected = candidate
+                selected_dataset = ds
                 break
         except (OSError, ValueError, IndexError):
             continue
@@ -966,6 +983,19 @@ def _start_existing_optimization(
         conflict = _execution_conflict(list_optimization_studies())
         if conflict:
             raise RuntimeError(conflict)
+        gp_config = IntermittentConfig(
+            feature_profile=profile,
+            workers=1,
+            control_runs=0,
+        )
+        with st.spinner("기존 Study의 GP 실행 환경을 확인하고 있습니다."):
+            preflight = get_or_run_research_preflight(
+                selected_dataset, gp_config, ("intermittent_gp",)
+            )
+        if preflight["report"].get("status") != "passed":
+            raise RuntimeError(
+                f"GP/Optuna 실행 환경 검사 실패: {preflight['report'].get('engines')}"
+            )
         with st.status(
             "기존 Optuna 연구를 확인하고 이어서 실행합니다", expanded=True
         ) as status_box:

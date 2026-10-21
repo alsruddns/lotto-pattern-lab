@@ -516,6 +516,21 @@ class ResearchQueueStore:
         item["config"] = json.loads(item.pop("config_json"))
         return item
 
+    def release_claim(self, item_id: str, *, status: str = "waiting") -> None:
+        """Return a claimed item to a safe waiting state when the global slot became busy."""
+        if status not in {"waiting", "paused", "interrupted"}:
+            raise ValueError("A released reservation must return to a waiting or resumable state.")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cursor = db.execute(
+                """UPDATE research_queue_items SET status=?,
+                started_at=CASE WHEN ?='waiting' THEN NULL ELSE started_at END,
+                completed_at=NULL,updated_at=? WHERE item_id=? AND status='running'""",
+                (status, status, _now(), item_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Reservation claim changed before it could be released.")
+
     def finish_item(self, item_id: str, status: str, *, error: str | None = None) -> None:
         if status not in {"paused", "completed", "failed", "interrupted", "skipped"}:
             raise ValueError("Invalid terminal reservation status.")

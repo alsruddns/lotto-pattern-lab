@@ -10,14 +10,25 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .dataset import load_csv
+from .engines import GP_ENGINE_ID, PYSR_ENGINE_ID
+from .intermittent import IntermittentConfig
 from .paths import PROJECT_ROOT, project_path
+from .preflight import get_or_run_research_preflight
+from .pysr_backend import PySRConfig
 from .research import load_checkpoint, request_pause, research_worker_active
 from .research_queue import ResearchQueueStore
 from .research_rounds import ResearchRoundStore
 from .storage_management import load_storage_settings, storage_inventory, storage_over_quota
+
+
+class ExecutionSlotBusy(RuntimeError):
+    """The shared worker slot became occupied while a reservation was being checked."""
 
 
 def start_detached_scheduler(store: ResearchQueueStore, queue_id: str) -> int:
@@ -143,6 +154,46 @@ def _research_command(
     return command
 
 
+def _check_queued_item_environment(item: dict[str, Any]) -> None:
+    """Run a cached per-engine smoke check before a detached queue launches a worker."""
+    settings = item["config"]
+    dataset = load_csv(project_path(settings.get("csv", "data/official/draws.csv")))
+    config_values = {
+        field.name: settings[field.name]
+        for field in fields(IntermittentConfig)
+        if field.name in settings
+    }
+    if "elite_seeding" in settings and "elite_seeding_enabled" not in config_values:
+        config_values["elite_seeding_enabled"] = bool(settings["elite_seeding"])
+    if "elite_seed_ratio" in settings:
+        config_values["elite_seed_ratio"] = float(settings["elite_seed_ratio"])
+    config_values.setdefault("feature_profile", item["feature_profile"])
+    config = IntermittentConfig(**config_values)
+    engine = item["engine"]
+    engines = (
+        (GP_ENGINE_ID, PYSR_ENGINE_ID)
+        if engine == "comparison"
+        else (engine,)
+    )
+    pysr_values = settings.get("pysr") or {}
+    pysr_values = dict(pysr_values)
+    for key in ("binary_operators", "unary_operators", "guesses"):
+        if key in pysr_values:
+            pysr_values[key] = tuple(pysr_values[key])
+    pysr_config = PySRConfig(**pysr_values) if PYSR_ENGINE_ID in engines else None
+    result = get_or_run_research_preflight(dataset, config, engines, pysr_config)
+    report = result["report"]
+    failures = [
+        f"{engine_id}: {engine_report.get('error', 'preflight failed')}"
+        for engine_id, engine_report in report.get("engines", {}).items()
+        if engine_report.get("status") != "passed"
+    ]
+    if failures:
+        raise RuntimeError("Research environment check failed: " + "; ".join(failures))
+    if research_worker_active():
+        raise ExecutionSlotBusy("Another research worker acquired the shared execution slot.")
+
+
 def scheduler_step(
     store: ResearchQueueStore,
     queue_id: str,
@@ -203,9 +254,23 @@ def scheduler_step(
         checkpoint = Path(item["checkpoint_path"])
         try:
             pid = launch(item, checkpoint, item["research_id"])
+        except ExecutionSlotBusy:
+            store.release_claim(item["item_id"], status=resumable["status"])
+            return "waiting_for_global_worker"
         except Exception as error:
             store.finish_item(item["item_id"], "failed", error=str(error))
             store.set_queue_status(queue_id, "failed")
+            round_store = round_store or ResearchRoundStore(
+                workspace_root / "data" / "database" / "patterns.sqlite"
+            )
+            round_store.update(
+                item["research_id"],
+                {
+                    "status": "failed",
+                    "failure_reason": str(error),
+                    "ended_at": datetime.now(UTC).isoformat(),
+                },
+            )
             return "queue_failed"
         store.set_item_research(
             item["item_id"], item["research_id"], item["research_round"], str(checkpoint), pid
@@ -214,33 +279,50 @@ def scheduler_step(
     item = store.claim_next(queue_id)
     if item is None:
         return store.queue(queue_id)["status"]
-    research_id = str(uuid.uuid4())
-    checkpoint = workspace_root / "checkpoints" / "research_queue" / f"{item['item_id']}.json"
+    research_id = str(item.get("research_id") or uuid.uuid4())
+    checkpoint = Path(
+        item.get("checkpoint_path")
+        or workspace_root / "checkpoints" / "research_queue" / f"{item['item_id']}.json"
+    )
     round_store = round_store or ResearchRoundStore(
         workspace_root / "data" / "database" / "patterns.sqlite"
     )
-    round_number = round_store.ensure_round(
-        research_id,
-        {
-            "status": "queued",
-            "queue_id": queue_id,
-            "queue_item_id": item["item_id"],
-            "schedule_mode": item.get("schedule_mode", "after_completion"),
-            "scheduled_at": item.get("scheduled_at"),
-            "planned_duration_seconds": item["duration_seconds"],
-            "research_mode": item["config"].get("research_mode", "independent"),
-            "feature_profile": item["feature_profile"],
-            "config": item["config"],
-        },
-        workspace_root / "checkpoints",
-        workspace_root / "experiments",
-    )
+    round_number = item.get("research_round")
+    if round_number is None:
+        round_number = round_store.ensure_round(
+            research_id,
+            {
+                "status": "queued",
+                "queue_id": queue_id,
+                "queue_item_id": item["item_id"],
+                "schedule_mode": item.get("schedule_mode", "after_completion"),
+                "scheduled_at": item.get("scheduled_at"),
+                "planned_duration_seconds": item["duration_seconds"],
+                "research_mode": item["config"].get("research_mode", "independent"),
+                "feature_profile": item["feature_profile"],
+                "config": item["config"],
+            },
+            workspace_root / "checkpoints",
+            workspace_root / "experiments",
+        )
     try:
         pid = launch(item, checkpoint, research_id)
+    except ExecutionSlotBusy:
+        store.set_item_research(item["item_id"], research_id, int(round_number), str(checkpoint))
+        store.release_claim(item["item_id"], status="waiting")
+        return "waiting_for_global_worker"
     except Exception as error:
         store.set_item_research(item["item_id"], research_id, round_number, str(checkpoint))
         store.finish_item(item["item_id"], "failed", error=str(error))
         store.set_queue_status(queue_id, "failed")
+        round_store.update(
+            research_id,
+            {
+                "status": "failed",
+                "failure_reason": str(error),
+                "ended_at": datetime.now(UTC).isoformat(),
+            },
+        )
         return "queue_failed"
     store.set_item_research(item["item_id"], research_id, round_number, str(checkpoint), pid)
     return "worker_started"
@@ -256,6 +338,7 @@ def run_forever(
         return
 
     def launch(item: dict[str, Any], checkpoint: Path, research_id: str) -> int:
+        _check_queued_item_environment(item)
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         log = PROJECT_ROOT / "logs" / "research_queue" / f"{item['item_id']}.log"
         log.parent.mkdir(parents=True, exist_ok=True)

@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import random
 import tempfile
+import time
 import traceback
 import uuid
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ from .intermittent import (
     run_intermittent_search,
 )
 from .intermittent_experiment import _splits_for
+from .preflight_cache import load_preflight_cache, preflight_cache_key, save_preflight_cache
 from .pysr_backend import PySRConfig, run_pysr_experiment
 from .storage import ExperimentStore
 
@@ -203,6 +206,7 @@ def run_research_preflight(
         "engines": {},
     }
     for engine_id in engines:
+        started_at = time.perf_counter()
         try:
             if engine_id == GP_ENGINE_ID:
                 result = _run_gp_checks(dataset, config, elite_seeds)
@@ -212,6 +216,7 @@ def run_research_preflight(
                 result = _run_pysr_check(dataset, pysr_config)
             else:
                 raise ValueError(f"No preflight is defined for engine {engine_id!r}.")
+            result["runtime_seconds"] = round(time.perf_counter() - started_at, 3)
             report["engines"][engine_id] = result
         except Exception as error:
             report["engines"][engine_id] = {
@@ -224,6 +229,7 @@ def run_research_preflight(
                 "error_type": type(error).__name__,
                 "error": str(error),
                 "traceback": traceback.format_exc(),
+                "runtime_seconds": round(time.perf_counter() - started_at, 3),
             }
     report["status"] = (
         "passed"
@@ -233,3 +239,106 @@ def run_research_preflight(
         else "failed"
     )
     return report
+
+
+def research_preflight_cache_key(
+    dataset: DrawDataset,
+    config: IntermittentConfig,
+    engines: tuple[str, ...],
+    pysr_config: PySRConfig | None = None,
+    elite_seeds: tuple[dict[str, object], ...] = (),
+    *,
+    dataset_sha256: str | None = None,
+) -> str:
+    """Key expensive smoke checks only by inputs that can affect their outcome."""
+    metadata = dataset_metadata(dataset) if dataset_sha256 is None else {}
+    settings: dict[str, Any] = {
+        "dataset_sha256": dataset_sha256 or metadata.get("dataset_sha256"),
+        "engines": list(engines),
+    }
+    if GP_ENGINE_ID in engines:
+        settings["gp"] = {
+            key: getattr(config, key)
+            for key in (
+                "crossover_probability",
+                "mutation_probability",
+                "max_depth",
+                "train_ratio",
+                "validation_ratio",
+                "max_lag",
+                "min_activation_rate",
+                "hidden_states",
+                "seed",
+                "feature_profile",
+                "elite_seeding_enabled",
+                "elite_seed_ratio",
+            )
+        }
+        settings["elite_seeds"] = [
+            {
+                key: seed.get(key)
+                for key in ("pattern_id", "candidate_id", "expression", "feature_profile")
+                if key in seed
+            }
+            for seed in elite_seeds
+        ]
+    if PYSR_ENGINE_ID in engines:
+        if pysr_config is None:
+            settings["pysr"] = None
+        else:
+            settings["pysr"] = {
+                key: getattr(pysr_config, key)
+                for key in (
+                    "feature_profile",
+                    "train_ratio",
+                    "validation_ratio",
+                    "max_lag",
+                    "seed",
+                    "binary_operators",
+                    "unary_operators",
+                )
+            }
+    return preflight_cache_key(settings)
+
+
+def get_or_run_research_preflight(
+    dataset: DrawDataset,
+    config: IntermittentConfig,
+    engines: tuple[str, ...],
+    pysr_config: PySRConfig | None = None,
+    elite_seeds: tuple[dict[str, object], ...] = (),
+    *,
+    dataset_sha256: str | None = None,
+    force: bool = False,
+    cache_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Reuse a fresh engine smoke report or run and persist a new one."""
+    key = research_preflight_cache_key(
+        dataset,
+        config,
+        engines,
+        pysr_config,
+        elite_seeds,
+        dataset_sha256=dataset_sha256,
+    )
+    if not force:
+        cached = load_preflight_cache(key, cache_path, engines=engines)
+        if cached is not None:
+            return {**cached, "cache_used": True, "runtime_seconds": 0.0}
+    started = time.perf_counter()
+    report = run_research_preflight(dataset, config, engines, pysr_config, elite_seeds)
+    report["runtime_seconds"] = round(time.perf_counter() - started, 3)
+    checked_at = datetime.now(UTC).isoformat()
+    try:
+        save_preflight_cache(key, report, cache_path, engines=engines)
+        cache_saved = True
+    except OSError:
+        cache_saved = False
+    return {
+        "report": report,
+        "checked_at": checked_at,
+        "cache_key": key,
+        "cache_used": False,
+        "cache_saved": cache_saved,
+        "runtime_seconds": report["runtime_seconds"],
+    }

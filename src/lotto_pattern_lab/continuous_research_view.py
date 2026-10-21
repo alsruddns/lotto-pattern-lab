@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
@@ -32,11 +31,13 @@ from lotto_pattern_lab.feature_schema import feature_schema_version
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
-from lotto_pattern_lab.preflight import run_research_preflight
+from lotto_pattern_lab.preflight import (
+    get_or_run_research_preflight,
+    research_preflight_cache_key,
+)
 from lotto_pattern_lab.preflight_cache import (
     load_preflight_cache,
-    preflight_cache_key,
-    save_preflight_cache,
+    preflight_report_is_fresh,
 )
 from lotto_pattern_lab.presentation import format_count, format_duration
 from lotto_pattern_lab.pysr_backend import PySRConfig, optional_backend_status
@@ -63,7 +64,6 @@ from lotto_pattern_lab.research_optimization_apply import (
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
 from lotto_pattern_lab.research_startup import (
-    research_startup_message,
     worker_start_failure_metadata,
 )
 from lotto_pattern_lab.research_time import (
@@ -82,6 +82,23 @@ GP_PRESETS = {
     480: {"population": 112, "generations": 35, "max_depth": 7, "controls": 10},
 }
 ENGINE_OPTIONS = ("GP 간헐 패턴 탐색", "PySR 기호 회귀", "GP와 PySR 비교")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_dataset_input(
+    csv_path: str, modified_ns: int, file_size: int
+) -> tuple[Any, dict[str, Any], str]:
+    del modified_ns, file_size
+    dataset = load_csv(Path(csv_path))
+    return dataset, dataset_integrity_report(dataset), dataset_digest(dataset)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_dataset_hashes(
+    csv_path: str, modified_ns: int, file_size: int, max_lag: int
+) -> dict[str, str]:
+    dataset, _, _ = _cached_dataset_input(csv_path, modified_ns, file_size)
+    return dataset_hashes(dataset, max_lag=max_lag)
 
 
 def _apply_research_preset() -> None:
@@ -146,11 +163,6 @@ def _remember_custom_duration() -> None:
 PAUSE_MESSAGE = (
     "일시정지 요청 완료. 현재 진행 중인 실험의 계산과 저장이 끝난 후 자동으로 일시정지됩니다."
 )
-
-
-def _preflight_fingerprint(payload: dict[str, Any]) -> str:
-    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _worker_active(checkpoint_path: Path) -> bool:
@@ -776,20 +788,29 @@ with new_tab:
         if data_label == "보너스 번호 포함 CSV"
         else "data/official/draws.csv"
     )
+    new_dataset_digest = None
+    dataset_file_signature = None
     try:
-        new_dataset = load_csv(csv_path)
-        new_integrity = dataset_integrity_report(new_dataset)
+        data_stat = csv_path.stat()
+        dataset_file_signature = (data_stat.st_mtime_ns, data_stat.st_size)
+        new_dataset, new_integrity, new_dataset_digest = _cached_dataset_input(
+            str(csv_path.resolve()), data_stat.st_mtime_ns, data_stat.st_size
+        )
+        bonus_label = (
+            "포함" if new_integrity["all_draws_have_bonus"] else "미포함"
+        )
+        date_label = (
+            "포함" if new_integrity["all_draws_dated"] else "미포함"
+        )
         st.caption(
-            f"기준 데이터 상태: {new_dataset.verification_status}; "
+            f"데이터 상태: {new_dataset.verification_status}; "
             f"회차 {new_dataset.records[0].round_number}~{new_dataset.records[-1].round_number}; "
-            f"보너스 번호 {'포함' if new_integrity['all_draws_have_bonus'] else '미포함'}; "
-            f"날짜 {'포함' if new_integrity['all_draws_dated'] else '미포함'}"
+            f"보너스 번호 {bonus_label}, 날짜 {date_label}"
         )
     except (OSError, ValueError, IndexError) as error:
         new_dataset = None
         new_integrity = None
-        st.error(f"기준 데이터를 읽지 못했습니다: {error}")
-
+        st.error(f"선택한 데이터를 읽지 못했습니다: {error}")
     st.session_state.setdefault("new_research_engine", ENGINE_OPTIONS[0])
     st.session_state.setdefault("new_profile", "legacy")
     st.session_state.setdefault("new_duration_minutes", 180)
@@ -888,8 +909,13 @@ with new_tab:
     st.session_state["research_current_dataset_range"] = current_data_range
     st.session_state["research_current_dataset_integrity"] = new_integrity
     current_dataset_hashes = (
-        dataset_hashes(new_dataset, max_lag=int(st.session_state.get("new_max_lag", 10)))
-        if new_dataset is not None
+        _cached_dataset_hashes(
+            str(csv_path.resolve()),
+            dataset_file_signature[0],
+            dataset_file_signature[1],
+            int(st.session_state.get("new_max_lag", 10)),
+        )
+        if new_dataset is not None and dataset_file_signature is not None
         else None
     )
     current_dataset_snapshot = (
@@ -1045,23 +1071,23 @@ with new_tab:
                 )
             scheduled_at = local_start.astimezone(UTC).isoformat()
             st.info(
-                "\uc608\uc57d \uc2dc\uac01\uc5d0 PC\uc640 \uc2a4\ucf00\uc904\ub7ec\uac00 \uc2e4\ud589 \uc911\uc774\uc5b4\uc57c \uc2dc\uc791\ub429\ub2c8\ub2e4. \uc5f0\uad6c\uac00 \uc2e4\ud589 \uc911\uc774\uba74 \uc7a0\uae08 \ud574\uc81c \ud6c4\uc5d0 \uc9c0\uc5f0 \uc2e4\ud589\ud569\ub2c8\ub2e4."  # noqa: E501
+                "예약 시각에 PC와 스케줄러가 실행 중이어야 시작됩니다. 연구가 실행 중이면 잠금 해제 후에 지연 실행합니다."  # noqa: E501
             )
             if research_worker_active():
                 st.warning(
-                    "\ud604\uc7ac \uc5f0\uad6c \uc885\ub8cc \uc2dc\uac01\uc740 \ud655\uc815\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4. "  # noqa: E501
-                    "\uc9c0\uc815 \uc2dc\uac04\uc5d0 \uc791\uc5c5\uc790 \uc7a0\uae08\uc774 \uc720\uc9c0\ub418\uba74 \uc7a0\uae08 \ud574\uc81c \ud6c4\uc5d0 \uc9c0\uc5f0 \uc2e4\ud589\ud569\ub2c8\ub2e4."  # noqa: E501
+                    "현재 연구 종료 시각은 확정할 수 없습니다. "  # noqa: E501
+                    "지정 시간에 작업자 잠금이 유지되면 잠금 해제 후에 지연 실행합니다."  # noqa: E501
                 )
     action_columns = st.columns([1, 1, 3])
     preflight_submitted = action_columns[0].button(
-        "연구 환경 사전 검사",
+        "환경 전체 재검사",
         key="run_new_research_preflight",
-        help="현재 데이터와 설정으로 실행 환경을 검사합니다.",
+        help="선택한 엔진의 실행 검사를 강제로 다시 수행하고 결과 캐시를 갱신합니다.",
     )
     submitted = action_columns[1].button(
-        "\uc0c8 \uc5f0\uad6c \uc2dc\uc791"
+        "새 연구 시작"
         if execution_method == "now"
-        else "\uc608\uc57d \ucd94\uac00",
+        else "예약 추가",
         type="primary",
         key="start_new_research_now" if execution_method == "now" else "enqueue_new_research",
         disabled=(research_worker_active() if execution_method == "now" else False)
@@ -1357,76 +1383,6 @@ with new_tab:
                 help="PySR 후보와 비교할 무작위 대조 횟수입니다.",
                 key="new_pysr_controls",
             )
-        pattern_db = project_path("data/database/patterns.sqlite")
-        pattern_db_stat = (
-            (pattern_db.stat().st_mtime_ns, pattern_db.stat().st_size)
-            if pattern_db.is_file()
-            else None
-        )
-        preflight_input_key = _preflight_fingerprint(
-            {
-                "dataset_sha256": dataset_digest(new_dataset) if new_dataset else None,
-                "dataset_file_sha256": (
-                    hashlib.sha256(csv_path.read_bytes()).hexdigest()
-                    if csv_path is not None and csv_path.is_file()
-                    else None
-                ),
-                "engines": engines,
-                "feature_profile": profile,
-                "gp": {
-                    "population": population,
-                    "generations": generations,
-                    "crossover": crossover,
-                    "mutation": mutation,
-                    "max_depth": max_depth,
-                    "workers": workers,
-                    "train_ratio": train_ratio,
-                    "validation_ratio": validation_ratio,
-                    "max_lag": max_lag,
-                    "control_runs": controls,
-                    "min_activation": min_activation,
-                    "hidden_states": hidden_states,
-                    "seed": seed,
-                    "elite_enabled": elite_enabled,
-                    "elite_ratio": elite_ratio,
-                },
-                "pysr": {
-                    "feature_profile": pysr_profile,
-                    "max_lag": pysr_max_lag,
-                    "target": pysr_target,
-                    "binary_operators": pysr_binary_operators,
-                    "unary_operators": pysr_unary_operators,
-                    "guesses": pysr_guesses_text,
-                    "warm_start": pysr_warm_start,
-                    "timeout": pysr_timeout,
-                    "train_ratio": pysr_train_ratio,
-                    "validation_ratio": pysr_validation_ratio,
-                    "iterations": pysr_iterations,
-                    "population": pysr_population,
-                    "populations": pysr_populations,
-                    "maxsize": pysr_maxsize,
-                    "maxdepth": pysr_maxdepth,
-                    "workers": pysr_workers,
-                    "controls": pysr_controls,
-                },
-                "pattern_library_stat": pattern_db_stat,
-            }
-        )
-        preflight_disk_key = preflight_cache_key({"ui_settings_fingerprint": preflight_input_key})
-        cache_loaded_from_disk = False
-        if st.session_state.get("research_preflight_input_key") != preflight_disk_key:
-            disk_cache = load_preflight_cache(preflight_disk_key)
-            if disk_cache is not None:
-                st.session_state["research_preflight_report"] = disk_cache["report"]
-                st.session_state["research_preflight_input_key"] = preflight_disk_key
-                st.session_state["research_preflight_checked_at"] = disk_cache["checked_at"]
-                cache_loaded_from_disk = True
-        saved_preflight = st.session_state.get("research_preflight_report", {})
-        preflight_ready = (
-            st.session_state.get("research_preflight_input_key") == preflight_disk_key
-            and saved_preflight.get("status") == "passed"
-        )
-
     effective_config = None
     config_error = None
     try:
@@ -1452,7 +1408,11 @@ with new_tab:
         config_error = str(error)
         st.error(f"GP 설정을 확인하세요: {error}")
     pysr_config = None
-    pysr_status = optional_backend_status()
+    pysr_status = (
+        optional_backend_status()
+        if "pysr_symbolic_regression" in engines
+        else {"installed": False, "not_applicable": True}
+    )
     if "pysr_symbolic_regression" in engines:
         try:
             pysr_config = PySRConfig(
@@ -1562,6 +1522,7 @@ with new_tab:
                 "값": f"{csv_path.name} / {new_dataset.verification_status}",
             },
         ]
+        pysr_installation_label = "설치됨" if pysr_status["installed"] else "미설치"
         if pysr_config is not None:
             setting_rows.extend(
                 [
@@ -1597,7 +1558,7 @@ with new_tab:
                         "설정": "초기 수식 수 / Julia 상태",
                         "값": (
                             f"{len(pysr_config.guesses)} / "
-                            f"{'설치됨' if pysr_status['installed'] else '미설치'}"
+                            f"{len(pysr_config.guesses)} / {pysr_installation_label}"
                         ),
                     },
                 ]
@@ -1625,6 +1586,11 @@ with new_tab:
             st.stop()
         preview: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
+        pattern_db_stat = (
+            (library.path.stat().st_mtime_ns, library.path.stat().st_size)
+            if library.path.is_file()
+            else None
+        )
         if elite_enabled:
             preview, skipped = _cached_elite_preview(
                 str(library.path),
@@ -1682,9 +1648,46 @@ with new_tab:
         invalid_profile = True
         elite_seeds = ()
 
+    preflight_disk_key = (
+        research_preflight_cache_key(
+            new_dataset,
+            effective_config,
+            engines,
+            pysr_config,
+            elite_seeds,
+            dataset_sha256=new_dataset_digest,
+        )
+        if new_dataset is not None and effective_config is not None
+        else None
+    )
+    disk_cache = (
+        load_preflight_cache(preflight_disk_key, engines=engines)
+        if preflight_disk_key
+        else None
+    )
+    cache_loaded_from_disk = disk_cache is not None
+    if disk_cache is not None:
+        st.session_state["research_preflight_report"] = disk_cache["report"]
+        st.session_state["research_preflight_input_key"] = preflight_disk_key
+        st.session_state["research_preflight_checked_at"] = disk_cache["checked_at"]
+    saved_preflight = st.session_state.get("research_preflight_report", {})
+    session_preflight_fresh = (
+        preflight_disk_key is not None
+        and st.session_state.get("research_preflight_input_key") == preflight_disk_key
+        and isinstance(saved_preflight, dict)
+        and preflight_report_is_fresh(
+            saved_preflight, st.session_state.get("research_preflight_checked_at")
+        )
+    )
+    preflight_ready = (
+        isinstance(saved_preflight, dict)
+        and saved_preflight.get("status") == "passed"
+        and (disk_cache is not None or session_preflight_fresh)
+    )
     with startup_status_container:
-        if preflight_submitted or (submitted and not preflight_ready):
+        if preflight_submitted or (submitted and execution_method == "now" and not preflight_ready):
             st.session_state["research_launch_status"] = "environment_checking"
+            cache_info = None
             if new_dataset is None or effective_config is None or invalid_profile:
                 report = {
                     "status": "failed",
@@ -1694,88 +1697,99 @@ with new_tab:
                             "engine": engine,
                             "feature_profile": profile,
                             "stage": "input_validation",
-                            "error": "선택한 데이터 또는 특징 프로파일 검증에 실패했습니다.",
+                            "error": "연구 데이터 또는 프로파일 입력을 확인하세요.",
                         }
                         for engine in engines
                     },
                 }
             else:
-                with st.status("연구 환경을 검사하고 있습니다.", expanded=True) as progress:
-                    st.write("데이터 무결성, 특징 설정, GP 실행 및 저장 환경을 확인합니다.")
-                    report = run_research_preflight(
+                with st.status("선택한 엔진의 환경을 확인합니다.", expanded=True) as progress:
+                    cache_info = get_or_run_research_preflight(
                         new_dataset,
                         effective_config,
                         engines,
                         pysr_config,
                         elite_seeds=elite_seeds,
+                        dataset_sha256=new_dataset_digest,
+                        force=preflight_submitted,
                     )
+                    report = cache_info["report"]
+                    cache_loaded_from_disk = bool(cache_info.get("cache_used"))
                     progress.update(
                         label=(
-                            "연구 환경 검사 통과"
+                            "환경 준비 완료"
                             if report.get("status") == "passed"
-                            else "연구 환경 검사 실패"
+                            else "환경 검사 실패"
                         ),
                         state="complete",
                     )
             st.session_state["research_preflight_report"] = report
             st.session_state["research_preflight_input_key"] = preflight_disk_key
-            st.session_state["research_preflight_checked_at"] = datetime.now(UTC).isoformat()
+            st.session_state["research_preflight_checked_at"] = (
+                cache_info["checked_at"] if cache_info else datetime.now(UTC).isoformat()
+            )
             st.session_state["research_launch_status"] = (
                 "environment_passed" if report.get("status") == "passed" else "environment_failed"
             )
-            try:
-                save_preflight_cache(preflight_disk_key, report)
-            except OSError as error:
+            if (
+                cache_info
+                and not cache_info.get("cache_used")
+                and not cache_info.get("cache_saved", True)
+            ):
                 st.warning(
-                    f"검사 결과를 디스크에 저장하지 못했습니다. 이번 세션에는 유지합니다: {error}"
+                    "검사 결과를 캐시에 저장하지 못했습니다. "
+                    "현재 세션에서 결과를 사용합니다."
                 )
-
         current_preflight = st.session_state.get("research_preflight_report")
         current_preflight_matches = (
-            st.session_state.get("research_preflight_input_key") == preflight_disk_key
-        )
-        if current_preflight and current_preflight_matches:
-            phase = st.session_state.get("research_launch_status")
-            if phase in {None, "ready", "environment_checking"}:
-                phase = (
-                    "environment_passed"
-                    if current_preflight.get("status") == "passed"
-                    else "environment_failed"
-                )
-            severity, message = research_startup_message(phase)
-            getattr(st, severity)(message)
-            if current_preflight.get("status") == "passed":
-                origin = (
-                    "\uc800\uc7a5\ub41c \uac80\uc0ac \uacb0\uacfc \uc0ac\uc6a9"
-                    if cache_loaded_from_disk
-                    else "\ud604\uc7ac \uc138\uc158 \uac80\uc0ac \uacb0\uacfc \uc0ac\uc6a9"
-                )
-                checked_at = st.session_state.get(
-                    "research_preflight_checked_at", "\uc2dc\uac01 \ubbf8\uae30\ub85d"
-                )
-                st.caption(f"{origin} \u00b7 \uac80\uc0ac \uc2dc\uac01 {checked_at}")
-            for engine_id, engine_report in current_preflight.get("engines", {}).items():
-                with st.expander(f"{engine_id}: {engine_report.get('status', 'failed')}"):
-                    st.json(
-                        {key: value for key, value in engine_report.items() if key != "traceback"}
-                    )
-                    if engine_report.get("traceback"):
-                        st.code(engine_report["traceback"], language="text")
-                    if engine_id == "pysr_symbolic_regression":
-                        if engine_report.get("julia_search") is True:
-                            st.caption("PySR/Julia의 짧은 smoke fit까지 확인했습니다.")
-                        else:
-                            st.warning(
-                                "이 사전 검사에서는 Julia 런타임 실행을 확인하지 않았습니다."
-                            )
-        else:
-            severity, message = research_startup_message(
-                st.session_state.get("research_launch_status", "ready")
+            preflight_disk_key is not None
+            and st.session_state.get("research_preflight_input_key") == preflight_disk_key
+            and isinstance(current_preflight, dict)
+            and preflight_report_is_fresh(
+                current_preflight, st.session_state.get("research_preflight_checked_at")
             )
-            getattr(st, severity)(message)
-
+        )
+        if current_preflight_matches and current_preflight.get("status") == "passed":
+            st.success("확인된 연구 환경 준비 완료")
+            origin = (
+                "저장된 검사 결과 사용"
+                if cache_loaded_from_disk
+                else "현재 세션 검사 결과 사용"
+            )
+            checked_at = st.session_state.get("research_preflight_checked_at", "시각 미기록")
+            st.caption(f"{origin} · 검사 시각 {checked_at}")
+        elif current_preflight_matches:
+            st.error("선택한 엔진 환경 검사가 실패했습니다. 상세 원인을 확인하세요.")
+        elif execution_method == "queue":
+            st.info(
+                "예약 입력은 실행 설정 단계에서 검증합니다. "
+                "실제 실행 시 환경과 잠금을 다시 확인합니다."
+            )
+        else:
+            st.info("필요한 환경 검사는 연구 시작 시 자동으로 진행합니다.")
+        if current_preflight_matches and current_preflight:
+            with st.expander("환경 검사 상세 정보", expanded=False):
+                for engine_id, engine_report in current_preflight.get("engines", {}).items():
+                    with st.expander(f"{engine_id}: {engine_report.get('status', 'failed')}"):
+                        st.json(
+                            {
+                                key: value
+                                for key, value in engine_report.items()
+                                if key != "traceback"
+                            }
+                        )
+                        if engine_report.get("traceback"):
+                            st.code(engine_report["traceback"], language="text")
+                        runtime = engine_report.get("runtime_seconds")
+                        if runtime is not None:
+                            st.caption(f"검사 실행 시간: {runtime:.3f}초")
+                        if (
+                            engine_id == "pysr_symbolic_regression"
+                            and engine_report.get("julia_search") is True
+                        ):
+                            st.caption("PySR/Julia 스모크 실행까지 확인했습니다.")
         if submitted:
-            if (
+            if execution_method == "now" and (
                 not current_preflight_matches
                 or not current_preflight
                 or current_preflight.get("status") != "passed"
@@ -2864,7 +2878,22 @@ with queue_tab:
                         },
                     }
                     try:
-                        edit_dataset = load_csv(project_path("data/official/draws.csv"))
+                        edit_dataset = load_csv(
+                            project_path(
+                                edit_item["config"].get("csv", "data/official/draws.csv")
+                            )
+                        )
+                        edit_integrity = dataset_integrity_report(edit_dataset)
+                        if (
+                            edit_profile == "bonus_lag_v1"
+                            and not edit_integrity["all_draws_have_bonus"]
+                        ):
+                            raise ValueError("bonus_lag_v1 requires bonus numbers in the data.")
+                        if (
+                            edit_profile == "calendar_round"
+                            and not edit_integrity["all_draws_dated"]
+                        ):
+                            raise ValueError("calendar_round requires dates in the data.")
                         edit_gp_config = IntermittentConfig(
                             population_size=int(new_config.get("population_size", 48)),
                             generations=int(new_config.get("generations", 15)),
@@ -2885,17 +2914,6 @@ with queue_tab:
                             maxsize=int(pysr_values.get("maxsize", 24)),
                             seed=int(edit_seed),
                         )
-                        edit_preflight = run_research_preflight(
-                            edit_dataset,
-                            edit_gp_config,
-                            tuple(new_engines),
-                            edit_pysr_config if "pysr_symbolic_regression" in new_engines else None,
-                        )
-                        if edit_preflight["status"] != "passed":
-                            raise ValueError(
-                                f"\uc0ac\uc804 \uac80\uc0ac \uc2e4\ud328: "
-                                f"{edit_preflight['engines']}"
-                            )
                         if edit_schedule_mode == "at_time" and edit_scheduled_at:
                             conflicts = queue_store.schedule_conflicts(
                                 edit_scheduled_at,

@@ -477,6 +477,37 @@ def test_scheduler_waits_for_global_worker_before_claiming(tmp_path: Path, monke
     assert store.list_items(queue)[0]["status"] == "waiting"
 
 
+def test_scheduler_releases_reservation_if_global_slot_becomes_busy_after_claim(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import lotto_pattern_lab.queue_scheduler as scheduler
+
+    store = ResearchQueueStore(tmp_path / "queue.sqlite")
+    queue = store.create_queue()
+    item_id = _add(store, queue)
+    store.set_queue_status(queue, "running")
+    active_checks = iter((False, True))
+    monkeypatch.setattr(scheduler, "research_worker_active", lambda: next(active_checks))
+
+    def launch(_item, _checkpoint, _research_id):
+        raise scheduler.ExecutionSlotBusy("test slot race")
+
+    result = scheduler.scheduler_step(
+        store,
+        queue,
+        launch=launch,
+        inspect=lambda _row: (False, None),
+        workspace_root=tmp_path,
+        round_store=ResearchRoundStore(tmp_path / "patterns.sqlite"),
+    )
+
+    record = store.list_items(queue)[0]
+    assert result == "waiting_for_global_worker"
+    assert record["item_id"] == item_id
+    assert record["status"] == "waiting"
+    assert record["research_id"] is not None
+
+
 def test_schedule_conflicts_include_running_fixed_reservation_estimate(tmp_path: Path) -> None:
     from datetime import UTC, datetime, timedelta
 
