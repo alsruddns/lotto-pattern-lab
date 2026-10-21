@@ -37,6 +37,11 @@ from lotto_pattern_lab.research_dashboard import (
     stringify_dashboard_table_rows,
     validated_pattern_counts,
 )
+from lotto_pattern_lab.research_dashboard_presentation import (
+    display_engine_names,
+    format_round_timestamp,
+    round_grid_column_order,
+)
 from lotto_pattern_lab.research_rounds import (
     SUMMARY_SCHEMA_VERSION,
     ResearchRoundStore,
@@ -335,14 +340,16 @@ else:
             {
                 "연구 회차": f"연구 {item['research_round']}회차",
                 "연구 ID": item["research_id"],
-                "실행 일시": item.get("started_at") or item.get("created_at"),
+                "실행 일시": format_round_timestamp(
+                    item.get("started_at") or item.get("created_at")
+                ),
                 "연구 시간": format_duration(item.get("total_elapsed_seconds")),
                 "상태": item.get("status", "미수집"),
                 "집계 상태": summary.get(
                     "aggregation_status",
                     research_aggregation_status(item, summary, summary.get("summary_diagnostic")),
                 ),
-                "탐색 엔진": ", ".join(item.get("engines", [])) or "미수집",
+                "탐색 엔진": display_engine_names(item.get("engines", [])),
                 "특징 프로파일": config.get("feature_profile", "미수집"),
                 "Elite Seeding": (
                     "활성화"
@@ -358,33 +365,55 @@ else:
                     summary, "failed_experiment_count", item.get("failed_runs")
                 ),
                 "신규 패턴": format_count(summary.get("new_pattern_count")),
-                "3개 이상 반복 평가": format_count(_hit_total(summary, "3_plus")),
-                "4개 이상 반복 평가": format_count(_hit_total(summary, "4_plus")),
-                "5개 이상 반복 평가": format_count(_hit_total(summary, "5_plus")),
+                "3개 이상 적중 (반복 평가)": format_count(_hit_total(summary, "3_plus")),
+                "4개 이상 적중 (반복 평가)": format_count(_hit_total(summary, "4_plus")),
+                "5개 이상 적중 (반복 평가)": format_count(_hit_total(summary, "5_plus")),
                 "2등 일치": second_prize_hits,
                 "2등 통계 상태": second_prize_status,
-                "6개 완전 일치 반복 평가": format_count(_hit_total(summary, "6_exact")),
+                "6개 완전 일치 (반복 평가)": format_count(_hit_total(summary, "6_exact")),
                 "독립 테스트 요약": _test_summary(summary),
             }
         )
     list_tooltips = {
         "연구 회차": "연구가 시작된 순서입니다.",
         "연구 ID": "연구를 식별하는 UUID입니다.",
-        "실행 일시": "연구를 시작한 시각입니다.",
+        "실행 일시": (
+            "연구 시작 시각입니다. 저장된 UTC 시각을 Asia/Seoul로 변환해 "
+            "YYYY-MM-DD HH:mm:ss로 표시합니다. 정렬은 이 표시값 기준으로 시간순입니다."
+        ),
         "연구 시간": "누적 연구 실행 시간입니다. 시·분·초로 표시합니다.",
         "상태": "연구의 마지막 저장 상태입니다.",
-        "탐색 엔진": "해당 연구에서 사용한 탐색 엔진입니다.",
+        "탐색 엔진": (
+            "해당 연구에서 사용한 엔진입니다. GP/PySR은 짧게 표시하고 "
+            "원본 식별자는 저장 데이터에 유지합니다."
+        ),
         "특징 프로파일": "모델 입력 특징의 구성 버전입니다.",
         "Elite Seeding": "기존 패턴을 초기 후보로 사용했는지 표시합니다.",
         "완료 실험": "완료 상태로 저장된 실험 수입니다.",
         "실패 실험": "실패 또는 중단된 실험 수입니다.",
         "신규 패턴": "패턴 라이브러리에 새로 등록한 패턴 수입니다.",
-        "3개 이상 반복 평가": "활성 예측 중 3개 이상 적중한 실험 평가 수입니다.",
-        "4개 이상 반복 평가": "활성 예측 중 4개 이상 적중한 실험 평가 수입니다.",
-        "5개 이상 반복 평가": "활성 예측 중 5개 이상 적중한 실험 평가 수입니다.",
-        "2등 일치": "예측한 6개 조합 중 본번호 정확히 5개와 보너스 번호가 함께 일치한 수입니다.",
+        "3개 이상 적중 (반복 평가)": (
+            "평가 단위는 실험별 활성 예측 회차입니다. 각 예측 6개 중 본번호 3개 이상이 "
+            "맞은 횟수를 실험 간 합산합니다. 같은 로또 회차가 여러 실험에서 평가되면 "
+            "반복 포함하며, 누적 등수 통계가 아닙니다."
+        ),
+        "4개 이상 적중 (반복 평가)": (
+            "평가 단위는 실험별 활성 예측 회차입니다. 각 예측 6개 중 본번호 4개 이상이 "
+            "맞은 횟수를 합산하고, 같은 회차의 반복 평가는 중복 포함합니다."
+        ),
+        "5개 이상 적중 (반복 평가)": (
+            "평가 단위는 실험별 활성 예측 회차입니다. 각 예측 6개 중 본번호 5개 이상 "
+            "(5개 또는 6개)이 맞은 횟수를 합산하며 같은 회차의 반복 평가는 중복 포함합니다."
+        ),
+        "2등 일치": (
+            "평가 단위는 활성 6개 번호 조합입니다. 본번호 정확히 5개와 실제 보너스 번호가 "
+            "함께 포함된 정확한 2등 횟수입니다. 보너스 미수집은 0건이 아니라 미수집입니다."
+        ),
         "2등 통계 상태": "보너스 번호가 저장된 활성 6개 조합에 대해서만 판정합니다.",
-        "6개 완전 일치 반복 평가": "본번호 6개 일치입니다. 보너스 번호는 판정에 사용하지 않습니다.",
+        "6개 완전 일치 (반복 평가)": (
+            "평가 단위는 실험별 활성 예측 회차입니다. 예측 6개가 본번호 6개와 모두 일치한 "
+            "횟수를 합산하며, 같은 회차의 반복 평가는 중복 포함합니다. 보너스는 사용하지 않습니다."
+        ),
         "독립 테스트 요약": "독립 테스트 평가 점수의 모델별 평균입니다.",
     }
     list_tooltips["집계 상태"] = "집계 정보의 준비 또는 형식 상태입니다."
@@ -401,7 +430,22 @@ else:
         for label, tooltip in list_tooltips.items()
     }
     list_column_config["실행 일시"] = st.column_config.TextColumn(
-        "실행 일시", help=list_tooltips["실행 일시"]
+        "실행 일시", help=list_tooltips["실행 일시"], width="medium"
+    )
+    list_column_config["연구 회차"] = st.column_config.TextColumn(
+        "연구 회차", help=list_tooltips["연구 회차"], width="small"
+    )
+    list_column_config["연구 시간"] = st.column_config.TextColumn(
+        "연구 시간", help=list_tooltips["연구 시간"], width="small"
+    )
+    list_column_config["상태"] = st.column_config.TextColumn(
+        "상태", help=list_tooltips["상태"], width="small"
+    )
+    list_column_config["집계 상태"] = st.column_config.TextColumn(
+        "집계 상태", help=list_tooltips["집계 상태"], width="medium"
+    )
+    list_column_config["탐색 엔진"] = st.column_config.TextColumn(
+        "탐색 엔진", help=list_tooltips["탐색 엔진"], width="small"
     )
     list_column_config["연구 ID"] = st.column_config.TextColumn(
         "연구 ID", help=list_tooltips["연구 ID"], width="small"
@@ -417,9 +461,25 @@ else:
     list_column_config["독립 테스트 요약"] = st.column_config.TextColumn(
         "독립 테스트 요약", help=list_tooltips["독립 테스트 요약"], width="medium"
     )
+    for label in (
+        "3개 이상 적중 (반복 평가)",
+        "4개 이상 적중 (반복 평가)",
+        "5개 이상 적중 (반복 평가)",
+        "6개 완전 일치 (반복 평가)",
+    ):
+        list_column_config[label] = st.column_config.TextColumn(
+            label, help=list_tooltips[label], width="small"
+        )
+    list_column_config["2등 일치"] = st.column_config.NumberColumn(
+        "2등 일치",
+        help=list_tooltips["2등 일치"],
+        format="localized",
+        width="small",
+    )
     st.dataframe(
         list_rows,
         column_config=list_column_config,
+        column_order=round_grid_column_order(list(list_rows[0])) if list_rows else None,
         hide_index=True,
         width="stretch",
     )

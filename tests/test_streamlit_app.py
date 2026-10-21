@@ -129,6 +129,100 @@ def test_optimization_history_tab_state_survives_rerun() -> None:
     assert app.session_state["optimization_workspace_tab"] == history_label
 
 
+def test_auto_optimization_tab_renders_without_running_hidden_research_view(monkeypatch) -> None:
+    import runpy
+
+    import lotto_pattern_lab.research as research
+    import lotto_pattern_lab.research_optimization as optimization
+
+    monkeypatch.setattr(optimization, "list_optimization_study_overviews", lambda *_: [])
+    monkeypatch.setattr(optimization, "list_optimization_run_states", lambda *_: [])
+    monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
+    monkeypatch.setattr(research, "research_worker_active", lambda: True)
+    original_run_path = runpy.run_path
+
+    def guarded_run_path(path, *args, **kwargs):
+        if str(path).endswith("continuous_research_view.py"):
+            raise AssertionError("hidden continuous-research tab was executed")
+        return original_run_path(path, *args, **kwargs)
+
+    monkeypatch.setattr(runpy, "run_path", guarded_run_path)
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
+    )
+    app = AppTest.from_file(page)
+    app.session_state["research_workspace_tab"] = "연구 조건 자동 최적화"
+    app.run(timeout=30)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert "연구 조건 자동 최적화" in [tab.label for tab in app.tabs]
+    assert "최적화 이력" in [tab.label for tab in app.tabs]
+    app.session_state["optimization_workspace_tab"] = "최적화 이력"
+    app.run(timeout=30)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.session_state["optimization_workspace_tab"] == "최적화 이력"
+
+
+def test_optimization_trial_details_are_read_only_until_requested(monkeypatch, tmp_path) -> None:
+    import runpy
+
+    import lotto_pattern_lab.research as research
+    import lotto_pattern_lab.research_optimization as optimization
+
+    record = {
+        "study_name": "temporary-study",
+        "status": "completed",
+        "database_available": True,
+        "database_path": str(tmp_path / "temporary-study.sqlite"),
+        "state_path": str(tmp_path / "temporary-study.state.json"),
+        "completed_trials": 1,
+        "failed_trials": 0,
+        "pruned_trials": 0,
+        "best_value": 0.5,
+    }
+    reads = []
+    monkeypatch.setattr(optimization, "list_optimization_study_overviews", lambda *_: [record])
+    monkeypatch.setattr(optimization, "list_optimization_run_states", lambda *_: [])
+    monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
+    monkeypatch.setattr(
+        optimization,
+        "load_optimization_study_detail",
+        lambda value, **kwargs: reads.append((value["study_name"], kwargs))
+        or {
+            **value,
+            "detail_available": True,
+            "trials": [],
+            "total_trials": 0,
+            "best_parameters": {},
+        },
+    )
+    monkeypatch.setattr(research, "research_worker_active", lambda: True)
+    original_run_path = runpy.run_path
+    monkeypatch.setattr(
+        runpy,
+        "run_path",
+        lambda path, *args, **kwargs: (
+            (_ for _ in ()).throw(AssertionError("hidden research view executed"))
+            if str(path).endswith("continuous_research_view.py")
+            else original_run_path(path, *args, **kwargs)
+        ),
+    )
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
+    )
+    app = AppTest.from_file(page)
+    app.session_state["research_workspace_tab"] = "연구 조건 자동 최적화"
+    app.session_state["optimization_workspace_tab"] = "최적화 이력"
+    app.session_state["optimization_history_refresh_token"] = "test-detail-load"
+    app.run(timeout=30)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert reads == []
+    app.button(key="optimization_history_load_detail").click().run(timeout=30)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert reads == [("temporary-study", {"offset": 0, "limit": 100})]
+
+
 def test_live_research_status_is_at_top_and_rerun_preserves_controls(tmp_path) -> None:
     page = next(
         (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")

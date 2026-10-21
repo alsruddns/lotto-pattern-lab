@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import time
@@ -19,7 +17,7 @@ from typing import Any
 
 import streamlit as st
 
-from lotto_pattern_lab.atomic_io import LockTimeoutError, interprocess_lock
+from lotto_pattern_lab.atomic_io import LockTimeoutError
 from lotto_pattern_lab.cumulative_research import (
     CUMULATIVE_MODE,
     INDEPENDENT_MODE,
@@ -70,6 +68,12 @@ from lotto_pattern_lab.research_time import (
     checkpoint_status_label,
     format_hhmmss,
     research_time_snapshot,
+)
+from lotto_pattern_lab.research_worker_process import (
+    launch_worker as _launch_worker,
+)
+from lotto_pattern_lab.research_worker_process import (
+    worker_active as _worker_active,
 )
 from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 
@@ -163,14 +167,6 @@ def _remember_custom_duration() -> None:
 PAUSE_MESSAGE = (
     "일시정지 요청 완료. 현재 진행 중인 실험의 계산과 저장이 끝난 후 자동으로 일시정지됩니다."
 )
-
-
-def _worker_active(checkpoint_path: Path) -> bool:
-    try:
-        with interprocess_lock(checkpoint_path, timeout=0, scope="research-worker"):
-            return False
-    except LockTimeoutError:
-        return True
 
 
 def _format_comparison_value(value: Any) -> str:
@@ -367,51 +363,6 @@ def _resume_records(rounds: ResearchRoundStore) -> list[dict[str, Any]]:
             }
         )
     return sorted(records, key=lambda item: int(item.get("research_round", 0)), reverse=True)
-
-
-def _launch_worker(
-    command: list[str], checkpoint_path: Path, log_path: Path
-) -> subprocess.Popen[bytes]:
-    checkpoint_path = checkpoint_path.resolve()
-    launch_path = Path(f"{checkpoint_path}.launch")
-    with interprocess_lock(checkpoint_path, timeout=0, scope="research-launch"):
-        if _worker_active(checkpoint_path):
-            raise RuntimeError("이 연구의 워커가 이미 실행 중입니다.")
-        if launch_path.exists():
-            try:
-                request = json.loads(launch_path.read_text(encoding="utf-8"))
-                created = datetime.fromisoformat(request["created_at"])
-                stale = (datetime.now(UTC) - created).total_seconds() > 120
-            except (OSError, ValueError, KeyError):
-                stale = True
-            if not stale:
-                raise RuntimeError("이 연구의 워커 시작 요청이 이미 처리 중입니다.")
-            launch_path.unlink(missing_ok=True)
-        launch_path.write_text(
-            json.dumps({"created_at": datetime.now(UTC).isoformat()}), encoding="utf-8"
-        )
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file = log_path.open("a", encoding="utf-8")
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
-            subprocess, "CREATE_NO_WINDOW", 0
-        )
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=PROJECT_ROOT,
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                creationflags=flags,
-                close_fds=True,
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            )
-        except Exception:
-            launch_path.unlink(missing_ok=True)
-            raise
-        finally:
-            log_file.close()
-        return process
 
 
 def _launch_checkpoint_state(checkpoint_path: Path, research_id: str) -> dict[str, Any] | None:

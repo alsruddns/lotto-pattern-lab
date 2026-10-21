@@ -8,10 +8,10 @@ import json
 import re
 import runpy
 import sqlite3
-import subprocess
 import sys
 import uuid
 from datetime import UTC, datetime
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,8 @@ from lotto_pattern_lab.research_optimization import (
     estimate_optimization_remaining_seconds,
     format_optimization_duration,
     list_optimization_run_states,
-    list_optimization_studies,
+    list_optimization_study_overviews,
+    load_optimization_study_detail,
     optimization_monitor_snapshot,
     optuna_status,
     request_optimization_stop,
@@ -34,6 +35,12 @@ from lotto_pattern_lab.research_optimization import (
 from lotto_pattern_lab.research_optimization_apply import (
     OPTUNA_TO_RESEARCH_KEYS,
     validate_optimization_compatibility,
+)
+from lotto_pattern_lab.research_worker_process import (
+    launch_worker as _launch_worker,
+)
+from lotto_pattern_lab.research_worker_process import (
+    worker_active as _optimization_worker_active,
 )
 from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 
@@ -67,50 +74,36 @@ research_tab, optimization_tab = st.tabs(
     on_change="rerun",
 )
 with research_tab:
-    try:
-        _continuous_runtime = runpy.run_path(
-            str(PROJECT_ROOT / "src/lotto_pattern_lab/continuous_research_view.py"),
-            run_name="lotto_pattern_lab_continuous_research_view",
-        )
-    except sqlite3.OperationalError as error:
-        log_database_failure(
-            "continuous research page render", "data/database/patterns.sqlite", error
-        )
-        if is_database_locked(error):
-            st.error("연구 데이터베이스가 다른 작업에서 잠겨 있습니다.")
-        else:
-            st.error("연구 데이터베이스 처리 중 오류가 발생했습니다.")
-        st.caption("저장된 연구 상태는 유지됩니다. 상세 오류를 확인한 뒤 다시 시도하세요.")
-        st.code(str(error), language="text")
-        if st.button("연구 화면 다시 불러오기", key="retry_continuous_page_database"):
-            st.rerun()
-        st.stop()
-globals().update(
-    {
-        name: _continuous_runtime[name]
-        for name in (
-            "_worker_active",
-            "_launch_worker",
-            "format_duration",
-            "PROJECT_ROOT",
-            "project_path",
-        )
-    }
-)
+    _continuous_runtime = {}
+    if st.session_state.get("research_workspace_tab", "지속적 패턴 연구") == "지속적 패턴 연구":
+        try:
+            _continuous_runtime = runpy.run_path(
+                str(PROJECT_ROOT / "src/lotto_pattern_lab/continuous_research_view.py"),
+                run_name="lotto_pattern_lab_continuous_research_view",
+            )
+        except sqlite3.OperationalError as error:
+            log_database_failure(
+                "continuous research page render", "data/database/patterns.sqlite", error
+            )
+            if is_database_locked(error):
+                st.error("연구 데이터베이스가 다른 작업에서 잠겨 있습니다.")
+            else:
+                st.error("연구 데이터베이스 처리 중 오류가 발생했습니다.")
+            st.caption("저장된 연구 상태는 유지됩니다. 상세 오류를 확인한 뒤 다시 시도하세요.")
+            st.code(str(error), language="text")
+            if st.button("연구 화면 다시 불러오기", key="retry_continuous_page_database"):
+                st.rerun()
+            st.stop()
+@st.cache_data(ttl=10, max_entries=2, show_spinner=False)
+def _cached_optimization_study_overviews(storage_directory: str, refresh_token: str):
+    # The token participates in Streamlit's cache key and supports explicit refresh.
+    del refresh_token
+    return list_optimization_study_overviews(storage_directory)
 
 
-def _worker_active(checkpoint_path: Path) -> bool:
-    return _continuous_runtime["_worker_active"](checkpoint_path)
-
-
-def _launch_worker(
-    command: list[str], checkpoint_path: Path, log_path: Path
-) -> subprocess.Popen[bytes]:
-    return _continuous_runtime["_launch_worker"](command, checkpoint_path, log_path)
-
-
-def format_duration(seconds: object) -> str:
-    return _continuous_runtime["format_duration"](seconds)
+def _invalidate_optimization_history_cache() -> None:
+    st.session_state["optimization_history_refresh_token"] = str(uuid.uuid4())
+    st.session_state.pop("optimization_history_detail", None)
 
 
 def render_optimization() -> None:
@@ -123,18 +116,26 @@ def render_optimization() -> None:
         "점수는 내부 평가값이며 실제 당첨 확률을 뜻하지 않습니다."
     )
     status = optuna_status()
-    records = list_optimization_studies()
-
     monitor_states = list_optimization_run_states()
-    monitor_refresh = st.session_state.get("optimization_monitor_start_pending", False) or any(
-        _worker_active(
+    active_optimization_states = [
+        item
+        for item in monitor_states
+        if _optimization_worker_active(
             Path(
                 item.get("state_path")
                 or project_path(f"data/optimizations/{item['study_name']}.state.json")
             )
         )
-        for item in monitor_states
+    ]
+    monitor_refresh = st.session_state.get("optimization_monitor_start_pending", False) or bool(
+        active_optimization_states
     )
+    active_study_names = {str(item.get("study_name")) for item in active_optimization_states}
+    refresh_token = str(st.session_state.get("optimization_history_refresh_token", "initial"))
+    if active_optimization_states:
+        records = list_optimization_study_overviews()
+    else:
+        records = _cached_optimization_study_overviews("data/optimizations", refresh_token)
 
     @st.fragment(run_every="5s" if monitor_refresh else None)
     def optimization_monitor() -> None:
@@ -143,7 +144,7 @@ def render_optimization() -> None:
             (
                 item
                 for item in fresh_records
-                if _worker_active(
+                if _optimization_worker_active(
                     Path(
                         item.get("state_path")
                         or project_path(f"data/optimizations/{item['study_name']}.state.json")
@@ -372,7 +373,7 @@ def render_optimization() -> None:
                     item
                     for item in fresh_records
                     if item.get("status") in {"running", "stopping"}
-                    and not _worker_active(
+                    and not _optimization_worker_active(
                         Path(
                             item.get("state_path")
                             or project_path(f"data/optimizations/{item['study_name']}.state.json")
@@ -535,7 +536,7 @@ def render_optimization() -> None:
             )
             chosen = choices[chosen_name]
             st.write(
-                f"상태: **{_status_label(chosen)}** · "
+                f"상태: **{_status_label(chosen, active_study_names)}** · "
                 f"완료 Trial: **{int(chosen.get('completed_trials', 0)):,}** · "
                 f"최고 Trial: **{chosen.get('best_trial_number', '—')}** · "
                 f"최고 내부 점수: **{_display_score(chosen.get('best_value'))}**"
@@ -564,14 +565,15 @@ def render_optimization() -> None:
             if c1.button(
                 "기존 자동 최적화 이어서 하기",
                 type="primary",
-                disabled=not status["available"] or _any_optimization_active(records),
+                disabled=not status["available"]
+                or _any_optimization_active(records, active_study_names),
                 help="기존 SQLite Study와 Trial을 그대로 불러와 이어서 실행합니다.",
             ):
                 _start_existing_optimization(chosen, int(trial_add), float(timeout_add), "resume")
             if c2.button(
                 "완료 연구에 추가 Trial 실행",
                 disabled=not status["available"]
-                or _any_optimization_active(records)
+                or _any_optimization_active(records, active_study_names)
                 or chosen.get("status") != "completed",
                 help="완료 결과를 보존한 채 같은 Study에 Trial을 추가합니다.",
             ):
@@ -583,19 +585,43 @@ def render_optimization() -> None:
         if not records:
             st.info("저장된 자동 최적화 이력이 없습니다.")
         else:
+            page_size = 50
+            page_count = max(1, ceil(len(records) / page_size))
+            st.session_state["optimization_history_page"] = min(
+                max(1, int(st.session_state.get("optimization_history_page", 1))),
+                page_count,
+            )
+            history_page = int(
+                st.number_input(
+                    "이력 페이지 (최근 실행순)",
+                    min_value=1,
+                    max_value=page_count,
+                    value=1,
+                    step=1,
+                    key="optimization_history_page",
+                )
+            )
+            page_start = (history_page - 1) * page_size
+            visible_records = records[page_start : page_start + page_size]
+            st.caption(
+                f"최근순 {page_start + 1:,}–{page_start + len(visible_records):,} / "
+                f"{len(records):,}개 Study"
+            )
             rows = [
                 {
                     "연구 이름": r["study_name"],
+                    "최근 실행": r.get("finished_at") or r.get("started_at") or "기록 없음",
                     "모드": r.get("mode", "기록 없음"),
+                    "엔진": r.get("engine", "미수집"),
                     "데이터": r.get("dataset_range", "기록 없음"),
-                    "상태": _status_label(r),
+                    "상태": _status_label(r, active_study_names),
                     "완료 Trial": r.get("completed_trials", 0),
-                    "최고 Trial": r.get("best_trial_number", "—"),
+                    "실패 Trial": r.get("failed_trials", 0),
+                    "가지치기 Trial": r.get("pruned_trials", 0),
                     "최고 점수": r.get("best_value", "—"),
-                    "종료 시각": r.get("finished_at", "—"),
                     "DB": "사용 가능" if r.get("database_available") else "없음",
                 }
-                for r in records
+                for r in visible_records
             ]
             st.dataframe(rows, width="stretch", hide_index=True)
             csv_buffer = io.StringIO(newline="")
@@ -608,12 +634,88 @@ def render_optimization() -> None:
                 file_name="optimization_history.csv",
                 mime="text/csv; charset=utf-8",
             )
+            if st.button("최적화 이력 새로고침", key="optimization_history_refresh"):
+                st.session_state["optimization_history_refresh_token"] = str(uuid.uuid4())
+                st.session_state.pop("optimization_history_detail", None)
+                st.rerun()
             selected_name = st.selectbox(
                 "상세 조회할 연구",
-                [r["study_name"] for r in records],
+                [r["study_name"] for r in visible_records],
                 key="optimization_history_choice",
             )
-            selected = next(r for r in records if r["study_name"] == selected_name)
+            overview = next(r for r in visible_records if r["study_name"] == selected_name)
+            stored_detail = st.session_state.get("optimization_history_detail") or {}
+            detail = (
+                stored_detail
+                if stored_detail.get("study_name") == selected_name
+                else None
+            )
+            if st.button(
+                "선택한 최적화 상세 조회",
+                key="optimization_history_load_detail",
+            ):
+                detail = load_optimization_study_detail(overview, offset=0, limit=100)
+                if detail.get("detail_available"):
+                    st.session_state["optimization_history_detail"] = detail
+                else:
+                    st.session_state.pop("optimization_history_detail", None)
+                    st.warning("선택한 Study 상세 정보를 읽지 못했습니다.")
+            stored_detail = st.session_state.get("optimization_history_detail") or {}
+            detail = stored_detail if stored_detail.get("study_name") == selected_name else None
+            selected = detail or overview
+            if detail:
+                trials = detail.get("trials", [])
+                st.caption(
+                    f"Trial {detail.get('trial_offset', 0) + 1:,}–"
+                    f"{detail.get('trial_offset', 0) + len(trials):,} / "
+                    f"{detail.get('total_trials', 0):,}"
+                )
+                if trials:
+                    st.dataframe(
+                        [
+                            {
+                                "Trial": row["number"],
+                                "상태": row["state"],
+                                "시작": row["started_at"],
+                                "종료": row["finished_at"],
+                                "소요 시간(초)": row["duration_seconds"],
+                                "Objective": row["value"],
+                                "파라미터": ", ".join(
+                                    f"{key}={value:g}"
+                                    for key, value in row["parameters"].items()
+                                ),
+                            }
+                            for row in trials
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                    )
+                page_offset = int(detail.get("trial_offset", 0) or 0)
+                previous_col, next_col = st.columns(2)
+                if previous_col.button(
+                    "이전 Trial",
+                    key="optimization_history_previous_page",
+                    disabled=page_offset <= 0,
+                ):
+                    st.session_state["optimization_history_detail"] = (
+                        load_optimization_study_detail(
+                            overview, offset=max(0, page_offset - 100), limit=100
+                        )
+                    )
+                    st.rerun()
+                if next_col.button(
+                    "다음 Trial",
+                    key="optimization_history_next_page",
+                    disabled=page_offset + len(trials) >= int(detail.get("total_trials", 0) or 0),
+                ):
+                    st.session_state["optimization_history_detail"] = (
+                        load_optimization_study_detail(
+                            overview, offset=page_offset + 100, limit=100
+                        )
+                    )
+                    st.rerun()
+            else:
+                st.info("Trial 전체와 최적 파라미터는 상세 조회 버튼을 누른 뒤 읽습니다.")
             st.json({key: value for key, value in selected.items() if key != "best_parameters"})
             st.download_button(
                 "선택한 연구 결과 JSON 다운로드",
@@ -739,7 +841,7 @@ def render_optimization() -> None:
                                 st.session_state["research_workspace_tab"] = "지속적 패턴 연구"
                             st.session_state.pop("optimization_apply_confirmation", None)
                             st.rerun()
-            else:
+            elif detail:
                 st.info("최적 파라미터가 저장되지 않았거나 SQLite 데이터베이스를 읽을 수 없습니다.")
 
     optimization_monitor()
@@ -749,13 +851,10 @@ def _display_score(value: Any) -> str:
     return "기록 없음" if value is None else f"{float(value):.6f}"
 
 
-def _status_label(record: dict[str, Any]) -> str:
-    if _worker_active(
-        Path(
-            record.get("state_path")
-            or project_path(f"data/optimizations/{record['study_name']}.state.json")
-        )
-    ):
+def _status_label(
+    record: dict[str, Any], active_study_names: set[str] | None = None
+) -> str:
+    if active_study_names is not None and str(record["study_name"]) in active_study_names:
         return "실행 중"
     labels = {
         "completed": "완료",
@@ -772,9 +871,15 @@ def _status_label(record: dict[str, Any]) -> str:
     return labels.get(status_value, status_value)
 
 
-def _any_optimization_active(records: list[dict[str, Any]]) -> bool:
-    return research_worker_active() or any(
-        _worker_active(
+def _any_optimization_active(
+    records: list[dict[str, Any]], active_study_names: set[str] | None = None
+) -> bool:
+    if research_worker_active():
+        return True
+    if active_study_names is not None:
+        return bool(active_study_names)
+    return any(
+        _optimization_worker_active(
             Path(
                 row.get("state_path")
                 or project_path(f"data/optimizations/{row['study_name']}.state.json")
@@ -790,7 +895,7 @@ def _execution_conflict(records: list[dict[str, Any]]) -> str | None:
             record.get("state_path")
             or project_path(f"data/optimizations/{record['study_name']}.state.json")
         )
-        if _worker_active(state_path):
+        if _optimization_worker_active(state_path):
             return (
                 f"현재 연구조건 자동 최적화 {record['study_name']} (실행 ID "
                 f"{record.get('run_id', '확인 중')})가 CPU 실행 슬롯을 사용 중입니다."
@@ -804,7 +909,7 @@ def _execution_conflict(records: list[dict[str, Any]]) -> str | None:
             continue
         if state.get("status") not in {"running", "pause_requested"}:
             continue
-        if not _worker_active(checkpoint):
+        if not _optimization_worker_active(checkpoint):
             continue
         research_id = state.get("research_id", "확인 중")
         started_at = state.get("started_at", "시각 미기록")
@@ -916,6 +1021,7 @@ def _start_optimization(
     except Exception as error:
         st.error(f"최적화 실행 준비 실패: {error}")
     if started:
+        _invalidate_optimization_history_cache()
         st.rerun()
 
 
@@ -980,7 +1086,7 @@ def _start_existing_optimization(
     ]
     started = False
     try:
-        conflict = _execution_conflict(list_optimization_studies())
+        conflict = _execution_conflict(list_optimization_study_overviews())
         if conflict:
             raise RuntimeError(conflict)
         gp_config = IntermittentConfig(
@@ -1020,8 +1126,10 @@ def _start_existing_optimization(
     except Exception as error:
         st.error(f"기존 연구를 시작하지 못했습니다: {error}")
     if started:
+        _invalidate_optimization_history_cache()
         st.rerun()
 
 
-with optimization_tab:
-    render_optimization()
+if st.session_state.get("research_workspace_tab") == "연구 조건 자동 최적화":
+    with optimization_tab:
+        render_optimization()

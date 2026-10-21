@@ -148,6 +148,222 @@ def list_optimization_studies(
     return sorted(records.values(), key=lambda item: str(item.get("study_name", "")).casefold())
 
 
+def list_optimization_study_overviews(
+    storage_directory: str | Path = "data/optimizations",
+) -> list[dict[str, Any]]:
+    """Read compact Study summaries without loading trial parameters or trial objects."""
+    root = project_path(storage_directory)
+    if not root.is_dir():
+        return []
+    records: dict[str, dict[str, Any]] = {}
+    for state_path in root.glob("*.state.json"):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(state, dict):
+                name = str(state.get("study_name") or state_path.name.removesuffix(".state.json"))
+                records[name] = {
+                    **state,
+                    "study_name": name,
+                    "state_path": str(state_path),
+                    "database_path": str(root / f"{_study_slug(name)}.sqlite"),
+                    "database_available": False,
+                }
+        except (OSError, ValueError, TypeError):
+            name = state_path.name.removesuffix(".state.json")
+            records[name] = {
+                "study_name": name,
+                "status": "state_unreadable",
+                "state_path": str(state_path),
+                "database_path": str(root / f"{name}.sqlite"),
+                "database_available": False,
+            }
+
+    for database_path in root.glob("*.sqlite"):
+        try:
+            uri = database_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=0.25) as connection:
+                connection.execute("PRAGMA query_only=ON")
+                study_rows = connection.execute(
+                    "SELECT study_id, study_name FROM studies ORDER BY study_id DESC"
+                ).fetchall()
+                for study_id, raw_name in study_rows:
+                    name = str(raw_name)
+                    record = records.setdefault(name, {"study_name": name})
+                    record.update(
+                        database_path=str(database_path),
+                        database_available=True,
+                        optuna_study_id=int(study_id),
+                    )
+                    for key, raw_value in connection.execute(
+                        "SELECT key, value_json FROM study_user_attributes WHERE study_id=?",
+                        (study_id,),
+                    ):
+                        try:
+                            record[str(key)] = json.loads(raw_value)
+                        except (TypeError, ValueError):
+                            record[str(key)] = raw_value
+                    if (
+                        "engine" not in record
+                        and record.get("objective_policy_version") == "validation_only_v1"
+                    ):
+                        record["engine"] = "intermittent_gp"
+                        record["engine_metadata_source"] = "optimizer implementation metadata"
+                    counts = connection.execute(
+                        "SELECT state, COUNT(*) FROM trials WHERE study_id=? GROUP BY state",
+                        (study_id,),
+                    ).fetchall()
+                    state_counts = {str(state).upper(): int(count) for state, count in counts}
+                    record["completed_trials"] = state_counts.get("COMPLETE", 0)
+                    record["failed_trials"] = state_counts.get("FAIL", 0)
+                    record["pruned_trials"] = state_counts.get("PRUNED", 0)
+                    timing = connection.execute(
+                        "SELECT MIN(datetime_start), MAX(datetime_complete) "
+                        "FROM trials WHERE study_id=?",
+                        (study_id,),
+                    ).fetchone()
+                    if timing and timing[0]:
+                        record.setdefault("started_at", str(timing[0]))
+                    if timing and timing[1]:
+                        record.setdefault("finished_at", str(timing[1]))
+                    direction = connection.execute(
+                        "SELECT direction FROM study_directions WHERE study_id=? "
+                        "ORDER BY objective LIMIT 1",
+                        (study_id,),
+                    ).fetchone()
+                    ordering = "ASC" if direction and direction[0] == "MINIMIZE" else "DESC"
+                    best = connection.execute(
+                        f"""SELECT t.number,tv.value FROM trials t
+                            JOIN trial_values tv ON tv.trial_id=t.trial_id
+                            WHERE t.study_id=? AND t.state='COMPLETE' AND tv.objective=0
+                            ORDER BY tv.value {ordering},t.number ASC LIMIT 1""",
+                        (study_id,),
+                    ).fetchone()
+                    if best:
+                        record["best_trial_number"] = int(best[0])
+                        record["best_value"] = float(best[1])
+                    elif record["completed_trials"] == 0:
+                        record["best_trial_number"] = None
+                        record["best_value"] = None
+                    record.setdefault("mode", "기록 없음")
+                    record.setdefault(
+                        "status", "completed" if record["completed_trials"] else "진행 기록 없음"
+                    )
+                    record["last_modified"] = datetime.fromtimestamp(
+                        database_path.stat().st_mtime, UTC
+                    ).isoformat()
+        except (OSError, sqlite3.Error):
+            continue
+    return sorted(
+        records.values(),
+        key=lambda item: (
+            str(
+                item.get("updated_at")
+                or item.get("finished_at")
+                or item.get("started_at")
+                or item.get("last_modified")
+                or ""
+            ),
+            str(item.get("study_name", "")).casefold(),
+        ),
+        reverse=True,
+    )
+
+
+def load_optimization_study_detail(
+    record: dict[str, Any], *, offset: int = 0, limit: int = 100
+) -> dict[str, Any]:
+    """Load one selected Study and a bounded page of its Trial details, read-only."""
+    database = Path(str(record.get("database_path", "")))
+    if not database.is_file():
+        return {**record, "detail_available": False, "trials": [], "total_trials": 0}
+    try:
+        uri = database.resolve().as_uri() + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=0.5) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            study = connection.execute(
+                "SELECT study_id FROM studies WHERE study_name=?", (record["study_name"],)
+            ).fetchone()
+            if study is None:
+                return {**record, "detail_available": False, "trials": [], "total_trials": 0}
+            study_id = int(study["study_id"])
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM trials WHERE study_id=?", (study_id,)
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """SELECT t.trial_id,t.number,t.state,t.datetime_start,t.datetime_complete,
+                          tv.value
+                   FROM trials t LEFT JOIN trial_values tv
+                     ON tv.trial_id=t.trial_id AND tv.objective=0
+                   WHERE t.study_id=? ORDER BY t.number LIMIT ? OFFSET ?""",
+                (study_id, max(1, min(100, limit)), max(0, offset)),
+            ).fetchall()
+            trials = []
+            for row in rows:
+                params = connection.execute(
+                    "SELECT param_name,param_value FROM trial_params WHERE trial_id=? "
+                    "ORDER BY param_name",
+                    (row["trial_id"],),
+                ).fetchall()
+                duration = None
+                if row["datetime_start"] and row["datetime_complete"]:
+                    try:
+                        duration = max(
+                            0.0,
+                            (
+                                datetime.fromisoformat(row["datetime_complete"])
+                                - datetime.fromisoformat(row["datetime_start"])
+                            ).total_seconds(),
+                        )
+                    except ValueError:
+                        pass
+                trials.append(
+                    {
+                        "number": int(row["number"]),
+                        "state": str(row["state"]),
+                        "started_at": row["datetime_start"],
+                        "finished_at": row["datetime_complete"],
+                        "duration_seconds": duration,
+                        "value": float(row["value"]) if row["value"] is not None else None,
+                        "parameters": {
+                            str(key): float(value) for key, value in params
+                        },
+                    }
+                )
+            best_parameters = {}
+            if record.get("best_trial_number") is not None:
+                best_row = connection.execute(
+                    "SELECT trial_id FROM trials WHERE study_id=? AND number=?",
+                    (study_id, int(record["best_trial_number"])),
+                ).fetchone()
+                if best_row:
+                    best_parameters = {
+                        str(key): (
+                            int(value)
+                            if str(key)
+                            in {"population_size", "generations", "max_depth", "max_lag"}
+                            and float(value).is_integer()
+                            else float(value)
+                        )
+                        for key, value in connection.execute(
+                            "SELECT param_name,param_value FROM trial_params WHERE trial_id=?",
+                            (best_row["trial_id"],),
+                        )
+                    }
+            return {
+                **record,
+                "best_parameters": best_parameters,
+                "trials": trials,
+                "trial_offset": max(0, offset),
+                "total_trials": total,
+                "detail_available": True,
+            }
+    except (OSError, sqlite3.Error):
+        return {**record, "detail_available": False, "trials": [], "total_trials": 0}
+
+
 def list_optimization_run_states(
     storage_directory: str | Path = "data/optimizations",
 ) -> list[dict[str, Any]]:

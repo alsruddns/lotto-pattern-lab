@@ -132,6 +132,60 @@ def test_optimization_history_reads_sqlite_and_json_without_mutating_files(tmp_p
     } == before
 
 
+def test_optimization_overview_and_selected_detail_are_read_only_and_page_trials(tmp_path) -> None:
+    import hashlib
+    import json
+    import sqlite3
+
+    root = tmp_path / "optimizations"
+    root.mkdir()
+    database = root / "study.sqlite"
+    state = root / "study.state.json"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE studies (study_id INTEGER PRIMARY KEY, study_name TEXT);
+            CREATE TABLE study_user_attributes (study_id INTEGER, key TEXT, value_json TEXT);
+            CREATE TABLE study_directions (study_id INTEGER, direction TEXT, objective INTEGER);
+            CREATE TABLE trials (
+                trial_id INTEGER PRIMARY KEY, study_id INTEGER, number INTEGER,
+                state TEXT, datetime_start TEXT, datetime_complete TEXT
+            );
+            CREATE TABLE trial_values (trial_id INTEGER, objective INTEGER, value REAL);
+            CREATE TABLE trial_params (trial_id INTEGER, param_name TEXT, param_value REAL);
+            INSERT INTO studies VALUES (1, 'paged-study');
+            INSERT INTO study_user_attributes VALUES (1, 'feature_profile', '"legacy"');
+            INSERT INTO study_directions VALUES (1, 'MAXIMIZE', 0);
+            INSERT INTO trials VALUES (1, 1, 0, 'COMPLETE', '2026-01-01', '2026-01-02');
+            INSERT INTO trial_values VALUES (1, 0, 0.25);
+            INSERT INTO trial_params VALUES (1, 'population_size', 56);
+            INSERT INTO trials VALUES (2, 1, 1, 'FAIL', '2026-01-02', NULL);
+            INSERT INTO trials VALUES (3, 1, 2, 'PRUNED', '2026-01-03', NULL);
+            """
+        )
+    state.write_text(
+        json.dumps({"study_name": "paged-study", "status": "completed"}), encoding="utf-8"
+    )
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (database, state)
+    }
+
+    overview = optimization.list_optimization_study_overviews(root)[0]
+    assert overview["completed_trials"] == 1
+    assert overview["failed_trials"] == 1
+    assert overview["pruned_trials"] == 1
+    assert overview["best_value"] == 0.25
+    assert "best_parameters" not in overview
+
+    detail = optimization.load_optimization_study_detail(overview, limit=1)
+    assert detail["total_trials"] == 3
+    assert len(detail["trials"]) == 1
+    assert detail["trials"][0]["parameters"] == {"population_size": 56.0}
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (database, state)
+    } == before
+
+
 def test_new_optimization_refuses_to_reuse_existing_name_without_touching_state(
     tmp_path, monkeypatch
 ) -> None:
