@@ -155,10 +155,7 @@ def cumulative_growth_summary(records: Iterable[dict[str, Any]]) -> dict[str, An
                     break
     return {
         "research_round_count": len(rounds),
-        "candidate_count": sum(
-            int(record.get("dashboard_summary", {}).get("candidate_count", 0) or 0)
-            for record in rounds
-        ),
+        "candidate_count": _known_sum(rounds, "candidate_count"),
         "new_valid_formula_count": patterns,
         "reused_elite_formula_count": inherited,
         "modified_formula_count": modified,

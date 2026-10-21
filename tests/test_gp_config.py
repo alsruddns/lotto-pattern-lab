@@ -30,6 +30,41 @@ def test_research_dashboard_exposes_settings_in_separate_start_tab(tmp_path, mon
     app = AppTest.from_file(page).run(timeout=30)
 
     assert not app.exception, [exception.message for exception in app.exception]
+    rendered = []
+
+    def visit(node):
+        rendered.append(node)
+        children = getattr(node, "children", ())
+        if isinstance(children, dict):
+            children = children.values()
+        for child in children:
+            visit(child)
+
+    visit(app.main)
+    start_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "key", None) == "start_new_research_now"
+    )
+    startup_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if index > start_index
+        and type(item).__name__ in {"Info", "Success", "Error", "Warning"}
+    )
+    settings_index = next(
+        index
+        for index, item in enumerate(rendered)
+        if getattr(item, "value", None) == "시작 전 적용 설정"
+    )
+    assert start_index < startup_index < settings_index
+    assert rendered[startup_index].value
+    detail_expander = next(item for item in app.expander if item.label == "세부 적용 설정 보기")
+    assert detail_expander.label == "세부 적용 설정 보기"
+    view_source = page.parents[1] / "continuous_research_view.py"
+    view_text = view_source.read_text(encoding="utf-8")
+    assert "settings_details = applied_settings_container.expander(" in view_text
+    assert 'expanded=False' in view_text[view_text.index("settings_details ="):]
     tab_labels = [tab.label for tab in app.tabs]
     assert "지속적 패턴 연구" in tab_labels
     assert "연구 조건 자동 최적화" in tab_labels

@@ -30,6 +30,10 @@ from lotto_pattern_lab.randomized_controls import (
 )
 from lotto_pattern_lab.report_clipboard import report_copy_button
 from lotto_pattern_lab.research import load_checkpoint
+from lotto_pattern_lab.research_dashboard import (
+    normalize_dashboard_summary,
+    validated_pattern_counts,
+)
 from lotto_pattern_lab.research_rounds import (
     SUMMARY_SCHEMA_VERSION,
     ResearchRoundStore,
@@ -192,6 +196,13 @@ def _duration(seconds: int | float | None) -> str:
     return f"{hours}시간 {minutes}분 {seconds}초"
 
 
+def _summary_count(summary: dict, key: str, fallback: object = None) -> object:
+    value = summary.get(key)
+    if value is not None:
+        return value
+    return fallback
+
+
 def hydrate_round(
     record: dict, *, reaggregate: bool = False, library: PatternLibrary = pattern_library
 ) -> dict:
@@ -209,38 +220,57 @@ def hydrate_round(
             hydrated["research_round"] = record["research_round"]
         except (OSError, ValueError):
             pass
-    summary = hydrated.get("dashboard_summary")
-    checkpoint_summary = hydrated.get("dashboard_summary")
-    registry_summary = record.get("dashboard_summary")
+    summary_value = hydrated.get("dashboard_summary")
+    registry_summary_value = record.get("dashboard_summary")
+    registry_summary, registry_diagnostic = normalize_dashboard_summary(
+        registry_summary_value, missing="dashboard_summary" not in record
+    )
+    checkpoint_summary, checkpoint_diagnostic = normalize_dashboard_summary(
+        summary_value, missing="dashboard_summary" not in hydrated
+    )
     if (
-        isinstance(registry_summary, dict)
+        registry_diagnostic is None
         and registry_summary.get("summary_schema_version") == SUMMARY_SCHEMA_VERSION
         and (
-            not isinstance(checkpoint_summary, dict)
+            checkpoint_diagnostic is not None
             or checkpoint_summary.get("summary_schema_version") != SUMMARY_SCHEMA_VERSION
         )
     ):
-        hydrated["dashboard_summary"] = registry_summary
-    summary = hydrated.get("dashboard_summary")
+        summary_value = registry_summary_value
+        hydrated["dashboard_summary"] = registry_summary_value
+    summary, summary_diagnostic = normalize_dashboard_summary(
+        summary_value, missing="dashboard_summary" not in hydrated
+    )
     needs_reaggregation = (
-        not isinstance(summary, dict)
+        summary_diagnostic is not None
         or summary.get("completed_experiment_count") is None
         or summary.get("summary_schema_version") != SUMMARY_SCHEMA_VERSION
     )
     if needs_reaggregation and reaggregate:
-        with st.spinner("실험 상세 기록에서 회차 통계를 다시 계산하고 있습니다..."):
-            summary = rebuild_dashboard_summary_from_store(hydrated, experiment_directory)
+        with st.spinner("연구 집계를 다시 계산하고 있습니다..."):
+            rebuilt_summary = rebuild_dashboard_summary_from_store(hydrated, experiment_directory)
+        summary, summary_diagnostic = normalize_dashboard_summary(rebuilt_summary)
         hydrated["dashboard_summary"] = summary
     try:
-        pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
+        raw_pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
     except sqlite3.OperationalError as error:
         _stop_on_database_error("research_pattern_count_lookup", error)
-    summary.update(pattern_counts)
-    summary["registration_metrics_available"] = True
-    summary["registration_count_source"] = "pattern_library"
+    pattern_counts, pattern_count_diagnostic = validated_pattern_counts(raw_pattern_counts)
+    if pattern_counts is not None:
+        summary.update(pattern_counts)
+        summary["registration_metrics_available"] = True
+        summary["registration_count_source"] = "pattern_library"
+    else:
+        summary["registration_metrics_available"] = False
+        summary_diagnostic = summary_diagnostic or pattern_count_diagnostic
+    if summary_diagnostic:
+        summary["summary_state"] = "pending_or_invalid"
+        summary["summary_diagnostic"] = summary_diagnostic
+    elif pattern_counts is not None:
+        summary["summary_state"] = "available"
     if not summary.get("exact_match_count") and hydrated.get("discovered_exact_matches"):
         summary["exact_match_count"] = len(hydrated.get("discovered_exact_matches", []))
-    if reaggregate:
+    if reaggregate and summary_diagnostic is None:
         summary["summary_schema_version"] = SUMMARY_SCHEMA_VERSION
         try:
             rounds_store.update(str(hydrated["research_id"]), {"dashboard_summary": summary})
@@ -265,6 +295,11 @@ else:
                 "실행 일시": item.get("started_at") or item.get("created_at"),
                 "연구 시간": format_duration(item.get("total_elapsed_seconds")),
                 "상태": item.get("status", "미수집"),
+                "집계 상태": (
+                    "집계 완료"
+                    if summary.get("summary_state") == "available"
+                    else "집계 대기 또는 점검 필요"
+                ),
                 "탐색 엔진": ", ".join(item.get("engines", [])) or "미수집",
                 "특징 프로파일": config.get("feature_profile", "미수집"),
                 "Elite Seeding": (
@@ -274,10 +309,12 @@ else:
                     if item.get("elite_seeding", {}).get("enabled") is False
                     else "미수집"
                 ),
-                "완료 실험": summary.get(
-                    "completed_experiment_count", item.get("completed_runs", 0)
+                "완료 실험": _summary_count(
+                    summary, "completed_experiment_count", item.get("completed_runs")
                 ),
-                "실패 실험": summary.get("failed_experiment_count", item.get("failed_runs", 0)),
+                "실패 실험": _summary_count(
+                    summary, "failed_experiment_count", item.get("failed_runs")
+                ),
                 "신규 패턴": format_count(summary.get("new_pattern_count")),
                 "3개 이상 반복 평가": format_count(_hit_total(summary, "3_plus")),
                 "4개 이상 반복 평가": format_count(_hit_total(summary, "4_plus")),
@@ -304,6 +341,7 @@ else:
         "6개 완전 일치 반복 평가": "6개 번호가 모두 일치한 실험 평가 수입니다.",
         "독립 테스트 요약": "독립 테스트 평가 점수의 모델별 평균입니다.",
     }
+    list_tooltips["집계 상태"] = "집계 정보의 준비 또는 형식 상태입니다."
     numeric_labels = {
         "완료 실험",
         "실패 실험",
@@ -346,18 +384,14 @@ else:
     growth_second[0].metric("중복 제외 수식", format_count(growth["duplicate_formula_count"]))
     growth_second[1].metric("연구 시간", _duration(growth["runtime_seconds"]))
     rate = growth["new_valid_formulas_per_hour"]
-    growth_second[2].metric(
-        "시간당 신규 수식", f"{rate:.2f}" if rate is not None else "평가 불가"
-    )
+    growth_second[2].metric("시간당 신규 수식", f"{rate:.2f}" if rate is not None else "평가 불가")
     growth_second[3].metric(
         "validation 평균",
         format_decimal(growth["mean_validation_scores"]["six_number_set"], suffix="점"),
     )
     growth_second[4].metric(
         "독립 테스트 평균",
-        format_decimal(
-            growth["mean_independent_test_scores"]["six_number_set"], suffix="점"
-        ),
+        format_decimal(growth["mean_independent_test_scores"]["six_number_set"], suffix="점"),
     )
     efficiency_change = growth["efficiency_change_vs_comparable_previous"]
     st.caption(
@@ -370,9 +404,7 @@ else:
     )
     random_p_values = growth["random_control_median_p_values"]
     one_p_value = (
-        random_p_values["one_number"]
-        if random_p_values["one_number"] is not None
-        else "평가 불가"
+        random_p_values["one_number"] if random_p_values["one_number"] is not None else "평가 불가"
     )
     six_p_value = (
         random_p_values["six_number_set"]
@@ -422,6 +454,11 @@ else:
     selected = hydrate_round(choices[selected_label], reaggregate=False)
     summary = selected.get("dashboard_summary", {})
     config = selected.get("config", {})
+    if summary.get("summary_diagnostic"):
+        st.warning(
+            f"이 연구의 회차 통계는 집계 대기 또는 점검이 필요합니다: "
+            f"{summary['summary_diagnostic']}"
+        )
     selected["prediction_candidates"] = collect_prediction_candidates(
         selected.get("completed_experiment_ids", [])
     )
@@ -431,8 +468,12 @@ else:
     model_metrics = model_metric_stats(summary)
     headline = st.columns(5)
     headline[0].metric("연구 시간", _duration(selected.get("total_elapsed_seconds")))
-    headline[1].metric("완료 실험", format_count(summary.get("completed_experiment_count", 0)))
-    headline[2].metric("실패·중단", format_count(summary.get("failed_experiment_count", 0)))
+    headline[1].metric(
+        "완료 실험", format_count(_summary_count(summary, "completed_experiment_count"))
+    )
+    headline[2].metric(
+        "실패·중단", format_count(_summary_count(summary, "failed_experiment_count"))
+    )
     headline[3].metric("검사 후보 수", format_count(summary.get("candidate_count")))
     headline[4].metric("신규 패턴", format_count(summary.get("new_pattern_count")))
     second = st.columns(5)
@@ -584,8 +625,7 @@ else:
         st.dataframe(model_result_rows, hide_index=True, width="stretch")
     else:
         st.info(
-            "저장된 추가 모델 비교가 없습니다. "
-            "선택형 모델 실행 기록은 기존 GP 기록과 분리됩니다."
+            "저장된 추가 모델 비교가 없습니다. 선택형 모델 실행 기록은 기존 GP 기록과 분리됩니다."
         )
     st.markdown("#### 실제 데이터와 무작위 대조 성능 분포")
     completed_ids = list(selected.get("completed_experiment_ids", []))
