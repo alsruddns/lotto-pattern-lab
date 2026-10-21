@@ -31,6 +31,7 @@ from lotto_pattern_lab.randomized_controls import (
 from lotto_pattern_lab.report_clipboard import report_copy_button
 from lotto_pattern_lab.research import load_checkpoint
 from lotto_pattern_lab.research_dashboard import (
+    dashboard_failure_records,
     normalize_dashboard_summary,
     validated_pattern_counts,
 )
@@ -521,7 +522,7 @@ else:
         )
     with right:
         st.markdown("#### 실패 및 중단 기록")
-        failures = selected.get("failed_runs", [])
+        failures = dashboard_failure_records(selected)
         if isinstance(failures, list) and failures:
             st.dataframe(
                 [

@@ -55,6 +55,8 @@ def test_worker_exit_before_checkpoint_records_failure_without_fake_results():
     assert metadata["status"] == "failed"
     assert metadata["failure_reason"] == "worker_exited_before_checkpoint"
     assert metadata["worker_pid"] == 4242
+    assert metadata["worker_exit_code"] == 2
+    assert metadata["failed_run_summary"][0]["worker_exit_code"] == 2
     assert "exit code 2" in metadata["failed_run_summary"][0]["error"]
     assert "completed_runs" not in metadata
     assert "completed_experiment_ids" not in metadata

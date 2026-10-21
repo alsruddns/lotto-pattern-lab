@@ -1308,6 +1308,7 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
             "seed": item.get("seed"),
             "error_type": item.get("error_type"),
             "error": item.get("error"),
+            "worker_exit_code": item.get("worker_exit_code"),
         }
         for item in failures
         if isinstance(item, dict)

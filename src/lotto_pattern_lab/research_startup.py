@@ -44,11 +44,13 @@ def worker_start_failure_metadata(
     return {
         "status": "failed",
         "worker_pid": worker_pid,
+        "worker_exit_code": exit_code,
         "finished_at": timestamp,
         "failure_reason": "worker_exited_before_checkpoint",
         "failed_run_summary": [
             {
                 "error_type": "WorkerStartError",
+                "worker_exit_code": exit_code,
                 "error": (
                     f"워커가 체크포인트를 쓰기 전에 종료했습니다 (exit code {exit_code}). "
                     f"로그: {log_path}"

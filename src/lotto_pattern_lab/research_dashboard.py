@@ -196,3 +196,16 @@ def validated_pattern_counts(value: Any) -> tuple[dict[str, Any] | None, str | N
     ):
         return None, "패턴 계보 집계의 형식 또는 값이 올바르지 않습니다."
     return copy.deepcopy(value), None
+
+
+def dashboard_failure_records(record: Mapping[str, Any]) -> list[dict[str, Any]] | int | None:
+    """Prefer experiment failures, then expose worker-start failures without counting trials."""
+    failures = record.get("failed_runs")
+    if isinstance(failures, list) and failures:
+        return copy.deepcopy(failures)
+    if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
+        return failures
+    startup_failures = record.get("failed_run_summary")
+    if isinstance(startup_failures, list):
+        return copy.deepcopy(startup_failures)
+    return failures if isinstance(failures, int) else None

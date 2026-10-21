@@ -5,6 +5,7 @@ import copy
 import pytest
 
 from lotto_pattern_lab.research_dashboard import (
+    dashboard_failure_records,
     normalize_dashboard_summary,
     validated_pattern_counts,
 )
@@ -103,6 +104,18 @@ def test_pattern_counts_accept_complete_dict_and_reject_missing_or_wrong_values(
         result, error = validated_pattern_counts(invalid)
         assert result is None
         assert error
+
+
+def test_dashboard_exposes_startup_failure_without_counting_it_as_an_experiment():
+    startup_failure = [{"error_type": "WorkerStartError", "worker_exit_code": 2}]
+    first_result = dashboard_failure_records(
+        {"failed_runs": [], "failed_run_summary": startup_failure}
+    )
+    assert first_result == startup_failure
+    assert dashboard_failure_records({"failed_runs": 0, "failed_run_summary": startup_failure}) == (
+        startup_failure
+    )
+    assert dashboard_failure_records({"failed_runs": 0}) == 0
 
 
 @pytest.mark.parametrize(

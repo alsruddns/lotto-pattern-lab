@@ -364,6 +364,29 @@ def test_report_missing_fields_are_explicit_and_comparison_flags_differences() -
     assert comparison["differences"]["population_size"] == {"left": 8, "right": 32}
 
 
+def test_report_includes_worker_start_failure_code_without_trial_counts() -> None:
+    report = build_chatgpt_report(
+        {
+            "research_round": 13,
+            "research_id": "b2c54ef1-763c-4885-afe9-f673a3ea3161",
+            "status": "failed",
+            "config": {},
+            "failed_runs": 0,
+            "failed_run_summary": [
+                {
+                    "error_type": "WorkerStartError",
+                    "worker_exit_code": 2,
+                    "error": "워커가 체크포인트 생성 전에 종료했습니다.",
+                }
+            ],
+        }
+    )
+    assert "failed" in report
+    assert "worker_exit_code" in report
+    assert "2" in report
+    assert "체크포인트 생성 전에 종료" in report
+
+
 def test_clipboard_button_has_browser_confirmation_and_fallback() -> None:
     component = (
         Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/clipboard_component/index.html"
