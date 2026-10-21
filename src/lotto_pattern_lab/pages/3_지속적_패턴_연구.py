@@ -37,6 +37,9 @@ if st.session_state.pop("optimization_reset_pending", False):
         "new_research_engine",
         "new_profile",
         "new_duration_minutes",
+        "new_duration_mode",
+        "new_custom_duration_minutes",
+        "new_custom_duration_minutes_value",
         *OPTUNA_TO_RESEARCH_KEYS.values(),
     ):
         st.session_state.pop(_key, None)

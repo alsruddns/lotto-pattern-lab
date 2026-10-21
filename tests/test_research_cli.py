@@ -21,7 +21,7 @@ def test_research_cli_accepts_cumulative_mode_and_optimization_source(monkeypatc
             "--csv",
             "unused.csv",
             "--duration-minutes",
-            "480",
+            "5",
             "--checkpoint",
             "unused.json",
             "--research-id",
@@ -41,6 +41,7 @@ def test_research_cli_accepts_cumulative_mode_and_optimization_source(monkeypatc
     assert captured["research_id"] == "b2c54ef1-763c-4885-afe9-f673a3ea3161"
     assert captured["research_mode"] == "cumulative"
     assert captured["optimization_origin"] == {"study_name": "test-study"}
+    assert captured["duration_seconds"] == 300
     assert "test-only" in capsys.readouterr().out
 
 

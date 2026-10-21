@@ -49,6 +49,11 @@ from lotto_pattern_lab.research import (
     request_pause,
     research_worker_active,
 )
+from lotto_pattern_lab.research_duration import (
+    duration_seconds_from_minutes,
+    recommended_preset_minutes,
+    validate_duration_minutes,
+)
 from lotto_pattern_lab.research_optimization import list_optimization_studies
 from lotto_pattern_lab.research_optimization_apply import (
     OPTUNA_TO_RESEARCH_KEYS,
@@ -80,8 +85,17 @@ ENGINE_OPTIONS = ("GP 간헐 패턴 탐색", "PySR 기호 회귀", "GP와 PySR �
 
 
 def _apply_research_preset() -> None:
-    minutes = int(st.session_state.get("new_duration_minutes", 180))
-    preset = GP_PRESETS[minutes]
+    duration_mode = st.session_state.get("new_duration_mode", "recommended")
+    duration_value = (
+        st.session_state.get(
+            "new_custom_duration_minutes",
+            st.session_state.get("new_custom_duration_minutes_value", 5),
+        )
+        if duration_mode == "custom"
+        else st.session_state.get("new_duration_minutes", 180)
+    )
+    minutes = int(duration_value)
+    preset = GP_PRESETS[recommended_preset_minutes(minutes, GP_PRESETS)]
     values = {
         "new_population_size": preset["population"],
         "new_generations": preset["generations"],
@@ -118,6 +132,17 @@ def _apply_research_preset() -> None:
     st.session_state["new_pysr_train_ratio"] = 0.60
     st.session_state["new_pysr_validation_ratio"] = 0.20
     st.session_state["new_pysr_warm_start"] = False
+
+
+def _remember_custom_duration() -> None:
+    value = st.session_state.get("new_custom_duration_minutes")
+    if value is not None:
+        try:
+            st.session_state["new_custom_duration_minutes_value"] = (
+                validate_duration_minutes(value)
+            )
+        except ValueError:
+            return
 
 
 PAUSE_MESSAGE = (
@@ -773,6 +798,9 @@ with new_tab:
     st.session_state.setdefault("new_research_engine", ENGINE_OPTIONS[0])
     st.session_state.setdefault("new_profile", "legacy")
     st.session_state.setdefault("new_duration_minutes", 180)
+    st.session_state.setdefault("new_duration_mode", "recommended")
+    st.session_state.setdefault("new_custom_duration_minutes", 5)
+    st.session_state.setdefault("new_custom_duration_minutes_value", 5)
     # Keep the previous UI's Elite Seeding-on default while making the mode explicit.
     st.session_state.setdefault("new_research_mode", CUMULATIVE_MODE)
     if "new_population_size" not in st.session_state:
@@ -805,17 +833,47 @@ with new_tab:
         help="날짜나 보너스 번호 특징을 쓰려면 데이터에 해당 정보가 있어야 합니다.",
         on_change=_apply_research_preset,
     )
-    duration_minutes = selector_columns[2].selectbox(
-        "연구 시간 프리셋",
-        (30, 60, 120, 180, 360, 480),
-        format_func=lambda value: f"{value}분",
-        key="new_duration_minutes",
-        help=(
-            "전체 연구 시간 예산입니다. GP와 PySR 비교는 같은 예산 안에서 "
-            "두 엔진을 번갈아 실행합니다."
-        ),
-        on_change=_apply_research_preset,
+    duration_mode = selector_columns[2].selectbox(
+        "연구 시간 설정",
+        ("recommended", "custom"),
+        format_func=lambda value: "추천 시간" if value == "recommended" else "직접 입력",
+        key="new_duration_mode",
     )
+    if duration_mode == "recommended":
+        duration_input = selector_columns[2].selectbox(
+            "연구 시간 프리셋",
+            (30, 60, 120, 180, 360, 480),
+            format_func=lambda value: f"{value}분",
+            key="new_duration_minutes",
+            help=(
+                "전체 연구 시간 예산입니다. GP와 PySR 비교도 같은 예산 안에서 "
+                "두 엔진을 번갈아 실행합니다."
+            ),
+            on_change=_apply_research_preset,
+        )
+    else:
+        st.session_state["new_custom_duration_minutes"] = st.session_state[
+            "new_custom_duration_minutes_value"
+        ]
+        duration_input = selector_columns[2].number_input(
+            "연구 시간(분)",
+            min_value=1,
+            max_value=1440,
+            step=1,
+            key="new_custom_duration_minutes",
+            help="1분부터 1440분(24시간)까지 정수 분으로 직접 설정합니다.",
+            on_change=_remember_custom_duration,
+        )
+    duration_validation_error = None
+    try:
+        duration_minutes = duration_input
+        duration_seconds = duration_seconds_from_minutes(duration_input)
+    except (TypeError, ValueError):
+        duration_validation_error = (
+            "연구 시간은 1분부터 1440분까지 정수로 입력해야 합니다."
+        )
+        duration_minutes = int(st.session_state.get("new_duration_minutes", 180))
+        duration_seconds = None
     research_mode = selector_columns[3].selectbox(
         "연구 방식",
         (INDEPENDENT_MODE, CUMULATIVE_MODE),
@@ -835,6 +893,7 @@ with new_tab:
     )
     st.session_state["research_current_engine_ids"] = list(engines)
     st.session_state["research_current_profile"] = profile
+    st.session_state["research_current_duration_seconds"] = duration_seconds
     st.session_state["research_current_dataset_range"] = current_data_range
     st.session_state["research_current_dataset_integrity"] = new_integrity
     current_dataset_hashes = (
@@ -917,7 +976,7 @@ with new_tab:
             st.session_state["optimization_reset_pending"] = True
             st.rerun()
 
-    selected_preset = GP_PRESETS[int(duration_minutes)]
+    selected_preset = GP_PRESETS[recommended_preset_minutes(duration_minutes, GP_PRESETS)]
     strategy_recommendation = recommend_optuna_settings(
         list_optimization_studies(),
         feature_profile=profile,
@@ -935,6 +994,12 @@ with new_tab:
             else "기본 연구 설정"
         )
     )
+    if duration_minutes <= 10:
+        st.info(
+            "짧은 테스트 연구는 워커 실행, 체크포인트 저장, 상태 갱신 및 결과 연결을 "
+            "확인하는 용도입니다. GP/PySR 계산은 진행 중인 실험 단위가 마무리된 뒤 "
+            "시간 제한을 다시 확인하므로 설정한 시간을 넘길 수 있습니다."
+        )
     action_columns = st.columns([1, 1, 3])
     preflight_submitted = action_columns[0].button(
         "연구 환경 사전 검사",
@@ -945,13 +1010,16 @@ with new_tab:
         "새 연구 시작",
         type="primary",
         key="start_new_research_now",
-        disabled=research_worker_active(),
+        disabled=research_worker_active() or duration_validation_error is not None,
         help="시작을 누르면 유효한 검사가 없을 때 자동 검사 후 새 연구를 시작합니다.",
     )
     if research_worker_active():
         action_columns[2].warning("다른 연구 작업이 실행 중이어서 시작할 수 없습니다.")
     elif new_dataset is None:
         action_columns[2].error("기준 데이터 파일을 읽지 못해 연구를 시작할 수 없습니다.")
+
+    if duration_validation_error and new_dataset is not None and not research_worker_active():
+        action_columns[2].error(duration_validation_error)
 
     startup_status_container = st.container()
     applied_settings_container = st.container()
@@ -1368,7 +1436,7 @@ with new_tab:
             config_error = str(error)
             st.error(f"PySR 설정을 확인하세요: {error}")
     if effective_config is not None:
-        expected = GP_PRESETS[int(duration_minutes)]
+        expected = GP_PRESETS[recommended_preset_minutes(duration_minutes, GP_PRESETS)]
         is_custom = (
             effective_config.population_size != expected["population"]
             or effective_config.generations != expected["generations"]
@@ -1715,7 +1783,8 @@ with new_tab:
                 st.session_state["research_launch_reuse_candidate_count"] = len(preview)
                 st.session_state["research_launch_seed"] = effective_config.seed
                 st.session_state["research_launch_started_at"] = datetime.now(UTC).isoformat()
-                st.session_state["research_target_duration_seconds"] = float(duration_minutes) * 60
+                assert duration_seconds is not None
+                st.session_state["research_target_duration_seconds"] = float(duration_seconds)
                 created_at = datetime.now(UTC).isoformat()
                 optimization_origin = None
                 if optimization_context:
@@ -1783,7 +1852,7 @@ with new_tab:
                         if optimization_origin
                         else None,
                         "completed_runs": 0,
-                        "target_duration_seconds": float(duration_minutes) * 60,
+                        "target_duration_seconds": float(duration_seconds),
                         "completed_experiment_ids": [],
                     },
                     checkpoint_dir,

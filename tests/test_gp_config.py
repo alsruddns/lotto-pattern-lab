@@ -8,6 +8,11 @@ from lotto_pattern_lab import research_queue
 from lotto_pattern_lab.gp_config import GPConfig
 from lotto_pattern_lab.gp_engine import SearchConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
+from lotto_pattern_lab.research_duration import (
+    duration_seconds_from_minutes,
+    recommended_preset_minutes,
+    validate_duration_minutes,
+)
 
 
 def test_searches_share_gp_defaults_and_validation() -> None:
@@ -20,6 +25,26 @@ def test_searches_share_gp_defaults_and_validation() -> None:
     assert {name: getattr(intermittent, name) for name in shared_fields} == asdict(defaults)
     with pytest.raises(ValueError, match="Train plus validation"):
         IntermittentConfig(train_ratio=0.8, validation_ratio=0.2)
+
+
+@pytest.mark.parametrize("minutes", [5, 10, 45, 120, 480, 720])
+def test_custom_duration_is_positive_whole_minutes_and_converts_exactly(minutes):
+    assert validate_duration_minutes(minutes) == minutes
+    assert duration_seconds_from_minutes(minutes) == minutes * 60
+
+
+@pytest.mark.parametrize("minutes", [0, -1, 1441, 5.5, True])
+def test_custom_duration_rejects_invalid_or_unsafe_values(minutes):
+    with pytest.raises(ValueError):
+        duration_seconds_from_minutes(minutes)
+
+
+def test_custom_duration_uses_nearest_lower_recommended_gp_profile():
+    presets = (30, 60, 120, 180, 360, 480)
+    assert recommended_preset_minutes(5, presets) == 30
+    assert recommended_preset_minutes(45, presets) == 30
+    assert recommended_preset_minutes(120, presets) == 120
+    assert recommended_preset_minutes(720, presets) == 480
 
 
 def test_research_dashboard_exposes_settings_in_separate_start_tab(tmp_path, monkeypatch) -> None:
@@ -76,6 +101,22 @@ def test_research_dashboard_exposes_settings_in_separate_start_tab(tmp_path, mon
     preset_selector = next(item for item in app.selectbox if item.key == "new_duration_minutes")
     assert preset_selector.value == 180
     assert len(preset_selector.options) == 6
+
+    original_tab = app.session_state["research_workspace_tab"]
+    app.selectbox(key="new_duration_mode").set_value("custom").run(timeout=30)
+    assert app.number_input(key="new_custom_duration_minutes").value == 5
+    assert app.session_state["research_current_duration_seconds"] == 300
+    assert app.session_state["research_current_settings"]["new_duration_minutes"] == 5
+    app.number_input(key="new_custom_duration_minutes").set_value(45).run(timeout=30)
+    assert app.session_state["research_current_duration_seconds"] == 2700
+    assert app.session_state["research_workspace_tab"] == original_tab
+    app.selectbox(key="new_duration_mode").set_value("recommended").run(timeout=30)
+    assert app.selectbox(key="new_duration_minutes").value == 180
+    assert app.session_state["research_current_duration_seconds"] == 10800
+    app.selectbox(key="new_duration_mode").set_value("custom").run(timeout=30)
+    assert app.number_input(key="new_custom_duration_minutes").value == 45
+    assert app.session_state["research_current_duration_seconds"] == 2700
+    app.selectbox(key="new_duration_mode").set_value("recommended").run(timeout=30)
     presets = {
         30: (32, 10, 5, 3),
         60: (48, 15, 5, 5),
