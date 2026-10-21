@@ -56,6 +56,7 @@ def test_dashboard_overview_renders_from_temporary_database(monkeypatch, tmp_pat
 
     assert not app.exception, [exception.message for exception in app.exception]
     assert any(item.key == "research_dashboard_selected_round" for item in app.selectbox)
+    assert any(item.label == "연구 회차 선택" for item in app.selectbox)
     assert any(item.key == "load_research_round_detail" for item in app.button)
     assert len(app.dataframe) == 1
     assert store.get("temporary-round")["status"] == "completed"

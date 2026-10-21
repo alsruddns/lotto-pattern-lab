@@ -25,6 +25,10 @@ from lotto_pattern_lab.prediction import (
     summarize_prediction_history,
 )
 from lotto_pattern_lab.presentation import format_count, format_decimal, pretty_formula
+from lotto_pattern_lab.research_recommendations import (
+    generate_research_recommendations,
+    list_research_recommendation_candidates,
+)
 from lotto_pattern_lab.storage import ExperimentStore
 
 
@@ -33,6 +37,15 @@ def _candidate_validation_value(candidate: dict) -> object:
     if score is not None:
         return score
     return candidate.get("evaluation", {}).get("validation", {}).get("mae")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_research_candidates(
+    directory: str, file_manifest: tuple[tuple[str, int, int], ...]
+):
+    # The manifest is part of the key so newly completed experiments invalidate the cache.
+    del file_manifest
+    return list_research_recommendation_candidates(directory, limit=200)
 
 
 st.set_page_config(page_title="다음 회차 번호 추천", layout="wide")
@@ -214,6 +227,141 @@ else:
     st.caption(
         "대상 회차 이전의 연속 10회만 입력 특징에 사용합니다. 이후 결과는 예측 입력에서 제외합니다."
     )
+
+st.subheader("누적 연구 기반 자동 추천")
+st.caption(
+    "완료된 GP·PySR 연구 중 시간순 검증과 홀드아웃 기록이 있고, "
+    "현재 데이터 프로파일과 호환되는 저장 수식만 재실행합니다. "
+    "과거 검증 성과는 실제 당첨 확률을 뜻하지 않습니다."
+)
+st.caption("성능을 위해 최근 저장 실험 최대 200건의 요약만 확인합니다.")
+experiment_manifest = tuple(
+    (path.name, path.stat().st_mtime_ns, path.stat().st_size)
+    for path in sorted(
+        experiments.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True
+    )[:200]
+)
+research_candidates = _cached_research_candidates(str(experiments.resolve()), experiment_manifest)
+research_profiles = sorted({str(item["feature_profile"]) for item in research_candidates})
+if not research_profiles:
+    st.info("시간순 검증, 홀드아웃 결과 및 재실행 조건을 갖춘 GP·PySR 후보를 찾지 못했습니다.")
+elif dataset is None:
+    st.info("연구 기반 추천을 만들려면 먼저 연속된 과거 회차가 포함된 데이터를 선택하세요.")
+else:
+    profile_index = research_profiles.index("legacy") if "legacy" in research_profiles else 0
+    research_profile = st.selectbox(
+        "추천에 사용할 특징 프로파일",
+        research_profiles,
+        index=profile_index,
+        key="research_prediction_feature_profile",
+    )
+    profile_candidates = [
+        item for item in research_candidates if item["feature_profile"] == research_profile
+    ]
+    st.write(f"재실행 가능 후보: **{len(profile_candidates):,}개**")
+    st.caption(
+        "후보는 검증 근거와 수식 재실행 가능성으로 거릅니다. "
+        "GP와 PySR의 서로 다른 점수는 직접 비교하지 않습니다. "
+        "미래 독립 검증 기록은 별도 영역에서 확인할 수 있습니다."
+    )
+    requested_recommendations = st.selectbox(
+        "추천 조합 수", (1, 3, 5, 10), key="research_prediction_recommendation_count"
+    )
+    if st.button(
+        "검증 기반 추천 조합 생성",
+        key="generate_research_based_recommendations",
+        disabled=not profile_candidates,
+        type="primary",
+    ):
+        try:
+            st.session_state["research_recommendation_drafts"] = []
+            st.session_state["research_recommendation_failures"] = []
+            official_latest = _fetch_latest_round()
+            if int(target) != official_latest + 1:
+                raise ValueError(
+                    "사전 추천 대상은 최신 확정 회차의 다음 회차인 "
+                    f"{official_latest + 1}회여야 합니다."
+                )
+            drafts, failures = generate_research_recommendations(
+                profile_candidates,
+                dataset,
+                int(target),
+                int(requested_recommendations),
+                feature_profile=research_profile,
+                data_file_sha256=hashlib.sha256(data_bytes).hexdigest() if data_bytes else None,
+                random_seed=int(seed),
+                official_latest_round=official_latest,
+                target_date=target_date,
+            )
+            st.session_state["research_recommendation_drafts"] = drafts
+            st.session_state["research_recommendation_failures"] = failures
+            if len(drafts) < int(requested_recommendations):
+                st.info(
+                    f"요청한 {requested_recommendations}조합 중 근거가 확인된 고유 조합 "
+                    f"{len(drafts)}개만 생성했습니다. 임의 번호로 채우지 않았습니다."
+                )
+        except Exception as error:
+            st.error(f"추천 생성 실패: {error}")
+
+research_drafts = st.session_state.get("research_recommendation_drafts", [])
+if research_drafts:
+    st.markdown("#### 생성된 추천 초안")
+    st.caption("초안은 자동 저장하지 않습니다. 저장을 눌러야 사전 등록 이력에 추가됩니다.")
+    saved_draft_ids = st.session_state.setdefault("saved_research_recommendation_ids", set())
+    for draft_index, draft in enumerate(research_drafts, start=1):
+        with st.container(border=True):
+            st.markdown(
+                f"**추천 {draft_index} · {draft['target_round']}회**  "
+                + " · ".join(f"`{number}`" for number in draft["recommended_numbers"])
+            )
+            for source_record in draft.get("research_selection", {}).get(
+                "supporting_candidates", []
+            ):
+                st.caption(
+                    f"{source_record['engine']} · 연구 {source_record['experiment_id']} · "
+                    f"후보 {source_record['candidate_rank']} · "
+                    f"검증 {source_record.get('validation_round_count') or '미수집'}회 / "
+                    f"홀드아웃 {source_record.get('test_round_count') or '미수집'}회"
+                )
+            with st.expander("추천 근거 및 사용 공식"):
+                st.json(draft.get("research_selection", {}))
+                st.write(
+                    "후보별 기록 통계",
+                    draft.get("research_selection", {}).get("supporting_candidates", []),
+                )
+                st.write("사용 공식", draft.get("used_formulas", []))
+                st.write("데이터 출처", draft.get("data_provenance", {}))
+            already_saved = draft["recommendation_id"] in saved_draft_ids
+            if already_saved:
+                st.success("이 추천은 이미 저장되었습니다.")
+            elif st.button(
+                f"추천 {draft_index} 사전 등록",
+                key=f"save_research_recommendation_{draft['recommendation_id']}",
+            ):
+                try:
+                    current_official_round = _fetch_latest_round()
+                    if int(draft["target_round"]) != int(current_official_round) + 1:
+                        raise ValueError(
+                            "최신 확정 회차가 바뀌어 이 초안을 사전 추천으로 등록할 수 없습니다. "
+                            "현재 회차 기준으로 다시 생성하세요."
+                        )
+                    saved_path = save_recommendation(draft, prediction_dir)
+                    saved_draft_ids.add(draft["recommendation_id"])
+                    st.session_state["saved_research_recommendation_ids"] = saved_draft_ids
+                    st.session_state["active_recommendation_id"] = draft["recommendation_id"]
+                    st.success(f"사전 추천 기록을 저장했습니다: {saved_path.name}")
+                except FileExistsError:
+                    saved_draft_ids.add(draft["recommendation_id"])
+                    st.info("동일 추천 기록이 이미 저장되어 있습니다.")
+                except (OSError, ValueError) as error:
+                    st.error(f"추천 저장 실패: {error}")
+if st.session_state.get("research_recommendation_failures"):
+    with st.expander("실행할 수 없었던 후보"):
+        st.dataframe(
+            st.session_state["research_recommendation_failures"],
+            hide_index=True,
+            width="stretch",
+        )
 
 with st.expander("\uae30\uc874 \uace0\uc801\uc911 \ud328\ud134 \uc0ac\ub840", expanded=False):
     st.write("\ud328\ud134 ID: `b5f4b83e-20e3-47ea-9ac1-9d613e0e28f0`")

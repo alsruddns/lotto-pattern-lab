@@ -527,7 +527,7 @@ else:
         f"연구 {item['research_round']}회차 · {item['research_id'][:8]}": item for item in rounds
     }
     selected_label = st.selectbox(
-        "?? ?? ??",
+        "연구 회차 선택",
         list(choices),
         key="research_dashboard_selected_round",
     )

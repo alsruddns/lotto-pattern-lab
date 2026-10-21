@@ -508,6 +508,45 @@ def test_scheduler_releases_reservation_if_global_slot_becomes_busy_after_claim(
     assert record["research_id"] is not None
 
 
+def test_detached_scheduler_uses_hidden_windows_process_flags(tmp_path: Path, monkeypatch) -> None:
+    import subprocess
+
+    import lotto_pattern_lab.queue_scheduler as scheduler
+
+    class Store:
+        path = tmp_path / "queue.sqlite"
+
+        def __init__(self) -> None:
+            self.checks = iter((False, True))
+
+        def lease_is_live(self, _queue_id: str) -> bool:
+            return next(self.checks)
+
+    class Process:
+        pid = 4321
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    calls = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr(scheduler, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(scheduler.subprocess, "Popen", fake_popen)
+
+    pid = scheduler.start_detached_scheduler(Store(), "temporary-queue")
+
+    assert pid == 4321
+    flags = calls[0][1]["creationflags"]
+    if __import__("os").name == "nt":
+        assert flags & subprocess.CREATE_NO_WINDOW
+        assert flags & subprocess.DETACHED_PROCESS
+
+
 def test_schedule_conflicts_include_running_fixed_reservation_estimate(tmp_path: Path) -> None:
     from datetime import UTC, datetime, timedelta
 
