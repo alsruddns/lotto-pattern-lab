@@ -16,6 +16,7 @@ from .feature_schema import PRIMITIVE_SET_VERSION, feature_mapping, remap_formul
 from .features import Example
 from .gp_config import GPConfig
 from .gp_engine import _make_primitive_set, _predict
+from .windows_process import enable_hidden_multiprocessing_children
 
 _WORKER_EXAMPLES: tuple[Example, ...] = ()
 _WORKER_PSET: gp.PrimitiveSetTyped | None = None
@@ -582,6 +583,7 @@ def run_intermittent_search(
     _WORKER_MIN_COVERAGE = config.min_activation_rate
     pool = None
     if config.workers > 1:
+        enable_hidden_multiprocessing_children()
         pool = multiprocessing.get_context("spawn").Pool(
             config.workers,
             initializer=_worker_init,

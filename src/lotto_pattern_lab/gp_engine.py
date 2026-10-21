@@ -13,6 +13,7 @@ from deap import base, creator, gp, tools
 from .backtest import DataSplits
 from .features import Example
 from .gp_config import GPConfig
+from .windows_process import enable_hidden_multiprocessing_children
 
 _EVALUATION_EXAMPLES: tuple[Example, ...] = ()
 _MAX_DEPTH = 6
@@ -349,6 +350,7 @@ def run_search(
     _MAX_DEPTH = config.max_depth
     pool = None
     if config.workers > 1:
+        enable_hidden_multiprocessing_children()
         pool = multiprocessing.get_context("spawn").Pool(
             config.workers,
             initializer=_worker_init,
