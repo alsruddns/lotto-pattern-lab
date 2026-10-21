@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
 from typing import Any
@@ -138,9 +138,7 @@ def _remember_custom_duration() -> None:
     value = st.session_state.get("new_custom_duration_minutes")
     if value is not None:
         try:
-            st.session_state["new_custom_duration_minutes_value"] = (
-                validate_duration_minutes(value)
-            )
+            st.session_state["new_custom_duration_minutes_value"] = validate_duration_minutes(value)
         except ValueError:
             return
 
@@ -586,8 +584,7 @@ def render_top_research_status() -> None:
         failed = summary.get(
             "failed_experiment_count",
             sum(
-                not item.get("resolved_by_experiment_id")
-                for item in monitor.get("failed_runs", [])
+                not item.get("resolved_by_experiment_id") for item in monitor.get("failed_runs", [])
             ),
         )
         completed = int(monitor.get("completed_runs", 0))
@@ -619,10 +616,10 @@ def render_top_research_status() -> None:
         seed = seed if seed is not None else "—"
         event = monitor.get("current_progress", {}).get("event", {})
         stage = (
-            event.get("stage") or event.get("run")
-            if isinstance(event, dict)
-            else None
-        ) or current.get("stage") or "실험 경계 대기"
+            (event.get("stage") or event.get("run") if isinstance(event, dict) else None)
+            or current.get("stage")
+            or "실험 경계 대기"
+        )
         progress_time = f"시간 제한 진행률 · {progress:.1%}" if target > 0 else "시간 제한 없음"
         research_round_number = monitor.get("research_round", "확인 중")
         source_research_count = len(strategy.get("source_research_ids", ()))
@@ -669,9 +666,7 @@ def render_top_research_status() -> None:
         source_research_count = int(
             st.session_state.get("research_launch_source_research_count", 0)
         )
-        reused_formula_count = int(
-            st.session_state.get("research_launch_reuse_candidate_count", 0)
-        )
+        reused_formula_count = int(st.session_state.get("research_launch_reuse_candidate_count", 0))
         new_formula_count = None
         research_mode_label = st.session_state.get("research_launch_mode", "확인 중")
 
@@ -766,7 +761,7 @@ new_tab, resume_tab, queue_tab = st.tabs(
     (
         "\uc0c8 \uc5f0\uad6c \uc2dc\uc791",
         "\uae30\uc874 \uc5f0\uad6c \uc774\uc5b4\uc11c \ud558\uae30",
-        "\uc5f0\uad6c \uc608\uc57d \uc2e4\ud589",
+        "\uc5f0\uad6c \uc608\uc57d \uad00\ub9ac",
     )
 )
 
@@ -869,17 +864,13 @@ with new_tab:
         duration_minutes = duration_input
         duration_seconds = duration_seconds_from_minutes(duration_input)
     except (TypeError, ValueError):
-        duration_validation_error = (
-            "연구 시간은 1분부터 1440분까지 정수로 입력해야 합니다."
-        )
+        duration_validation_error = "연구 시간은 1분부터 1440분까지 정수로 입력해야 합니다."
         duration_minutes = int(st.session_state.get("new_duration_minutes", 180))
         duration_seconds = None
     research_mode = selector_columns[3].selectbox(
         "연구 방식",
         (INDEPENDENT_MODE, CUMULATIVE_MODE),
-        format_func=lambda value: (
-            "독립 탐색" if value == INDEPENDENT_MODE else "누적 진화 연구"
-        ),
+        format_func=lambda value: "독립 탐색" if value == INDEPENDENT_MODE else "누적 진화 연구",
         key="new_research_mode",
         help=(
             "독립 탐색은 과거 수식을 주입하지 않습니다. 누적 진화 연구는 호환되는 GP 수식을 "
@@ -922,9 +913,7 @@ with new_tab:
         expected_params = optimization_context.get("parameters", {})
         if not optimization_context.get("application_verified"):
             expected_controls = optimization_context.get("expected_controls", {})
-            actual_controls = {
-                key: st.session_state.get(key) for key in expected_controls
-            }
+            actual_controls = {key: st.session_state.get(key) for key in expected_controls}
             values_match = (
                 bool(expected_controls)
                 and actual_controls == expected_controls
@@ -1000,6 +989,69 @@ with new_tab:
             "확인하는 용도입니다. GP/PySR 계산은 진행 중인 실험 단위가 마무리된 뒤 "
             "시간 제한을 다시 확인하므로 설정한 시간을 넘길 수 있습니다."
         )
+    execution_method = st.selectbox(
+        "\uc2e4\ud589 \ubc29\ubc95",
+        ("now", "queue"),
+        format_func=lambda value: (
+            "\uc9c0\uae08 \uc5f0\uad6c \uc2dc\uc791"
+            if value == "now"
+            else "\uc608\uc57d \ub300\uae30\uc5f4\uc5d0 \ucd94\uac00"
+        ),
+        key="new_research_execution_method",
+    )
+    st.session_state.setdefault("new_research_queue_request_key", str(uuid.uuid4()))
+    schedule_mode = "after_completion"
+    scheduled_at = None
+    schedule_time_valid = True
+    if execution_method == "queue":
+        schedule_mode = st.radio(
+            "\uc608\uc57d \uc2dc\uc791 \uc870\uac74",
+            ("after_completion", "at_time"),
+            format_func=lambda value: (
+                "\uc774\uc804 \uc5f0\uad6c \uc885\ub8cc \ud6c4 \uc2e4\ud589"
+                if value == "after_completion"
+                else "\uc9c0\uc815\ud55c \ub0a0\uc9dc\uc640 \uc2dc\uac01\uc5d0 \uc2e4\ud589"
+            ),
+            key="new_research_schedule_mode",
+        )
+        failure_policy = st.selectbox(
+            "\uc5f0\uad6c \uc2e4\ud328 \ud6c4 \ub2e4\uc74c \uc608\uc57d",
+            ("continue", "stop"),
+            format_func=lambda value: (
+                "\uc7a0\uae08 \ud574\uc81c \ud6c4 \ub2e4\uc74c \uc5f0\uad6c \uc9c4\ud589"
+                if value == "continue"
+                else "\uc2e4\ud328 \uc2dc \ub300\uae30\uc5f4 \uc815\uc9c0"
+            ),
+            key="new_research_failure_policy",
+        )
+        if schedule_mode == "at_time":
+            from datetime import datetime as local_datetime
+            from zoneinfo import ZoneInfo
+
+            schedule_columns = st.columns(2)
+            selected_date = schedule_columns[0].date_input(
+                "\uc2dc\uc791 \ub0a0\uc9dc (Asia/Seoul)", key="new_research_schedule_date"
+            )
+            selected_time = schedule_columns[1].time_input(
+                "\uc2dc\uc791 \uc2dc\uac01 (HH:mm)", key="new_research_schedule_time"
+            )
+            local_start = local_datetime.combine(selected_date, selected_time).replace(
+                tzinfo=ZoneInfo("Asia/Seoul")
+            )
+            schedule_time_valid = local_start > datetime.now(ZoneInfo("Asia/Seoul"))
+            if not schedule_time_valid:
+                st.error(
+                    "\uc608\uc57d \uc2dc\uac01\uc740 \ud604\uc7ac \uc2dc\uac01 \uc774\ud6c4\uc5ec\uc57c \ud569\ub2c8\ub2e4."  # noqa: E501
+                )
+            scheduled_at = local_start.astimezone(UTC).isoformat()
+            st.info(
+                "\uc608\uc57d \uc2dc\uac01\uc5d0 PC\uc640 \uc2a4\ucf00\uc904\ub7ec\uac00 \uc2e4\ud589 \uc911\uc774\uc5b4\uc57c \uc2dc\uc791\ub429\ub2c8\ub2e4. \uc5f0\uad6c\uac00 \uc2e4\ud589 \uc911\uc774\uba74 \uc7a0\uae08 \ud574\uc81c \ud6c4\uc5d0 \uc9c0\uc5f0 \uc2e4\ud589\ud569\ub2c8\ub2e4."  # noqa: E501
+            )
+            if research_worker_active():
+                st.warning(
+                    "\ud604\uc7ac \uc5f0\uad6c \uc885\ub8cc \uc2dc\uac01\uc740 \ud655\uc815\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4. "  # noqa: E501
+                    "\uc9c0\uc815 \uc2dc\uac04\uc5d0 \uc791\uc5c5\uc790 \uc7a0\uae08\uc774 \uc720\uc9c0\ub418\uba74 \uc7a0\uae08 \ud574\uc81c \ud6c4\uc5d0 \uc9c0\uc5f0 \uc2e4\ud589\ud569\ub2c8\ub2e4."  # noqa: E501
+                )
     action_columns = st.columns([1, 1, 3])
     preflight_submitted = action_columns[0].button(
         "연구 환경 사전 검사",
@@ -1007,13 +1059,17 @@ with new_tab:
         help="현재 데이터와 설정으로 실행 환경을 검사합니다.",
     )
     submitted = action_columns[1].button(
-        "새 연구 시작",
+        "\uc0c8 \uc5f0\uad6c \uc2dc\uc791"
+        if execution_method == "now"
+        else "\uc608\uc57d \ucd94\uac00",
         type="primary",
-        key="start_new_research_now",
-        disabled=research_worker_active() or duration_validation_error is not None,
+        key="start_new_research_now" if execution_method == "now" else "enqueue_new_research",
+        disabled=(research_worker_active() if execution_method == "now" else False)
+        or duration_validation_error is not None
+        or not schedule_time_valid,
         help="시작을 누르면 유효한 검사가 없을 때 자동 검사 후 새 연구를 시작합니다.",
     )
-    if research_worker_active():
+    if research_worker_active() and execution_method == "now":
         action_columns[2].warning("다른 연구 작업이 실행 중이어서 시작할 수 없습니다.")
     elif new_dataset is None:
         action_columns[2].error("기준 데이터 파일을 읽지 못해 연구를 시작할 수 없습니다.")
@@ -1160,14 +1216,10 @@ with new_tab:
                 "GP Elite Seeding 사용",
                 help="호환되는 저장 패턴을 초기 후보에 포함합니다.",
                 key="new_elite_seeding_enabled",
-                disabled=(
-                    research_mode != CUMULATIVE_MODE or "intermittent_gp" not in engines
-                ),
+                disabled=(research_mode != CUMULATIVE_MODE or "intermittent_gp" not in engines),
             )
             elite_enabled = bool(
-                research_mode == CUMULATIVE_MODE
-                and "intermittent_gp" in engines
-                and elite_toggle
+                research_mode == CUMULATIVE_MODE and "intermittent_gp" in engines and elite_toggle
             )
             elite_ratio = st.slider(
                 "기존 패턴 계승 비율",
@@ -1178,9 +1230,7 @@ with new_tab:
                 key="new_elite_seed_ratio",
             )
             pysr_targets = ("main_positions", "one_number") + (
-                ("bonus",)
-                if pysr_profile in {"bonus_lag_v1", "calendar_round"}
-                else ()
+                ("bonus",) if pysr_profile in {"bonus_lag_v1", "calendar_round"} else ()
             )
             pysr_target = st.selectbox(
                 "PySR 탐색 목표",
@@ -1650,12 +1700,8 @@ with new_tab:
                     },
                 }
             else:
-                with st.status(
-                    "연구 환경을 검사하고 있습니다.", expanded=True
-                ) as progress:
-                    st.write(
-                        "데이터 무결성, 특징 설정, GP 실행 및 저장 환경을 확인합니다."
-                    )
+                with st.status("연구 환경을 검사하고 있습니다.", expanded=True) as progress:
+                    st.write("데이터 무결성, 특징 설정, GP 실행 및 저장 환경을 확인합니다.")
                     report = run_research_preflight(
                         new_dataset,
                         effective_config,
@@ -1700,20 +1746,16 @@ with new_tab:
             getattr(st, severity)(message)
             if current_preflight.get("status") == "passed":
                 origin = (
-                    "\uC800\uC7A5\uB41C \uAC80\uC0AC \uACB0\uACFC \uC0AC\uC6A9"
+                    "\uc800\uc7a5\ub41c \uac80\uc0ac \uacb0\uacfc \uc0ac\uc6a9"
                     if cache_loaded_from_disk
-                    else "\uD604\uC7AC \uC138\uC158 \uAC80\uC0AC \uACB0\uACFC \uC0AC\uC6A9"
+                    else "\ud604\uc7ac \uc138\uc158 \uac80\uc0ac \uacb0\uacfc \uc0ac\uc6a9"
                 )
                 checked_at = st.session_state.get(
-                    "research_preflight_checked_at", "\uC2DC\uAC01 \uBBF8\uAE30\uB85D"
+                    "research_preflight_checked_at", "\uc2dc\uac01 \ubbf8\uae30\ub85d"
                 )
-                st.caption(
-                    f"{origin} \u00B7 \uAC80\uC0AC \uC2DC\uAC01 {checked_at}"
-                )
+                st.caption(f"{origin} \u00b7 \uac80\uc0ac \uc2dc\uac01 {checked_at}")
             for engine_id, engine_report in current_preflight.get("engines", {}).items():
-                with st.expander(
-                    f"{engine_id}: {engine_report.get('status', 'failed')}"
-                ):
+                with st.expander(f"{engine_id}: {engine_report.get('status', 'failed')}"):
                     st.json(
                         {key: value for key, value in engine_report.items() if key != "traceback"}
                     )
@@ -1721,9 +1763,7 @@ with new_tab:
                         st.code(engine_report["traceback"], language="text")
                     if engine_id == "pysr_symbolic_regression":
                         if engine_report.get("julia_search") is True:
-                            st.caption(
-                                "PySR/Julia의 짧은 smoke fit까지 확인했습니다."
-                            )
+                            st.caption("PySR/Julia의 짧은 smoke fit까지 확인했습니다.")
                         else:
                             st.warning(
                                 "이 사전 검사에서는 Julia 런타임 실행을 확인하지 않았습니다."
@@ -1744,9 +1784,7 @@ with new_tab:
                     "현재 엔진·설정 조합의 사전 검사가 완료되지 않아 연구를 시작하지 않았습니다."
                 )
             elif new_dataset is None or effective_config is None or invalid_profile:
-                st.error(
-                    "데이터 또는 설정 검증을 통과하지 못해 연구를 시작하지 않았습니다."
-                )
+                st.error("데이터 또는 설정 검증을 통과하지 못해 연구를 시작하지 않았습니다.")
             elif optimization_context and (
                 not optimization_context.get("application_verified")
                 or "intermittent_gp" not in engines
@@ -1758,8 +1796,94 @@ with new_tab:
                     "GP 포함 엔진, 동일한 특징 프로파일과 데이터 범위를 선택한 뒤 다시 확인하세요."
                 )
             else:
+                if execution_method == "queue":
+                    from lotto_pattern_lab.research_queue import ResearchQueueStore
+
+                    queue_config = {
+                        **asdict(effective_config),
+                        "engines": list(engines),
+                        "csv": str(csv_path.relative_to(PROJECT_ROOT)),
+                        "elite_seeding": bool(effective_config.elite_seeding_enabled),
+                        "elite_seed_ratio": float(effective_config.elite_seed_ratio),
+                        "research_mode": research_mode,
+                        "dataset_round_range": current_data_range,
+                        "dataset_sha256": current_dataset_snapshot,
+                        "pysr": asdict(pysr_config) if pysr_config is not None else {},
+                        "optuna_origin": optimization_context,
+                    }
+                    queue_store = ResearchQueueStore(QUEUE_DB)
+                    queue_rows = queue_store.list_queues()
+                    active = next((row for row in queue_rows if row["status"] == "running"), None)
+                    active = active or next(
+                        (row for row in queue_rows if row["status"] in {"waiting", "paused"}), None
+                    )
+                    queue_id = (
+                        active["queue_id"]
+                        if active
+                        else queue_store.create_queue(error_policy="continue")
+                    )
+                    try:
+                        if schedule_mode == "at_time" and scheduled_at:
+                            conflicts = queue_store.schedule_conflicts(
+                                scheduled_at, int(duration_seconds)
+                            )
+                            if conflicts:
+                                from zoneinfo import ZoneInfo
+
+                                ids = ", ".join(row["item_id"][:8] for row in conflicts)
+                                latest_end = max(
+                                    datetime.fromisoformat(
+                                        row.get("started_at") or row["scheduled_at"]
+                                    ).timestamp()
+                                    + int(row["duration_seconds"])
+                                    for row in conflicts
+                                )
+                                recommended_start = datetime.fromtimestamp(
+                                    latest_end, UTC
+                                ) + timedelta(minutes=1)
+                                recommended_local = recommended_start.astimezone(
+                                    ZoneInfo("Asia/Seoul")
+                                )
+                                raise ValueError(
+                                    f"\uc608\uc0c1 \uc2e4\ud589 \uad6c\uac04\uc774 \uae30\uc874 \uc608\uc57d({ids})\uacfc \uacb9\uce69\ub2c8\ub2e4. "  # noqa: E501
+                                    f"\uc608\uc0c1 \uc885\ub8cc \ud6c4 \ucd94\ucc9c \uc2dc\uac01: {recommended_local:%Y-%m-%d %H:%M} KST. "  # noqa: E501
+                                    "\uc885\ub8cc \uc2dc\uac01\uc740 \ud655\uc815\uce58\uac00 \uc544\ub2d9\ub2c8\ub2e4."  # noqa: E501
+                                )
+                        item_id = queue_store.add_item(
+                            queue_id,
+                            engine={
+                                ENGINE_OPTIONS[0]: "intermittent_gp",
+                                ENGINE_OPTIONS[1]: "pysr_symbolic_regression",
+                                ENGINE_OPTIONS[2]: "comparison",
+                            }[engine_choice],
+                            feature_profile=profile,
+                            duration_seconds=int(duration_seconds),
+                            config=queue_config,
+                            schedule_mode=schedule_mode,
+                            scheduled_at=scheduled_at,
+                            request_key=st.session_state["new_research_queue_request_key"],
+                            activate_queue=True,
+                            error_policy=(
+                                failure_policy
+                                if not active or active["status"] in {"waiting", "paused"}
+                                else None
+                            ),
+                        )
+                        st.session_state["new_research_queue_request_key"] = str(uuid.uuid4())
+                        start_detached_scheduler(queue_store, queue_id)
+                        st.toast(
+                            "\uc608\uc57d\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4. \ud604\uc7ac \uc124\uc815\uc740 \uc720\uc9c0\ub429\ub2c8\ub2e4.",  # noqa: E501
+                            icon="?",
+                        )
+                        st.session_state["new_research_last_queued_item"] = item_id
+                        st.rerun()
+                    except (OSError, RuntimeError, ValueError) as error:
+                        st.error(
+                            f"\uc608\uc57d \uc800\uc7a5 \ub610\ub294 \uc2a4\ucf00\uc904\ub7ec \uc2dc\uc791\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4: {error}"  # noqa: E501
+                        )
+                    st.stop()
                 checkpoint_path = checkpoint_dir / (
-                    f"research_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"
+                    f"research_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"  # noqa: E501
                 )
                 st.session_state["research_launch_status"] = "environment_checking"
                 try:
@@ -1790,9 +1914,7 @@ with new_tab:
                 if optimization_context:
                     optimization_origin = optimization_origin_record(
                         study={
-                                    "optuna_study_id": optimization_context.get(
-                                        "optuna_study_id"
-                                    ),
+                            "optuna_study_id": optimization_context.get("optuna_study_id"),
                             "study_name": optimization_context["study_name"],
                             "best_trial_number": optimization_context["trial_number"],
                             "feature_profile": optimization_context["feature_profile"],
@@ -1829,9 +1951,7 @@ with new_tab:
                             "mode": research_mode,
                             "elite_seeding_enabled": effective_config.elite_seeding_enabled,
                             "elite_seed_ratio": effective_config.elite_seed_ratio,
-                            "selected_pattern_ids": [
-                                str(item["pattern_id"]) for item in preview
-                            ],
+                            "selected_pattern_ids": [str(item["pattern_id"]) for item in preview],
                             "source_research_ids": sorted(
                                 {
                                     str(item.get("origin_research_id") or item.get("research_id"))
@@ -1872,9 +1992,7 @@ with new_tab:
                 )
                 try:
                     st.session_state["research_launch_status"] = "background_starting"
-                    with st.status(
-                        "연구 작업을 시작하고 있습니다.", expanded=True
-                    ) as start_status:
+                    with st.status("연구 작업을 시작하고 있습니다.", expanded=True) as start_status:
                         st.write("연구 설정과 최적화 출처를 저장했습니다.")
                         st.write("백그라운드 연구 프로세스를 시작하는 중입니다.")
                         worker = _launch_worker(
@@ -1932,9 +2050,7 @@ with new_tab:
                                             "feature_profile": optimization_context[
                                                 "feature_profile"
                                             ],
-                                            "dataset_range": optimization_context[
-                                                "dataset_range"
-                                            ],
+                                            "dataset_range": optimization_context["dataset_range"],
                                         },
                                         parameters=optimization_context["parameters"],
                                         research_settings=current_research_settings,
@@ -2164,49 +2280,35 @@ with resume_tab:
             except (OSError, RuntimeError) as error:
                 st.error(f"연구를 재개하지 못했습니다: {error}")
 
-st.divider()
-st.subheader("패턴 라이브러리")
-try:
-    patterns = PatternLibrary().list_patterns()
-except sqlite3.OperationalError as error:
-    log_database_failure(
-        "continuous research pattern listing", "data/database/patterns.sqlite", error
-    )
-    if is_database_locked(error):
-        st.error("수식 라이브러리가 다른 저장 작업에서 사용 중입니다. 잠시 후 다시 불러오세요.")
-    else:
-        st.error("수식 라이브러리를 불러오지 못했습니다.")
-    st.code(str(error), language="text")
-    if st.button("수식 라이브러리 다시 시도", key="retry_pattern_library_listing"):
-        st.rerun()
-    st.stop()
-if patterns:
-    selected_profile = st.selectbox(
-        "프로파일 필터",
-        ("전체", "legacy", "calendar_round", "bonus_lag_v1"),
-        key="research_pattern_profile_filter",
-    )
-    visible = [
-        item
-        for item in patterns
-        if selected_profile == "전체" or item.get("feature_profile", "legacy") == selected_profile
-    ]
-    st.dataframe(
-        [
-            {
-                "pattern_id": str(item.get("pattern_id", "")),
-                "model_type": str(item.get("model_type", "")),
-                "feature_profile": str(item.get("feature_profile", "legacy")),
-                "formulas": "; ".join(item.get("formulas", [])),
-                "validation_score": item.get("performance", {}).get("validation_score"),
-            }
-            for item in visible
-        ],
-        hide_index=True,
-        width="stretch",
-    )
-else:
-    st.info("패턴 라이브러리에 등록된 패턴이 없습니다.")
+
+def _queue_local_time(value: str | None) -> str:
+    if not value:
+        return "\uc608\uc815 \uc5c6\uc74c"
+    from zoneinfo import ZoneInfo
+
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d %H:%M KST")
+
+
+def _queue_item_status(item: dict[str, Any], worker_active: bool) -> str:
+    if item["status"] == "waiting" and item.get("schedule_mode") == "at_time":
+        scheduled_at = item.get("scheduled_at")
+        if scheduled_at and datetime.fromisoformat(scheduled_at) <= datetime.now(UTC):
+            if worker_active:
+                return "\uc2dc\uac04 \ucda9\ub3cc\ub85c \ub300\uae30 \uc911"
+            return "\uc9c0\uc5f0 \uc2e4\ud589 \ub300\uae30"
+    return {
+        "waiting": "\ub300\uae30 \uc911",
+        "running": "\uc2e4\ud589 \uc911",
+        "paused": "\uc77c\uc2dc\uc815\uc9c0",
+        "completed": "\uc644\ub8cc",
+        "failed": "\uc2e4\ud328",
+        "cancelled": "\ucde8\uc18c",
+        "interrupted": "\uc911\ub2e8\ub428",
+        "skipped": "\uac74\ub108\ub700",
+    }[item["status"]]
 
 
 @st.fragment(run_every="5s")
@@ -2246,7 +2348,11 @@ def render_queue_summary(queue_id: str) -> None:
     if current and current["status"] == "running":
         active_remaining = max(0, int(current["duration_seconds"] - elapsed))
     expected_remaining = sum(item["duration_seconds"] for item in waiting_items) + active_remaining
-    columns = st.columns(7)
+    failed_count = sum(item["status"] == "failed" for item in items)
+    scheduled_count = sum(
+        item["status"] == "waiting" and item.get("schedule_mode") == "at_time" for item in items
+    )
+    columns = st.columns(8)
     columns[0].metric(
         "\uc608\uc57d \uc0c1\ud0dc", queue_status_labels.get(queue["status"], queue["status"])
     )
@@ -2254,12 +2360,14 @@ def render_queue_summary(queue_id: str) -> None:
         "\ud604\uc7ac \uc608\uc57d", current["position"] + 1 if current else "\uc5c6\uc74c"
     )
     columns[2].metric("\ub300\uae30 \uc608\uc57d", len(waiting_items))
-    columns[3].metric("\uc804\uccb4 \uc608\uc57d", len(items))
-    columns[4].metric("\uc644\ub8cc \uc608\uc57d", completed_count)
-    columns[5].metric(
+    columns[3].metric("\uc9c0\uc815 \uc2dc\uac04 \uc608\uc57d", scheduled_count)
+    columns[4].metric("\uc804\uccb4 \uc608\uc57d", len(items))
+    columns[5].metric("\uc644\ub8cc \uc608\uc57d", completed_count)
+    columns[6].metric("\uc2e4\ud328 \uc608\uc57d", failed_count)
+    columns[7].metric(
         "\uc608\uc57d\ub41c \ucd1d \uc5f0\uad6c \uc2dc\uac04", format_duration(total_seconds)
     )
-    columns[6].metric("\uc608\uc0c1 \ub0a8\uc740 \uc2dc\uac04", format_duration(expected_remaining))
+    st.metric("\uc608\uc0c1 \ub0a8\uc740 \uc2dc\uac04", format_duration(expected_remaining))
     if queue.get("last_error"):
         st.error(f"\ub9c8\uc9c0\ub9c9 \uc624\ub958: {queue['last_error']}")
     st.caption(
@@ -2281,7 +2389,7 @@ with queue_tab:
         "failed": "\uc2e4\ud328",
         "interrupted": "\uc911\ub2e8\ub428",
     }
-    st.subheader("연구 예약 대기열")
+    st.subheader("\uc5f0\uad6c \uc608\uc57d \uad00\ub9ac")
     queue_store = ResearchQueueStore(QUEUE_DB)
     queue_rows = queue_store.list_queues()
     if not queue_rows:
@@ -2293,7 +2401,7 @@ with queue_tab:
             [item["queue_id"] for item in queue_rows],
             format_func=lambda value: next(
                 f"{item['name']} · {queue_status_labels.get(item['status'], item['status'])} · "
-                f"{item['created_at'][:10]}"
+                f"{_queue_local_time(item.get('created_at'))}"
                 for item in queue_rows
                 if item["queue_id"] == value
             ),
@@ -2305,201 +2413,107 @@ with queue_tab:
     queue_state = queue_store.queue(active_queue_id)
     queue_items = queue_store.list_items(active_queue_id)
     current_queue_item = queue_store.current_item(active_queue_id)
-    render_queue_summary(active_queue_id)
-
-    with st.form("queue_add_form"):
-        st.markdown("#### 예약 추가")
-        engine_choice = st.selectbox("탐색 엔진", ["GP", "PySR", "GP + PySR"], key="queue_engine")
-        profile_choice = st.selectbox(
-            "특징 프로파일",
-            ["legacy", "calendar_round", "bonus_lag_v1"],
-            format_func=lambda value: {
-                "legacy": "기본 특징",
-                "calendar_round": "달력·회차 특징",
-                "bonus_lag_v1": "보너 번호 포함 특징",
-            }[value],
-            key="queue_profile",
-        )
-        duration_minutes = st.selectbox(
-            "연구 시간",
-            [30, 60, 120, 180, 360, 480],
-            format_func=lambda value: f"{value}분",
-            key="queue_duration",
-        )
-        pysr_preset = {
-            30: (20, 24),
-            60: (30, 32),
-            120: (50, 40),
-            180: (65, 48),
-            360: (100, 64),
-            480: (140, 80),
-        }[int(duration_minutes)]
-        advanced = st.checkbox("고급 설정", key="queue_advanced")
-        continue_after_error = st.checkbox(
-            "\uace0\uae09: \uc2e4\ud328 \uc2dc \ub2e4\uc74c \uc608\uc57d \uc9c4\ud589",
-            value=False,
-            help=(
-                "\uc2dc\uc2a4\ud15c \ubb34\uacb0\uc131 \uc624\ub958\ub294 "
-                "\uc790\ub3d9 \uc9c4\ud589\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4."
-            ),
-            disabled=not advanced,
-            key="queue_continue_after_error",
-        )
-        seed = st.number_input("난수 시드", 0, 2**31 - 1, 12345, key="queue_seed")
-        elite = st.checkbox("Elite Seeding 사용", value=True, key="queue_elite")
-        workers = st.number_input("CPU 워커", 1, 4, 2, key="queue_workers")
-        controls = st.number_input("무작위 대조 반복", 0, 100, 3, key="queue_controls")
-        population = st.number_input(
-            "GP 개체군",
-            8,
-            512,
-            GP_PRESETS[duration_minutes]["population"],
-            disabled=not advanced,
-            key="queue_population",
-        )
-        generations = st.number_input(
-            "GP 세대",
-            1,
-            500,
-            GP_PRESETS[duration_minutes]["generations"],
-            disabled=not advanced,
-            key="queue_generations",
-        )
-        max_depth = st.number_input(
-            "GP 최대 깊이",
-            2,
-            20,
-            GP_PRESETS[duration_minutes]["max_depth"],
-            disabled=not advanced,
-            key="queue_depth",
-        )
-        pysr_target = st.selectbox(
-            "PySR 타겟",
-            ["main_positions", "one_number", "bonus"],
-            disabled=engine_choice == "GP",
-            key="queue_pysr_target",
-        )
-        pysr_iterations = st.number_input(
-            "PySR \uc138\ub300 \uc218",
-            1,
-            1000,
-            pysr_preset[0],
-            disabled=engine_choice == "GP" or not advanced,
-            key="queue_pysr_iterations",
-        )
-        pysr_population = st.number_input(
-            "PySR \uac1c\uccb4\uad70",
-            8,
-            512,
-            pysr_preset[1],
-            disabled=engine_choice == "GP" or not advanced,
-            key="queue_pysr_population",
-        )
-        pysr_maxsize = st.number_input(
-            "PySR \uc218\uc2dd \ud06c\uae30 \ud55c\ub3c4",
-            4,
-            64,
-            24,
-            disabled=engine_choice == "GP" or not advanced,
-            key="queue_pysr_maxsize",
-        )
-        queue_add = st.form_submit_button("\uc608\uc57d \ucd94\uac00")
-    if queue_add:
-        engines = {
-            "GP": ["intermittent_gp"],
-            "PySR": ["pysr_symbolic_regression"],
-            "GP + PySR": ["intermittent_gp", "pysr_symbolic_regression"],
-        }[engine_choice]
-        config_snapshot = {
-            "engines": engines,
-            "seed": int(seed),
-            "elite_seeding": bool(elite),
-            "elite_seed_ratio": 0.2,
-            "workers": min(int(workers), 3) if engine_choice == "GP + PySR" else int(workers),
-            "control_runs": int(controls),
-            "population_size": int(population),
-            "generations": int(generations),
-            "max_depth": int(max_depth),
-            "crossover_probability": 0.65,
-            "mutation_probability": 0.25,
-            "train_ratio": 0.6,
-            "validation_ratio": 0.2,
-            "max_lag": 10,
-            "min_activation_rate": 0.1,
-            "hidden_states": 3,
-            "pysr": {
-                "target": pysr_target,
-                "workers": 1,
-                "niterations": int(pysr_iterations),
-                "population_size": int(pysr_population),
-                "maxsize": int(pysr_maxsize),
-                "timeout_seconds": 60.0,
-            },
-        }
+    if queue_state["status"] == "running" and not queue_store.lease_is_live(active_queue_id):
         try:
-            if (
-                "pysr_symbolic_regression" in engines
-                and pysr_target == "bonus"
-                and profile_choice == "legacy"
-            ):
-                raise ValueError(
-                    "\ubcf4\ub108 \ub300\uc0c1 PySR\uc740 calendar_round \ub610\ub294 "
-                    "bonus_lag_v1 \ud2b9\uc9d5\uc774 \ud544\uc694\ud569\ub2c8\ub2e4."
-                )
-            queue_dataset = load_csv(project_path("data/official/draws.csv"))
-            gp_preflight_config = IntermittentConfig(
-                population_size=int(population),
-                generations=int(generations),
-                max_depth=int(max_depth),
-                workers=int(config_snapshot["workers"]),
-                control_runs=int(controls),
-                feature_profile=profile_choice,
-                seed=int(seed),
+            start_detached_scheduler(queue_store, active_queue_id)
+        except (OSError, RuntimeError) as error:
+            st.warning(
+                f"\uc608\uc57d \uc2a4\ucf00\uc904\ub7ec \uc7ac\uc5f0\uacb0 \ub300\uae30 \uc911: {error}"  # noqa: E501
             )
-            pysr_preflight_config = PySRConfig(
-                target=pysr_target,
-                feature_profile=profile_choice,
-                workers=1,
-                niterations=int(pysr_iterations),
-                population_size=int(pysr_population),
-                maxsize=int(pysr_maxsize),
-                seed=int(seed),
-                random_control_replicates=int(controls),
+    all_items = [
+        item for queue_row in queue_rows for item in queue_store.list_items(queue_row["queue_id"])
+    ]
+    live_research = research_worker_active()
+    overview_columns = st.columns(6)
+    overview_columns[0].metric(
+        "\ud604\uc7ac \uc2e4\ud589 \uc5f0\uad6c",
+        "\uc788\uc74c" if live_research else "\uc5c6\uc74c",
+    )
+    overview_columns[1].metric(
+        "\uc2e4\ud589 \ub300\uae30 \uc608\uc57d",
+        sum(
+            item["status"] == "waiting" and item.get("schedule_mode") != "at_time"
+            for item in all_items
+        ),
+    )
+    overview_columns[2].metric(
+        "\uc9c0\uc815 \uc2dc\uac04 \uc608\uc57d",
+        sum(
+            item["status"] == "waiting" and item.get("schedule_mode") == "at_time"
+            for item in all_items
+        ),
+    )
+    overview_columns[3].metric(
+        "\uc644\ub8cc / \uc2e4\ud328",
+        f"{sum(item['status'] == 'completed' for item in all_items)} / {sum(item['status'] == 'failed' for item in all_items)}",  # noqa: E501
+    )
+    overview_columns[4].metric(
+        "\uc804\uccb4 \uc608\uc57d \uc2dc\uac04",
+        format_duration(
+            sum(
+                item["duration_seconds"]
+                for item in all_items
+                if item["status"] not in {"cancelled", "skipped"}
             )
-            preflight = run_research_preflight(
-                queue_dataset,
-                gp_preflight_config,
-                tuple(engines),
-                pysr_preflight_config if "pysr_symbolic_regression" in engines else None,
+        ),
+    )
+    overview_columns[5].metric(
+        "\uc608\uc0c1 \ub300\uae30 \uc2dc\uac04",
+        format_duration(
+            sum(item["duration_seconds"] for item in all_items if item["status"] == "waiting")
+        ),
+    )
+    st.caption(
+        "\uc608\uc57d\uc740 PC\uac00 \ucf1c\uc788\uace0 \ubc31\uadf8\ub77c\uc6b4\ub4dc \uc2a4\ucf00\uc904\ub7ec\uac00 \uc2e4\ud589\ub418\uc5b4\uc57c \uc2dc\uc791\ub429\ub2c8\ub2e4. "  # noqa: E501
+        "\uc2a4\ucf00\uc904\ub7ec\uac00 \uc885\ub8cc\ub418\uac70\ub098 PC\uac00 \uc885\ub8cc\ub418\uba74 \uc608\uc57d\uc740 \ucde8\uc18c\ub418\uc9c0 \uc54a\uace0, "  # noqa: E501
+        "\uc2a4\ucf00\uc904\ub7ec\uac00 \ub2e4\uc2dc \uc2e4\ud589\ub420 \ub54c \uc9c0\uc5f0 \uc2e4\ud589\ub429\ub2c8\ub2e4."  # noqa: E501
+    )
+    if queue_state["status"] == "running":
+        st.caption(
+            "\uc0ac\uc6a9\uc790 \uc911\uc9c0 \uc2dc \ub300\uae30\uc5f4\uc740 \uc77c\uc2dc\uc815\uc9c0\ub418\uba70, \ud655\uc778 \ud6c4 \uc7ac\uc2dc\uc791\ud574\uc57c \ub2e4\uc74c \uc608\uc57d\uc744 \uc2e4\ud589\ud569\ub2c8\ub2e4. "  # noqa: E501
+            "\ud604\uc7ac \ub300\uae30\uc5f4 \uc2e4\ud328 \uc815\ucc45: "
+            + (
+                "\uc2e4\ud328 \ud6c4 \ub2e4\uc74c \uc608\uc57d \uc9c4\ud589"
+                if queue_state["error_policy"] == "continue"
+                else "\uc2e4\ud328 \ud6c4 \uc815\uc9c0"
             )
-            if preflight["status"] != "passed":
-                raise ValueError(f"\uc0ac\uc804 \uac80\uc0ac \uc2e4\ud328: {preflight['engines']}")
-            queue_store.add_item(
-                active_queue_id,
-                engine={
-                    "GP": "intermittent_gp",
-                    "PySR": "pysr_symbolic_regression",
-                    "GP + PySR": "comparison",
-                }[engine_choice],
-                feature_profile=profile_choice,
-                duration_seconds=int(duration_minutes) * 60,
-                config=config_snapshot,
-            )
-            queue_store.set_error_policy(
-                active_queue_id, "continue" if continue_after_error else "stop"
-            )
-            st.toast("연구 예약을 대기열에 추가했습니다.", icon="✅")
-            st.rerun()
-        except (OSError, ValueError) as error:
-            st.error(f"예약을 추가하지 못했습니다: {error}")
+        )
+    render_queue_summary(active_queue_id)
+    st.caption(
+        "\uc608\uc0c1 \uc885\ub8cc \uc2dc\uac01\uc740 \uc124\uc815 \uc2dc\uac04\uc744 \ub354\ud55c \ucd94\uc815\uce58\uc785\ub2c8\ub2e4. "  # noqa: E501
+        "\uc2e4\ud5d8 \ub2e8\uc704\uc758 \uc885\ub8cc \uc2dc\uc810\uc5d0 \uc2dc\uac04 \uc81c\ud55c\uc744 \ud655\uc778\ud558\ubbc0\ub85c \uc2e4\uc81c \uc885\ub8cc\ub294 \ub2a6\uc5b4\uc9c8 \uc218 \uc788\uc2b5\ub2c8\ub2e4."  # noqa: E501
+    )
 
     if queue_items:
+        status_filter = st.selectbox(
+            "\uc0c1\ud0dc \ud544\ud130",
+            ("all", "waiting", "running", "completed", "failed", "cancelled", "interrupted"),
+            format_func=lambda value: (
+                "\uc804\uccb4" if value == "all" else queue_status_labels.get(value, value)
+            ),
+            key="queue_status_filter",
+        )
+        filtered_items = [
+            item
+            for item in queue_items
+            if status_filter == "all" or item["status"] == status_filter
+        ]
+        page_count = max(1, (len(filtered_items) + 49) // 50)
+        page_number = st.number_input(
+            "\ud398\uc774\uc9c0",
+            min_value=1,
+            max_value=page_count,
+            value=min(int(st.session_state.get("queue_page_number", 1)), page_count),
+            step=1,
+            key="queue_page_number",
+        )
+        visible_items = filtered_items[(int(page_number) - 1) * 50 : int(page_number) * 50]
         rows = []
-        for item in queue_items:
+        for item in visible_items:
             rows.append(
                 {
                     "\uc21c\uc11c": item["position"],
-                    "\uc608\uc57d ID": item["item_id"][:8],
+                    "\uc608\uc57d ID": item["item_id"],
                     "\uc5d4\uc9c4": {
                         "intermittent_gp": "GP",
                         "pysr_symbolic_regression": "PySR",
@@ -2511,17 +2525,31 @@ with queue_tab:
                         "bonus_lag_v1": "\ubcf4\ub108 \ubc88\ud638 \ud3ec\ud568 \ud2b9\uc9d5",
                     }[item["feature_profile"]],
                     "\uc5f0\uad6c \uc2dc\uac04": format_duration(item["duration_seconds"]),
+                    "\uc5f0\uad6c \ubc29\uc2dd": (
+                        "\ub204\uc801 \uc9c4\ud654 \uc5f0\uad6c"
+                        if item["config"].get("research_mode") == CUMULATIVE_MODE
+                        else "\ub3c5\ub9bd \ud0d0\uc0c9"
+                    ),
+                    "\uc0dd\uc131 \uc2dc\uac01": _queue_local_time(item.get("created_at")),
+                    "\uc218\uc815 \uc2dc\uac01": _queue_local_time(item.get("updated_at")),
+                    "\uc608\uc57d \uc720\ud615": (
+                        "\uc9c0\uc815 \uc2dc\uac04"
+                        if item.get("schedule_mode") == "at_time"
+                        else "\uc885\ub8cc \ud6c4 \uc2e4\ud589"
+                    ),
+                    "\uc608\uc815 \uc2dc\uc791 \uc2dc\uac01": _queue_local_time(
+                        item.get("scheduled_at")
+                    ),
+                    "\uc608\uc0c1 \uc885\ub8cc": _queue_local_time(
+                        (
+                            datetime.fromisoformat(item.get("scheduled_at") or item["started_at"])
+                            + timedelta(seconds=item["duration_seconds"])
+                        ).isoformat()
+                        if item.get("scheduled_at") or item.get("started_at")
+                        else None
+                    ),
                     "\uc2dc\ub4dc": item["config"].get("seed"),
-                    "\uc0c1\ud0dc": {
-                        "waiting": "\ub300\uae30 \uc911",
-                        "running": "\uc2e4\ud589 \uc911",
-                        "paused": "\uc77c\uc2dc\uc815\uc9c0",
-                        "completed": "\uc644\ub8cc",
-                        "failed": "\uc2e4\ud328",
-                        "cancelled": "\ucde8\uc18c",
-                        "interrupted": "\uc911\ub2e8\ub428",
-                        "skipped": "\uac74\ub108\ub700",
-                    }[item["status"]],
+                    "\uc0c1\ud0dc": _queue_item_status(item, live_research),
                     "\uc5f0\uad6c \ud68c\ucc28": item["research_round"] or "\ubbf8\ubc30\uc815",
                     "\uc644\ub8cc \uc2e4\ud5d8": (
                         len(
@@ -2559,9 +2587,32 @@ with queue_tab:
                 if column.button(label, key=f"queue_move_{direction}"):
                     queue_store.move(selected_item_id, direction)
                     st.rerun()
+            if st.button(
+                "\uc120\ud0dd\ud55c \uc608\uc57d \uc9c0\uae08 \uc2e4\ud589",
+                key="queue_run_selected",
+            ):
+                try:
+                    selected_queue_id = queue_store.run_waiting_now(selected_item_id)
+                    if queue_store.queue(selected_queue_id)["status"] in {"waiting", "paused"}:
+                        queue_store.set_queue_status(selected_queue_id, "running")
+                    start_detached_scheduler(queue_store, selected_queue_id)
+                    st.toast(
+                        "\uc608\uc57d\uc774 \uc989\uc2dc \uc2e4\ud589 \ub300\uae30\uc5f4\uc5d0 \ub4e4\uc5b4\uac14\uc2b5\ub2c8\ub2e4.",  # noqa: E501
+                        icon="?",
+                    )
+                    st.rerun()
+                except (OSError, RuntimeError, ValueError) as error:
+                    st.error(
+                        f"\uc608\uc57d \uc2e4\ud589 \uc694\uccad\uc744 \ucc98\ub9ac\ud558\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4: {error}"  # noqa: E501
+                    )
+            cancel_confirmed = st.checkbox(
+                "\uc120\ud0dd\ud55c \uc608\uc57d \ucde8\uc18c \ud655\uc778",
+                key="queue_cancel_confirm",
+            )
             if manage_columns[4].button(
                 "예약 취소",
                 key="queue_cancel_selected",
+                disabled=not cancel_confirmed,
                 help="대기 중인 예약을 취소합니다. 실행 중인 연구에는 영향을 주지 않습니다.",
             ):
                 queue_store.cancel_waiting(selected_item_id)
@@ -2587,12 +2638,67 @@ with queue_tab:
                     index=profile_values.index(edit_item["feature_profile"]),
                     key="queue_edit_profile",
                 )
-                edit_duration = st.selectbox(
-                    "수정 연구 시간",
-                    [30, 60, 120, 180, 360, 480],
-                    index=[30, 60, 120, 180, 360, 480].index(edit_item["duration_seconds"] // 60),
+                edit_research_mode = st.selectbox(
+                    "\uc218\uc815 \uc5f0\uad6c \ubc29\uc2dd",
+                    (INDEPENDENT_MODE, CUMULATIVE_MODE),
+                    index=0
+                    if edit_item["config"].get("research_mode", INDEPENDENT_MODE)
+                    == INDEPENDENT_MODE
+                    else 1,
+                    format_func=lambda value: (
+                        "\ub3c5\ub9bd \ud0d0\uc0c9"
+                        if value == INDEPENDENT_MODE
+                        else "\ub204\uc801 \uc9c4\ud654 \uc5f0\uad6c"
+                    ),
+                    key="queue_edit_research_mode",
+                )
+                edit_duration = st.number_input(
+                    "\uc218\uc815 \uc5f0\uad6c \uc2dc\uac04 (\ubd84)",
+                    min_value=1,
+                    max_value=1440,
+                    value=max(1, min(1440, int(edit_item["duration_seconds"] // 60))),
+                    step=1,
                     key="queue_edit_duration",
                 )
+                from zoneinfo import ZoneInfo
+
+                edit_schedule_mode = st.selectbox(
+                    "\uc608\uc57d \uc2dc\uc791 \ubc29\uc2dd",
+                    ("after_completion", "at_time"),
+                    index=0
+                    if edit_item.get("schedule_mode", "after_completion") == "after_completion"
+                    else 1,
+                    format_func=lambda value: (
+                        "\uc774\uc804 \uc5f0\uad6c \uc885\ub8cc \ud6c4"
+                        if value == "after_completion"
+                        else "\uc9c0\uc815 \uc2dc\uac01 (Asia/Seoul)"
+                    ),
+                    key="queue_edit_schedule_mode",
+                )
+                edit_scheduled_at = None
+                if edit_schedule_mode == "at_time":
+                    saved_local = datetime.now(ZoneInfo("Asia/Seoul"))
+                    if edit_item.get("scheduled_at"):
+                        saved_local = datetime.fromisoformat(edit_item["scheduled_at"]).astimezone(
+                            ZoneInfo("Asia/Seoul")
+                        )
+                    schedule_edit_columns = st.columns(2)
+                    edit_date = schedule_edit_columns[0].date_input(
+                        "\uc218\uc815 \uc2dc\uc791 \ub0a0\uc9dc",
+                        value=saved_local.date(),
+                        key="queue_edit_schedule_date",
+                    )
+                    edit_time = schedule_edit_columns[1].time_input(
+                        "\uc218\uc815 \uc2dc\uc791 \uc2dc\uac01",
+                        value=saved_local.time().replace(tzinfo=None),
+                        key="queue_edit_schedule_time",
+                    )
+                    edit_scheduled_at = (
+                        datetime.combine(edit_date, edit_time)
+                        .replace(tzinfo=ZoneInfo("Asia/Seoul"))
+                        .astimezone(UTC)
+                        .isoformat()
+                    )
                 edit_seed = st.number_input(
                     "수정 난수 시드",
                     0,
@@ -2640,6 +2746,20 @@ with queue_tab:
                     int(edit_item["config"].get("max_depth", 5)),
                     key="queue_edit_depth",
                 )
+                edit_crossover = st.slider(
+                    "\uc218\uc815 GP \uad50\ucc28 \ud655\ub960",
+                    0.0,
+                    1.0,
+                    float(edit_item["config"].get("crossover_probability", 0.65)),
+                    key="queue_edit_crossover",
+                )
+                edit_mutation = st.slider(
+                    "\uc218\uc815 GP \ub3cc\uc5f0\ubcc0\uc774 \ud655\ub960",
+                    0.0,
+                    1.0,
+                    float(edit_item["config"].get("mutation_probability", 0.25)),
+                    key="queue_edit_mutation",
+                )
                 saved_pysr = edit_item["config"].get("pysr", {})
                 edit_pysr_target = st.selectbox(
                     "PySR \ud0c0\uac9f",
@@ -2666,6 +2786,53 @@ with queue_tab:
                     disabled=edit_engine == "intermittent_gp",
                     key="queue_edit_pysr_population",
                 )
+                edit_pysr_maxsize = st.number_input(
+                    "PySR \ucd5c\ub300 \uc218\uc2dd \ud06c\uae30",
+                    4,
+                    64,
+                    int(saved_pysr.get("maxsize", 24)),
+                    disabled=edit_engine == "intermittent_gp",
+                    key="queue_edit_pysr_maxsize",
+                )
+                st.caption("\uc800\uc7a5 \uc804 \ubcc0\uacbd \ub0b4\uc6a9")
+                st.dataframe(
+                    [
+                        {
+                            "\uc124\uc815": "\uc5d4\uc9c4",
+                            "\uae30\uc874": edit_item["engine"],
+                            "\ubcc0\uacbd": edit_engine,
+                        },
+                        {
+                            "\uc124\uc815": "\ud2b9\uc9d5",
+                            "\uae30\uc874": edit_item["feature_profile"],
+                            "\ubcc0\uacbd": edit_profile,
+                        },
+                        {
+                            "\uc124\uc815": "\uc5f0\uad6c \ubc29\uc2dd",
+                            "\uae30\uc874": edit_item["config"].get(
+                                "research_mode", INDEPENDENT_MODE
+                            ),
+                            "\ubcc0\uacbd": edit_research_mode,
+                        },
+                        {
+                            "\uc124\uc815": "\uc2dc\uac04(\ubd84)",
+                            "\uae30\uc874": edit_item["duration_seconds"] // 60,
+                            "\ubcc0\uacbd": int(edit_duration),
+                        },
+                        {
+                            "\uc124\uc815": "\uc2dc\ub4dc",
+                            "\uae30\uc874": edit_item["config"].get("seed"),
+                            "\ubcc0\uacbd": int(edit_seed),
+                        },
+                        {
+                            "\uc124\uc815": "\uc2dc\uc791 \uc870\uac74",
+                            "\uae30\uc874": edit_item.get("schedule_mode"),
+                            "\ubcc0\uacbd": edit_schedule_mode,
+                        },
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
                 if st.button("대기 예약 설정 저장", key="queue_save_edit"):
                     new_engines = {
                         "intermittent_gp": ["intermittent_gp"],
@@ -2675,6 +2842,7 @@ with queue_tab:
                     new_config = {
                         **edit_item["config"],
                         "seed": int(edit_seed),
+                        "research_mode": edit_research_mode,
                         "engines": new_engines,
                         "workers": min(int(edit_workers), 3)
                         if edit_engine == "comparison"
@@ -2684,11 +2852,14 @@ with queue_tab:
                         "population_size": int(edit_population),
                         "generations": int(edit_generations),
                         "max_depth": int(edit_depth),
+                        "crossover_probability": float(edit_crossover),
+                        "mutation_probability": float(edit_mutation),
                         "pysr": {
                             **edit_item["config"].get("pysr", {}),
                             "target": edit_pysr_target,
                             "niterations": int(edit_pysr_iterations),
                             "population_size": int(edit_pysr_population),
+                            "maxsize": int(edit_pysr_maxsize),
                             "workers": 1,
                         },
                     }
@@ -2725,12 +2896,24 @@ with queue_tab:
                                 f"\uc0ac\uc804 \uac80\uc0ac \uc2e4\ud328: "
                                 f"{edit_preflight['engines']}"
                             )
+                        if edit_schedule_mode == "at_time" and edit_scheduled_at:
+                            conflicts = queue_store.schedule_conflicts(
+                                edit_scheduled_at,
+                                int(edit_duration) * 60,
+                                exclude_item_id=selected_item_id,
+                            )
+                            if conflicts:
+                                raise ValueError(
+                                    "\uc9c0\uc815 \uc608\uc57d \uc2e4\ud589 \uad6c\uac04\uc774 \uacb9\uce69\ub2c8\ub2e4. \uc2dc\uac01\uc744 \uc870\uc815\ud55c \ud6c4 \uc800\uc7a5\ud558\uc138\uc694."  # noqa: E501
+                                )
                         queue_store.edit_waiting(
                             selected_item_id,
                             engine=edit_engine,
                             feature_profile=edit_profile,
                             duration_seconds=int(edit_duration) * 60,
                             config=new_config,
+                            schedule_mode=edit_schedule_mode,
+                            scheduled_at=edit_scheduled_at,
                         )
                         st.toast("대기 예약 설정을 저장했습니다.", icon="✅")
                         st.rerun()
@@ -2783,6 +2966,23 @@ with queue_tab:
                     st.rerun()
                 except (OSError, RuntimeError) as error:
                     st.error(f"예약 실행기 복구에 실패했습니다: {error}")
+    if queue_state["status"] == "running" and not queue_store.lease_is_live(active_queue_id):
+        st.warning(
+            "\uc608\uc57d \uc2a4\ucf00\uc904\ub7ec \uc5f0\uacb0\uc774 \uc5c6\uc2b5\ub2c8\ub2e4. \uc9c0\uc815 \uc2dc\uac01\uc774 \uc9c0\ub098\ub3c4 \uc608\uc57d\uc740 \uc720\uc9c0\ub418\uba70, \uc2a4\ucf00\uc904\ub7ec\ub97c \uc7ac\uc5f0\uacb0\ud558\uba74 \uc9c0\uc5f0 \uc2e4\ud589\ub429\ub2c8\ub2e4."  # noqa: E501
+        )
+        if st.button(
+            "\uc608\uc57d \uc2a4\ucf00\uc904\ub7ec \uc7ac\uc5f0\uacb0",
+            key="queue_restart_scheduler",
+        ):
+            try:
+                start_detached_scheduler(queue_store, active_queue_id)
+                st.toast(
+                    "\uc2a4\ucf00\uc904\ub7ec\ub97c \uc7ac\uc5f0\uacb0\ud588\uc2b5\ub2c8\ub2e4.",
+                    icon="?",
+                )
+                st.rerun()
+            except (OSError, RuntimeError) as error:
+                st.error(f"\uc7ac\uc5f0\uacb0\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4: {error}")
     failed_items = [item for item in queue_items if item["status"] == "failed"]
     if failed_items:
         failed_id = failed_items[-1]["item_id"]

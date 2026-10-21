@@ -50,7 +50,10 @@ class ResearchQueueStore:
                     feature_profile TEXT NOT NULL, duration_seconds INTEGER NOT NULL,
                     config_json TEXT NOT NULL, research_id TEXT, research_round INTEGER,
                     checkpoint_path TEXT, worker_pid INTEGER, started_at TEXT, completed_at TEXT,
-                    cancelled_at TEXT, last_error TEXT, UNIQUE(queue_id, position)
+                    cancelled_at TEXT, last_error TEXT,
+                    schedule_mode TEXT NOT NULL DEFAULT 'after_completion',
+                    scheduled_at TEXT, created_at TEXT, updated_at TEXT, request_key TEXT,
+                    UNIQUE(queue_id, position), UNIQUE(request_key)
                 );
                 CREATE INDEX IF NOT EXISTS queue_items_status_idx
                     ON research_queue_items(queue_id, status, position);
@@ -59,6 +62,49 @@ class ResearchQueueStore:
                     queue_id TEXT NOT NULL, heartbeat_at REAL NOT NULL
                 );
                 """
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(research_queue_items)").fetchall()
+            }
+            if {
+                "schedule_mode",
+                "scheduled_at",
+                "created_at",
+                "updated_at",
+                "request_key",
+            } - columns:
+                backup_path = (
+                    self.path.parent
+                    / "backups"
+                    / (
+                        f"{self.path.stem}_pre_schedule_migration_"
+                        f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite"
+                    )
+                )
+                backup_path.parent.mkdir(parents=True, exist_ok=True)
+                with sqlite3.connect(backup_path) as backup:
+                    connection.backup(backup)
+            if "schedule_mode" not in columns:
+                connection.execute(
+                    "ALTER TABLE research_queue_items ADD COLUMN schedule_mode "
+                    "TEXT NOT NULL DEFAULT 'after_completion'"
+                )
+            if "scheduled_at" not in columns:
+                connection.execute("ALTER TABLE research_queue_items ADD COLUMN scheduled_at TEXT")
+            if "created_at" not in columns:
+                connection.execute("ALTER TABLE research_queue_items ADD COLUMN created_at TEXT")
+            if "updated_at" not in columns:
+                connection.execute("ALTER TABLE research_queue_items ADD COLUMN updated_at TEXT")
+            if "request_key" not in columns:
+                connection.execute("ALTER TABLE research_queue_items ADD COLUMN request_key TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS queue_schedule_idx "
+                "ON research_queue_items(status,schedule_mode,scheduled_at)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS queue_request_key_idx "
+                "ON research_queue_items(request_key) WHERE request_key IS NOT NULL"
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -88,6 +134,11 @@ class ResearchQueueStore:
         feature_profile: str,
         duration_seconds: int,
         config: dict[str, Any],
+        schedule_mode: str = "after_completion",
+        scheduled_at: str | None = None,
+        request_key: str | None = None,
+        activate_queue: bool = False,
+        error_policy: str | None = None,
     ) -> str:
         if engine not in {"intermittent_gp", "pysr_symbolic_regression", "comparison"}:
             raise ValueError("Unsupported research engine.")
@@ -95,23 +146,43 @@ class ResearchQueueStore:
             raise ValueError("Unsupported feature profile.")
         if duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive.")
+        if schedule_mode not in {"after_completion", "at_time"}:
+            raise ValueError("Unsupported schedule mode.")
+        if error_policy is not None and error_policy not in {"stop", "continue"}:
+            raise ValueError("error_policy must be stop or continue")
+        if schedule_mode == "at_time" and not scheduled_at:
+            raise ValueError("A scheduled start time is required.")
+        if schedule_mode == "at_time":
+            scheduled_time = datetime.fromisoformat(str(scheduled_at))
+            if scheduled_time.tzinfo is None or scheduled_time <= datetime.now(UTC):
+                raise ValueError("The scheduled start time must be future and timezone-aware.")
+        if schedule_mode == "after_completion":
+            scheduled_at = None
         item_id = str(uuid.uuid4())
         snapshot = json.dumps(config, ensure_ascii=False, sort_keys=True, allow_nan=False)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if request_key:
+                existing = db.execute(
+                    "SELECT item_id FROM research_queue_items WHERE request_key=?",
+                    (request_key,),
+                ).fetchone()
+                if existing:
+                    return str(existing["item_id"])
             queue = db.execute(
                 "SELECT status FROM research_queues WHERE queue_id=?", (queue_id,)
             ).fetchone()
-            if not queue or queue["status"] not in {"waiting", "paused"}:
-                raise ValueError("Reservations can only be added to a waiting or paused queue.")
+            if not queue or queue["status"] not in {"waiting", "paused", "running"}:
+                raise ValueError("Reservations can only be added to an active queue.")
             position = db.execute(
                 "SELECT COALESCE(MAX(position),0)+1 FROM research_queue_items WHERE queue_id=?",
                 (queue_id,),
             ).fetchone()[0]
             db.execute(
                 """INSERT INTO research_queue_items
-                (item_id,queue_id,position,status,engine,feature_profile,duration_seconds,config_json)
-                VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id,queue_id,position,status,engine,feature_profile,duration_seconds,config_json,
+                 schedule_mode,scheduled_at,created_at,updated_at,request_key)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     item_id,
                     queue_id,
@@ -121,8 +192,21 @@ class ResearchQueueStore:
                     feature_profile,
                     duration_seconds,
                     snapshot,
+                    schedule_mode,
+                    scheduled_at,
+                    _now(),
+                    _now(),
+                    request_key,
                 ),
             )
+            if activate_queue:
+                db.execute(
+                    """UPDATE research_queues SET status='running',
+                    error_policy=COALESCE(?,error_policy),
+                    started_at=COALESCE(started_at,?) WHERE queue_id=?
+                    AND status IN ('waiting','paused')""",
+                    (error_policy, _now(), queue_id),
+                )
         return item_id
 
     def list_items(self, queue_id: str) -> list[dict[str, Any]]:
@@ -140,6 +224,31 @@ class ResearchQueueStore:
         with self._connect() as db:
             rows = db.execute("SELECT * FROM research_queues ORDER BY created_at DESC").fetchall()
         return [dict(row) for row in rows]
+
+    def schedule_conflicts(
+        self, scheduled_at: str, duration_seconds: int, *, exclude_item_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return waiting fixed-time reservations with overlapping estimated intervals."""
+        start = datetime.fromisoformat(scheduled_at)
+        if start.tzinfo is None:
+            raise ValueError("scheduled_at must include a timezone.")
+        end = start.timestamp() + duration_seconds
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM research_queue_items
+                WHERE status IN ('waiting','running') AND schedule_mode='at_time'
+                AND scheduled_at IS NOT NULL
+                AND (? IS NULL OR item_id<>?)""",
+                (exclude_item_id, exclude_item_id),
+            ).fetchall()
+        conflicts = []
+        for row in rows:
+            item = dict(row)
+            existing_start = datetime.fromisoformat(item.get("started_at") or item["scheduled_at"])
+            existing_end = existing_start.timestamp() + int(item["duration_seconds"])
+            if start.timestamp() < existing_end and end > existing_start.timestamp():
+                conflicts.append(item)
+        return conflicts
 
     def queue(self, queue_id: str) -> dict[str, Any]:
         with self._connect() as db:
@@ -209,6 +318,8 @@ class ResearchQueueStore:
         feature_profile: str,
         duration_seconds: int,
         config: dict[str, Any],
+        schedule_mode: str | None = None,
+        scheduled_at: str | None = None,
     ) -> None:
         if engine not in {
             "intermittent_gp",
@@ -220,13 +331,33 @@ class ResearchQueueStore:
             raise ValueError("Unsupported feature profile.")
         if duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive.")
+        if schedule_mode is not None and schedule_mode not in {"after_completion", "at_time"}:
+            raise ValueError("Unsupported schedule mode.")
+        if schedule_mode == "at_time" and not scheduled_at:
+            raise ValueError("A scheduled start time is required.")
+        if schedule_mode == "at_time":
+            scheduled_time = datetime.fromisoformat(str(scheduled_at))
+            if scheduled_time.tzinfo is None or scheduled_time <= datetime.now(UTC):
+                raise ValueError("The scheduled start time must be future and timezone-aware.")
         snapshot = json.dumps(config, ensure_ascii=False, sort_keys=True, allow_nan=False)
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             cursor = db.execute(
                 """UPDATE research_queue_items SET engine=?,feature_profile=?,
-                duration_seconds=?,config_json=? WHERE item_id=? AND status='waiting'""",
-                (engine, feature_profile, duration_seconds, snapshot, item_id),
+                duration_seconds=?,config_json=?,schedule_mode=COALESCE(?,schedule_mode),
+                scheduled_at=CASE WHEN ? IS NULL THEN scheduled_at ELSE ? END,updated_at=?
+                WHERE item_id=? AND status='waiting'""",
+                (
+                    engine,
+                    feature_profile,
+                    duration_seconds,
+                    snapshot,
+                    schedule_mode,
+                    schedule_mode,
+                    scheduled_at if schedule_mode == "at_time" else None,
+                    _now(),
+                    item_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("Only a waiting reservation can be edited.")
@@ -235,11 +366,30 @@ class ResearchQueueStore:
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE research_queue_items SET status='cancelled',cancelled_at=?,
-                last_error=? WHERE item_id=? AND status='waiting'""",
-                (_now(), reason, item_id),
+                last_error=?,updated_at=? WHERE item_id=? AND status='waiting'""",
+                (_now(), reason, _now(), item_id),
             )
             if cursor.rowcount != 1:
                 raise ValueError("Only a waiting reservation can be cancelled.")
+
+    def run_waiting_now(self, item_id: str) -> str:
+        """Make one queued item immediately eligible without bypassing the worker lock."""
+        scheduled_at = _now()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT queue_id FROM research_queue_items WHERE item_id=? AND status='waiting'",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Only a waiting reservation can be started.")
+            db.execute(
+                """UPDATE research_queue_items SET schedule_mode='at_time',
+                scheduled_at=?,updated_at=?
+                WHERE item_id=? AND status='waiting'""",
+                (scheduled_at, scheduled_at, item_id),
+            )
+            return str(row["queue_id"])
 
     def move(self, item_id: str, direction: str) -> None:
         if direction not in {"first", "up", "down", "last"}:
@@ -276,8 +426,8 @@ class ResearchQueueStore:
             )
             for position, identifier in enumerate(ids, 1):
                 db.execute(
-                    "UPDATE research_queue_items SET position=? WHERE item_id=?",
-                    (position, identifier),
+                    "UPDATE research_queue_items SET position=?,updated_at=? WHERE item_id=?",
+                    (position, _now(), identifier),
                 )
 
     def set_queue_status(self, queue_id: str, status: str) -> None:
@@ -335,10 +485,19 @@ class ResearchQueueStore:
                 return None
             row = db.execute(
                 """SELECT item_id FROM research_queue_items WHERE queue_id=?
-                AND status='waiting' ORDER BY position LIMIT 1""",
-                (queue_id,),
+                AND status='waiting' AND (scheduled_at IS NULL OR scheduled_at<=?)
+                ORDER BY CASE WHEN schedule_mode='at_time' THEN 0 ELSE 1 END,
+                scheduled_at, position LIMIT 1""",
+                (queue_id, _now()),
             ).fetchone()
             if row is None:
+                future_item = db.execute(
+                    """SELECT 1 FROM research_queue_items WHERE queue_id=?
+                    AND status='waiting' AND scheduled_at>? LIMIT 1""",
+                    (queue_id, _now()),
+                ).fetchone()
+                if future_item:
+                    return None
                 db.execute(
                     "UPDATE research_queues SET status='completed',completed_at=? WHERE queue_id=?",
                     (_now(), queue_id),
@@ -346,9 +505,9 @@ class ResearchQueueStore:
                 return None
             item_id = row["item_id"]
             db.execute(
-                """UPDATE research_queue_items SET status='running',started_at=?
+                """UPDATE research_queue_items SET status='running',started_at=?,updated_at=?
                 WHERE item_id=? AND status='waiting'""",
-                (_now(), item_id),
+                (_now(), _now(), item_id),
             )
             claimed = db.execute(
                 "SELECT * FROM research_queue_items WHERE item_id=?", (item_id,)
@@ -366,9 +525,9 @@ class ResearchQueueStore:
                 "SELECT queue_id FROM research_queue_items WHERE item_id=?", (item_id,)
             ).fetchone()
             db.execute(
-                """UPDATE research_queue_items SET status=?,completed_at=?,last_error=?
+                """UPDATE research_queue_items SET status=?,completed_at=?,last_error=?,updated_at=?
                 WHERE item_id=? AND status='running'""",
-                (status, _now(), error, item_id),
+                (status, _now(), error, _now(), item_id),
             )
             if row and status == "failed":
                 db.execute(

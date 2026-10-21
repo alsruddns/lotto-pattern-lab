@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .paths import PROJECT_ROOT, project_path
-from .research import load_checkpoint, request_pause
+from .research import load_checkpoint, request_pause, research_worker_active
 from .research_queue import ResearchQueueStore
 from .research_rounds import ResearchRoundStore
 from .storage_management import load_storage_settings, storage_inventory, storage_over_quota
@@ -183,6 +183,8 @@ def scheduler_step(
         return store.queue(queue_id)["status"]
     if store.queue(queue_id)["status"] != "running":
         return "idle"
+    if research_worker_active():
+        return "waiting_for_global_worker"
     try:
         disk = shutil.disk_usage(workspace_root)
         if disk.free < 512 * 1024**2:
@@ -223,6 +225,11 @@ def scheduler_step(
             "status": "queued",
             "queue_id": queue_id,
             "queue_item_id": item["item_id"],
+            "schedule_mode": item.get("schedule_mode", "after_completion"),
+            "scheduled_at": item.get("scheduled_at"),
+            "planned_duration_seconds": item["duration_seconds"],
+            "research_mode": item["config"].get("research_mode", "independent"),
+            "feature_profile": item["feature_profile"],
             "config": item["config"],
         },
         workspace_root / "checkpoints",

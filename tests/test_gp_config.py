@@ -74,8 +74,7 @@ def test_research_dashboard_exposes_settings_in_separate_start_tab(tmp_path, mon
     startup_index = next(
         index
         for index, item in enumerate(rendered)
-        if index > start_index
-        and type(item).__name__ in {"Info", "Success", "Error", "Warning"}
+        if index > start_index and type(item).__name__ in {"Info", "Success", "Error", "Warning"}
     )
     settings_index = next(
         index
@@ -89,12 +88,17 @@ def test_research_dashboard_exposes_settings_in_separate_start_tab(tmp_path, mon
     view_source = page.parents[1] / "continuous_research_view.py"
     view_text = view_source.read_text(encoding="utf-8")
     assert "settings_details = applied_settings_container.expander(" in view_text
-    assert 'expanded=False' in view_text[view_text.index("settings_details ="):]
+    assert "expanded=False" in view_text[view_text.index("settings_details =") :]
     tab_labels = [tab.label for tab in app.tabs]
     assert "지속적 패턴 연구" in tab_labels
     assert "연구 조건 자동 최적화" in tab_labels
     assert all(
-        label in tab_labels for label in ("새 연구 시작", "기존 연구 이어서 하기", "연구 예약 실행")
+        label in tab_labels
+        for label in (
+            "\uc0c8 \uc5f0\uad6c \uc2dc\uc791",
+            "\uae30\uc874 \uc5f0\uad6c \uc774\uc5b4\uc11c \ud558\uae30",
+            "\uc5f0\uad6c \uc608\uc57d \uad00\ub9ac",
+        )
     )
     keys = set(app.session_state)
     assert {"new_population_size", "new_crossover_probability", "new_elite_seed_ratio"} <= keys

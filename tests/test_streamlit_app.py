@@ -64,9 +64,12 @@ def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypat
         for label in [
             "새 연구 시작",
             "기존 연구 이어서 하기",
-            "연구 예약 실행",
+            "\uc5f0\uad6c \uc608\uc57d \uad00\ub9ac",
         ]
     )
+    assert any(item.label == "\uc2e4\ud589 \ubc29\ubc95" for item in app.selectbox)
+    subheaders = {item.value for item in app.subheader}
+    assert "\ud328\ud134 \ub77c\uc774\ube0c\ub7ec\ub9ac" not in subheaders
     labels = [button.label for button in app.button]
     assert "연구 환경 사전 검사" in labels
     assert "새 연구 시작" in labels
@@ -99,6 +102,7 @@ def test_optimization_tab_shows_history_and_separates_new_and_resume() -> None:
     assert "최적화 이력" in labels
     assert "새 자동 최적화 시작" in [button.label for button in app.button]
     assert "기존 자동 최적화 이어서 하기" in [button.label for button in app.button]
+
 
 def test_optimization_history_tab_state_survives_rerun() -> None:
     page = next(
@@ -139,9 +143,7 @@ def test_live_research_status_is_at_top_and_rerun_preserves_controls(tmp_path) -
     assert any(item.value == "연구 진행 현황" for item in app.subheader)
     metrics = {item.label for item in app.metric}
     assert {"누적 실행 시간", "남은 연구 시간", "현재 시드"} <= metrics
-    assert any(
-        "첫 체크포인트 저장 대기 중" in item.value for item in app.markdown
-    )
+    assert any("첫 체크포인트 저장 대기 중" in item.value for item in app.markdown)
     assert "연구 진행 상태" not in {item.value for item in app.subheader}
     assert any(button.key == "refresh_research_status" for button in app.button)
 
