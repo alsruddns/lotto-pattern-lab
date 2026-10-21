@@ -173,6 +173,36 @@ def _worker_active(checkpoint_path: Path) -> bool:
         return True
 
 
+def _format_comparison_value(value: Any) -> str:
+    """Render heterogeneous settings as stable strings for Arrow comparison tables."""
+    if value is None:
+        return "해당 없음"
+    if isinstance(value, bool):
+        return "예" if value else "아니요"
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
+def _format_comparison_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Ensure every cell in a settings comparison table has a string dtype."""
+    return [
+        {str(column): _format_comparison_value(value) for column, value in row.items()}
+        for row in rows
+    ]
+
+
+def _show_reservation_saved_feedback() -> None:
+    message = "\uc608\uc57d\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4. \ud604\uc7ac \uc124\uc815\uc740 \uc720\uc9c0\ub429\ub2c8\ub2e4."  # noqa: E501
+    try:
+        st.toast(message, icon="\u2705")
+    except st.errors.StreamlitAPIException:
+        st.success(message)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_elite_preview(
     database_path: str,
@@ -1836,6 +1866,7 @@ with new_tab:
                         if active
                         else queue_store.create_queue(error_policy="continue")
                     )
+                    saved_item_id: str | None = None
                     try:
                         if schedule_mode == "at_time" and scheduled_at:
                             conflicts = queue_store.schedule_conflicts(
@@ -1883,18 +1914,24 @@ with new_tab:
                                 else None
                             ),
                         )
-                        st.session_state["new_research_queue_request_key"] = str(uuid.uuid4())
-                        start_detached_scheduler(queue_store, queue_id)
-                        st.toast(
-                            "\uc608\uc57d\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4. \ud604\uc7ac \uc124\uc815\uc740 \uc720\uc9c0\ub429\ub2c8\ub2e4.",  # noqa: E501
-                            icon="?",
-                        )
+                        saved_item_id = item_id
                         st.session_state["new_research_last_queued_item"] = item_id
+                        start_detached_scheduler(queue_store, queue_id)
+                        _show_reservation_saved_feedback()
+                        # Rotate only after confirmation; if feedback fails, the same key
+                        # makes a retry resolve to the already stored reservation.
+                        st.session_state["new_research_queue_request_key"] = str(uuid.uuid4())
                         st.rerun()
                     except (OSError, RuntimeError, ValueError) as error:
-                        st.error(
-                            f"\uc608\uc57d \uc800\uc7a5 \ub610\ub294 \uc2a4\ucf00\uc904\ub7ec \uc2dc\uc791\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4: {error}"  # noqa: E501
-                        )
+                        if saved_item_id is not None:
+                            st.session_state["new_research_queue_request_key"] = str(uuid.uuid4())
+                            st.warning(
+                                f"\uc608\uc57d {saved_item_id[:8]}\uc740(\ub294) \uc800\uc7a5\ub418\uc5c8\uc9c0\ub9cc \uc2a4\ucf00\uc904\ub7ec \uc2dc\uc791\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4. \uc911\ubcf5 \ub4f1\ub85d\ub418\uc9c0 \uc54a\ub3c4\ub85d \uc608\uc57d ID\ub97c \ubcf4\uc874\ud588\uc2b5\ub2c8\ub2e4: {error}"  # noqa: E501
+                            )
+                        else:
+                            st.error(
+                                f"\uc608\uc57d \uc800\uc7a5 \ub610\ub294 \uc2a4\ucf00\uc904\ub7ec \uc2dc\uc791\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4: {error}"  # noqa: E501
+                            )
                     st.stop()
                 checkpoint_path = checkpoint_dir / (
                     f"research_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.json"  # noqa: E501
@@ -2612,7 +2649,7 @@ with queue_tab:
                     start_detached_scheduler(queue_store, selected_queue_id)
                     st.toast(
                         "\uc608\uc57d\uc774 \uc989\uc2dc \uc2e4\ud589 \ub300\uae30\uc5f4\uc5d0 \ub4e4\uc5b4\uac14\uc2b5\ub2c8\ub2e4.",  # noqa: E501
-                        icon="?",
+                        icon="✅",
                     )
                     st.rerun()
                 except (OSError, RuntimeError, ValueError) as error:
@@ -2810,7 +2847,7 @@ with queue_tab:
                 )
                 st.caption("\uc800\uc7a5 \uc804 \ubcc0\uacbd \ub0b4\uc6a9")
                 st.dataframe(
-                    [
+                    _format_comparison_rows([
                         {
                             "\uc124\uc815": "\uc5d4\uc9c4",
                             "\uae30\uc874": edit_item["engine"],
@@ -2843,7 +2880,7 @@ with queue_tab:
                             "\uae30\uc874": edit_item.get("schedule_mode"),
                             "\ubcc0\uacbd": edit_schedule_mode,
                         },
-                    ],
+                    ]),
                     hide_index=True,
                     width="stretch",
                 )
@@ -2996,7 +3033,7 @@ with queue_tab:
                 start_detached_scheduler(queue_store, active_queue_id)
                 st.toast(
                     "\uc2a4\ucf00\uc904\ub7ec\ub97c \uc7ac\uc5f0\uacb0\ud588\uc2b5\ub2c8\ub2e4.",
-                    icon="?",
+                    icon="✅",
                 )
                 st.rerun()
             except (OSError, RuntimeError) as error:
