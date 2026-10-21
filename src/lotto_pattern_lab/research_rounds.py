@@ -615,18 +615,6 @@ def summarize_experiment(
                         "2_unknown": len(active_events) - len(known),
                     }
                 )
-    for split, metrics in (result.get("six_number_set_metrics") or {}).items():
-        if not isinstance(metrics, dict):
-            continue
-        output["hits"][f"six_number_set:{split}"] = {
-            "3_plus": int(metrics.get("three_plus", 0) or 0),
-            "4_plus": int(metrics.get("four_plus", 0) or 0),
-            "5_plus": int(metrics.get("five_plus", 0) or 0),
-            "6_exact": int(metrics.get("six_exact", 0) or 0),
-            "2_exact": int(metrics.get("second_prize_exact") or 0),
-            "2_known": int(metrics.get("second_prize_known", 0) or 0),
-            "2_unknown": int(metrics.get("second_prize_unknown", 0) or 0),
-        }
     paired = result.get("paired_unseeded_comparison") or {}
     progress = result.get("progress", [])
     actual_progress_span = _progress_span(progress, "actual_")
@@ -960,7 +948,27 @@ def safely_reaggregate_second_prize(
     database: str | Path = "data/database/patterns.sqlite",
 ) -> dict[str, Any]:
     """Add verified second-prize totals while preserving every existing metric and record."""
-    rebuilt = rebuild_dashboard_summary_from_store(research_record, experiment_directory)
+    batch = safely_reaggregate_second_prize_batch(
+        [research_record], experiment_directory, database
+    )
+    return {
+        "backup_path": batch["backup_path"],
+        "summary": batch["summaries"][str(research_record["research_id"])],
+    }
+
+
+def safely_reaggregate_second_prize_batch(
+    research_records: list[dict[str, Any]],
+    experiment_directory: str | Path,
+    database: str | Path = "data/database/patterns.sqlite",
+) -> dict[str, Any]:
+    """Back up once, then atomically add second-prize aggregates for several rounds."""
+    rebuilt_by_id = {
+        str(record["research_id"]): rebuild_dashboard_summary_from_store(
+            record, experiment_directory
+        )
+        for record in research_records
+    }
     database_path = project_path(database)
     lock_path = project_path("checkpoints/research_global")
     backup_directory = project_path("data/backups")
@@ -986,89 +994,98 @@ def safely_reaggregate_second_prize(
                 backup.close()
 
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT metadata_json FROM research_rounds WHERE research_id=?",
-                (str(research_record["research_id"]),),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"연구 회차가 존재하지 않습니다: {research_record['research_id']}")
-            metadata = json.loads(row[0])
-            original_summary = metadata.get("dashboard_summary")
-            if isinstance(original_summary, str):
-                original_summary = json.loads(original_summary)
-            if not isinstance(original_summary, dict):
-                raise ValueError("기존 dashboard_summary 형식이 올바르지 않아 갱신을 중단했습니다.")
-            old_totals = original_summary.get("hit_totals", {})
-            new_totals = rebuilt.get("hit_totals", {})
-            core_metrics = ("3_plus", "4_plus", "5_plus", "6_exact")
-            for key, old in old_totals.items():
-                if not isinstance(old, dict):
-                    raise ValueError(f"기존 적중 통계 형식이 올바르지 않습니다: {key}")
-                new = new_totals.get(key)
-                core_metrics_changed = new is None or any(
-                    old.get(metric) != new.get(metric) for metric in core_metrics
-                )
-                if core_metrics_changed:
+            summaries = {}
+            for research_id, rebuilt in rebuilt_by_id.items():
+                row = connection.execute(
+                    "SELECT metadata_json FROM research_rounds WHERE research_id=?",
+                    (research_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"연구 회차가 존재하지 않습니다: {research_id}")
+                metadata = json.loads(row[0])
+                original_summary = metadata.get("dashboard_summary")
+                if isinstance(original_summary, str):
+                    original_summary = json.loads(original_summary)
+                if not isinstance(original_summary, dict):
                     raise ValueError(
-                        f"기존 {key}의 3+/4+/5+/6개 통계와 재구성 값이 달라 "
-                        "기존 집계를 보존하고 갱신을 중단했습니다."
+                        f"{research_id}의 dashboard_summary 형식이 올바르지 않아 "
+                        "갱신을 중단했습니다."
                     )
-
-            summary = json.loads(json.dumps(original_summary, ensure_ascii=False))
-            totals = summary.setdefault("hit_totals", {})
-            updates = 0
-            for key, values in new_totals.items():
-                if not key.startswith("six_number_set:"):
-                    continue
-                target = totals.setdefault(key, {})
-                for metric in ("2_exact", "2_known", "2_unknown"):
-                    value = values.get(metric)
-                    if value is None:
-                        continue
-                    existing = target.get(metric)
-                    if existing is not None and existing != value:
-                        raise ValueError(
-                            f"기존 {key}.{metric} 값({existing})과 확인된 값({value})이 달라 "
-                            "갱신을 중단했습니다."
-                        )
-                    target[metric] = int(value)
-                has_second_metrics = any(
-                    metric in values for metric in ("2_exact", "2_known", "2_unknown")
+                summary = _merge_verified_second_prize_summary(original_summary, rebuilt)
+                metadata["dashboard_summary"] = summary
+                connection.execute(
+                    "UPDATE research_rounds SET metadata_json=? WHERE research_id=?",
+                    (
+                        json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                        research_id,
+                    ),
                 )
-                updates += int(has_second_metrics)
-            if updates == 0:
-                raise ValueError("저장된 예측 조합에서 추가 판정 가능한 2등 통계가 없습니다.")
-            unique_totals = summary.setdefault("unique_hit_totals", {})
-            for model, phases in rebuilt.get("unique_hit_totals", {}).items():
-                if model != "six_number_set":
-                    continue
-                model_target = unique_totals.setdefault(model, {})
-                for phase, values in phases.items():
-                    if "2_exact" in values:
-                        model_target.setdefault(phase, {})["2_exact"] = values["2_exact"]
-            summary["summary_schema_version"] = SUMMARY_SCHEMA_VERSION
-            summary["second_prize_aggregation_source"] = (
-                "검증된 데이터 해시와 저장 예측 조합을 사용한 추가 집계"
-            )
-            summary["second_prize_reaggregated_at"] = datetime.now(UTC).isoformat()
-            metadata["dashboard_summary"] = summary
-            connection.execute(
-                "UPDATE research_rounds SET metadata_json=? WHERE research_id=?",
-                (
-                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
-                    str(research_record["research_id"]),
-                ),
-            )
+                summaries[research_id] = summary
             connection.commit()
             after_integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
             if after_integrity != "ok":
                 raise RuntimeError(f"갱신 후 연구 DB 무결성 검사 실패: {after_integrity}")
-            return {"backup_path": str(backup_path), "summary": summary}
+            return {"backup_path": str(backup_path), "summaries": summaries}
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+
+def _merge_verified_second_prize_summary(
+    original_summary: dict[str, Any], rebuilt: dict[str, Any]
+) -> dict[str, Any]:
+    old_totals = original_summary.get("hit_totals", {})
+    new_totals = rebuilt.get("hit_totals", {})
+    core_metrics = ("3_plus", "4_plus", "5_plus", "6_exact")
+    for key, old in old_totals.items():
+        if not isinstance(old, dict):
+            raise ValueError(f"기존 적중 통계 형식이 올바르지 않습니다: {key}")
+        new = new_totals.get(key)
+        if new is None or any(old.get(metric) != new.get(metric) for metric in core_metrics):
+            raise ValueError(
+                f"기존 {key}의 3+/4+/5+/6개 통계와 재구성 값이 달라 "
+                "기존 집계를 보존하고 갱신을 중단했습니다."
+            )
+
+    summary = json.loads(json.dumps(original_summary, ensure_ascii=False))
+    totals = summary.setdefault("hit_totals", {})
+    updates = 0
+    for key, values in new_totals.items():
+        if not key.startswith("six_number_set:"):
+            continue
+        target = totals.setdefault(key, {})
+        for metric in ("2_exact", "2_known", "2_unknown"):
+            value = values.get(metric)
+            if value is None:
+                continue
+            existing = target.get(metric)
+            if existing is not None and existing != value:
+                raise ValueError(
+                    f"기존 {key}.{metric} 값({existing})과 확인된 값({value})이 달라 "
+                    "갱신을 중단했습니다."
+                )
+            target[metric] = int(value)
+        updates += int(
+            any(metric in values for metric in ("2_exact", "2_known", "2_unknown"))
+        )
+    if updates == 0:
+        raise ValueError("저장된 예측 조합에서 추가 판정 가능한 2등 통계가 없습니다.")
+    unique_totals = summary.setdefault("unique_hit_totals", {})
+    for model, phases in rebuilt.get("unique_hit_totals", {}).items():
+        if model != "six_number_set":
+            continue
+        model_target = unique_totals.setdefault(model, {})
+        for phase, values in phases.items():
+            if "2_exact" in values:
+                model_target.setdefault(phase, {})["2_exact"] = values["2_exact"]
+    summary["summary_schema_version"] = SUMMARY_SCHEMA_VERSION
+    summary["second_prize_aggregation_source"] = (
+        "검증된 데이터 해시와 저장 예측 조합을 사용한 추가 집계"
+    )
+    summary["second_prize_reaggregated_at"] = datetime.now(UTC).isoformat()
+    return summary
 def load_round_experiments(
     record: dict[str, Any], experiment_directory: str | Path
 ) -> list[dict[str, Any]]:
@@ -1464,6 +1481,16 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
                         f"{_display(counts.get('random_control_mean_hits'))}, "
                         f"반복 {counts.get('random_control_replicates')}, "
                         f"경험적 p { _display(counts.get('empirical_p_value')) }"
+                    )
+                    second_hits = (
+                        _display(counts.get("second_prize_exact"))
+                        if counts.get("second_prize_known")
+                        else "미수집"
+                    )
+                    lines.append(
+                        f"    - 2등 일치 {second_hits}회 "
+                        f"(판정 가능 조합 {counts.get('second_prize_known', 0)}, "
+                        f"보너스 미수집 {counts.get('second_prize_unknown', 0)})"
                     )
     lines.extend(["", "## 상위 후보 (검증 기반 정렬)"])
     candidates = [

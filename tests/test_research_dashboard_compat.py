@@ -242,6 +242,32 @@ def test_research_summary_counts_exact_second_prizes_without_changing_five_plus(
     assert summary["unique_hit_totals"]["six_number_set"]["validation"]["2_exact"] == 1
 
 
+def test_pysr_prize_metrics_stay_separate_from_gp_repeated_hit_totals():
+    compact = summarize_experiment(
+        {
+            "status": "completed",
+            "engine": "pysr_symbolic_regression",
+            "candidate_count": 1,
+            "six_number_set_metrics": {
+                "validation": {
+                    "three_plus": 4,
+                    "four_plus": 1,
+                    "five_plus": 0,
+                    "six_exact": 0,
+                    "second_prize_exact": 0,
+                    "second_prize_known": 10,
+                    "second_prize_unknown": 0,
+                }
+            },
+        }
+    )
+    summary = rebuild_dashboard_summary([compact])
+    assert summary["hit_totals"] == {}
+    assert summary["experiment_summaries"][0]["six_number_set_metrics"]["validation"][
+        "second_prize_known"
+    ] == 10
+
+
 def test_historical_bonus_reconstruction_requires_exact_snapshot_and_main_draw_match(
     tmp_path, monkeypatch
 ):
