@@ -36,7 +36,12 @@ def _split_provenance(experiment: dict[str, Any]) -> tuple[bool, int | None, int
         return True, len(validation), len(test)
     refs = (train, validation, test)
     if all(isinstance(value, dict) and value.get("$detail_ref") for value in refs):
-        counts = (experiment.get("storage") or {}).get("detail_collection_counts") or {}
+        storage = experiment.get("storage")
+        counts = (
+            storage.get("detail_collection_counts") or {}
+            if isinstance(storage, dict)
+            else {}
+        )
         return (
             True,
             counts.get("/splits/validation_rounds"),
@@ -69,6 +74,8 @@ def list_research_recommendation_candidates(
         try:
             experiment = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            continue
+        if not isinstance(experiment, dict):
             continue
         if experiment.get("status") != "completed":
             continue
@@ -127,13 +134,17 @@ def list_research_recommendation_candidates(
                 )
                 break
         elif engine == "pysr_symbolic_regression":
-            if (
-                config.get("target") != "main_positions"
-                or pysr_replay_readiness(experiment).get("status") != "verified"
+            pysr_candidates = experiment.get("candidates")
+            if not isinstance(pysr_candidates, list) or any(
+                not isinstance(candidate, dict) for candidate in pysr_candidates
+            ):
+                continue
+            if config.get("target") != "main_positions" or (
+                pysr_replay_readiness(experiment).get("status") != "verified"
             ):
                 continue
             targets = {f"main_position_{index}": [] for index in range(1, 7)}
-            for candidate in experiment.get("candidates", []):
+            for candidate in pysr_candidates:
                 if candidate.get("target") in targets:
                     targets[candidate["target"]].append(candidate)
             common_ranks = min((len(values) for values in targets.values()), default=0)
