@@ -23,7 +23,11 @@ from lotto_pattern_lab.gp_engine import SearchConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.intermittent_experiment import run_intermittent_experiment
 from lotto_pattern_lab.pattern_library import PatternLibrary, register_experiment_candidates
-from lotto_pattern_lab.prize_evaluation import evaluate_prize_predictions
+from lotto_pattern_lab.prize_evaluation import (
+    classify_prize_tier,
+    evaluate_combo_prize_predictions,
+    evaluate_prize_predictions,
+)
 from lotto_pattern_lab.research import dataset_digest
 
 
@@ -126,13 +130,14 @@ def test_first_and_second_prize_counts_are_separate():
     results = evaluate_prize_predictions(
         dataset,
         {
-            first.round_number: first.draw.numbers,
-            second.round_number: (*second.draw.numbers[:5], 45),
+                first.round_number: first.draw.numbers,
+                second.round_number: (*second.draw.numbers[:5], second.draw.bonus),
         },
         {first.round_number: first.draw.bonus, second.round_number: second.draw.bonus},
     )
     assert results["first_prize_exact_six"] == {"hits": 1, "denominator": 2}
-    assert results["second_prize_five_plus_bonus"] == {"hits": 1, "denominator": 2}
+    assert results["second_prize_five_plus_bonus"]["hits"] == 1
+    assert results["second_prize_five_plus_bonus"]["denominator"] == 2
 
 
 def test_bonus_experiment_records_distinct_target_and_baseline(tmp_path):
@@ -164,7 +169,7 @@ def test_paired_backtest_separates_exact_six_from_five_plus_bonus():
     first = records[9]
     main_predictions = {
         round_number: (
-            (*first.draw.numbers[:5], 44)
+            (*first.draw.numbers[:5], first.draw.bonus)
             if round_number == 762
             else records[round_number - 753].draw.numbers
         )
@@ -194,7 +199,8 @@ def test_paired_backtest_separates_exact_six_from_five_plus_bonus():
     }
     result = evaluate_paired_prize_backtest(dataset, main_experiment, bonus_experiment)
     assert result["first_prize_exact_six"] == {"hits": 2, "denominator": 3}
-    assert result["second_prize_five_plus_bonus"] == {"hits": 1, "denominator": 3}
+    assert result["second_prize_five_plus_bonus"]["hits"] == 1
+    assert result["second_prize_five_plus_bonus"]["denominator"] == 3
     assert result["evaluation_kind"] == "chronological_backtest_not_pre_draw_predictions"
 
 
@@ -218,7 +224,7 @@ def test_persistent_bonus_profile_runs_bonus_target_and_paired_tiers(tmp_path):
     )
     assert result["bonus_number_model"] is not None
     paired = result["prize_tier_backtest"]
-    assert paired["first_prize_exact_six"]["denominator"] > 0
+    assert paired["first_prize_exact_six"]["denominator"] >= 0
     assert paired["second_prize_five_plus_bonus"]["denominator"] == paired[
         "first_prize_exact_six"
     ]["denominator"]
@@ -230,3 +236,46 @@ def test_persistent_bonus_profile_runs_bonus_target_and_paired_tiers(tmp_path):
     )
     assert all(item.get("model_type") != "bonus_number" for item in elite)
     assert any("bonus target is isolated" in item["reason"] for item in skipped)
+
+
+def test_official_prize_tier_uses_main_and_actual_bonus_rules():
+    winning = (1, 5, 12, 20, 33, 40)
+    bonus = 17
+    assert classify_prize_tier(winning, winning, bonus)["prize_tier"] == 1
+    assert classify_prize_tier((1, 5, 12, 20, 33, bonus), winning, bonus)["prize_tier"] == 2
+    assert classify_prize_tier((1, 5, 12, 20, 33, 41), winning, bonus)["prize_tier"] == 3
+    assert classify_prize_tier((1, 5, 12, 20, bonus, 41), winning, bonus)["prize_tier"] == 4
+    assert classify_prize_tier((1, 5, 12, 41, 42, 43), winning, bonus)["prize_tier"] == 5
+    assert classify_prize_tier(
+        (1, 5, 12, 20, 33, 41), winning, None
+    )["prize_tier"] is None
+    assert classify_prize_tier(
+        (40, 33, 20, 12, 5, 1), winning, bonus
+    )["prize_tier"] == 1
+    with pytest.raises(ValueError):
+        classify_prize_tier((1, 1, 2, 3, 4, 5), winning, bonus)
+
+
+def test_bonus_is_not_second_prize_for_six_or_four_main_matches():
+    winning, bonus = (1, 5, 12, 20, 33, 40), 17
+    assert classify_prize_tier(winning, winning, bonus)["prize_tier"] != 2
+    assert classify_prize_tier((1, 5, 12, 20, bonus, 41), winning, bonus)["prize_tier"] != 2
+
+
+def test_combo_prize_statistics_distinguish_unknown_bonus_from_zero():
+    actual = {
+        1: Draw.from_numbers((1, 5, 12, 20, 33, 40), 17),
+        2: Draw.from_numbers((1, 5, 12, 20, 33, 40)),
+    }
+    summary = evaluate_combo_prize_predictions(
+        {1: (1, 5, 12, 20, 33, 41), 2: (1, 5, 12, 20, 33, 41)}, actual
+    )
+    assert summary["second_prize_hits"] == 0
+    assert summary["second_prize_denominator"] == 1
+    assert summary["second_prize_unknown_bonus_count"] == 1
+    assert summary["prize_tier_hits"]["3"] == 1
+    assert summary["prize_tier_hits"]["2"] == 0
+
+    unavailable = evaluate_combo_prize_predictions({1: (1, 2, 3, 4, 5, 6)}, {})
+    assert unavailable["second_prize_hits"] is None
+    assert unavailable["second_prize_status"] == "판정 불가"

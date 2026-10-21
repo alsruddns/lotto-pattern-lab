@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from collections.abc import Mapping
+from numbers import Real
 from typing import Any
 
 _UNKNOWN_SUMMARY = {
@@ -137,12 +139,25 @@ def normalize_dashboard_summary(value: Any, *, missing: bool = False) -> tuple[d
         if diagnostic is None:
             diagnostic = "summary.hit_totals에 올바르지 않은 집계 값이 있습니다."
         summary["hit_totals"] = {}
-    for key in ("paired_metrics", "p_value_distributions"):
-        for model, value in list(summary[key].items()):
-            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-                if diagnostic is None:
-                    diagnostic = f"summary.{key}[{model!r}] 형식이 올바르지 않습니다."
-                summary[key][model] = []
+    for model, value in list(summary["paired_metrics"].items()):
+        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+            if diagnostic is None:
+                diagnostic = f"summary.paired_metrics[{model!r}] 형식이 올바르지 않습니다."
+            summary["paired_metrics"][model] = []
+    for model, value in list(summary["p_value_distributions"].items()):
+        if not isinstance(value, list) or any(
+            isinstance(item, bool)
+            or not isinstance(item, Real)
+            or not math.isfinite(float(item))
+            or not 0 <= float(item) <= 1
+            for item in value
+        ):
+            if diagnostic is None:
+                diagnostic = (
+                    f"summary.p_value_distributions[{model!r}] 값이 "
+                    "0~1 숫자 목록이 아닙니다."
+                )
+            summary["p_value_distributions"][model] = []
     for model, phases in list(summary["unique_hit_totals"].items()):
         if not isinstance(phases, dict):
             if diagnostic is None:
@@ -209,6 +224,45 @@ def dashboard_failure_records(record: Mapping[str, Any]) -> list[dict[str, Any]]
     if isinstance(startup_failures, list):
         return copy.deepcopy(startup_failures)
     return failures if isinstance(failures, int) else None
+
+
+def research_aggregation_status(
+    record: Mapping[str, Any], summary: Mapping[str, Any], diagnostic: str | None
+) -> str:
+    """Classify aggregate readiness independently from the worker's execution status."""
+    experiment_ids = record.get("completed_experiment_ids") or record.get("experiment_ids") or []
+    execution_status = str(record.get("status", "")).lower()
+    stored_aggregation_status = str(summary.get("aggregation_status", "")).lower()
+    if stored_aggregation_status in {"running", "in_progress", "진행 중", "집계 진행 중"}:
+        return "집계 진행 중"
+    completed = summary.get("completed_experiment_count")
+    has_summary_data = (
+        isinstance(completed, int)
+        and not isinstance(completed, bool)
+        and completed > 0
+    ) or bool(summary.get("experiment_summaries")) or bool(summary.get("hit_totals"))
+    if execution_status == "running" and not has_summary_data:
+        return "집계 진행 중"
+    if diagnostic:
+        if has_summary_data:
+            return "부분 집계"
+        if experiment_ids:
+            return "집계 대기"
+        if "summary가 아직 저장되지 않아" in diagnostic and execution_status in {
+            "queued",
+            "failed",
+            "stopped",
+            "cancelled",
+        }:
+            return "집계 대상 아님"
+        return "집계 오류"
+    if not has_summary_data:
+        if experiment_ids:
+            return "집계 대기"
+        return "집계 대상 아님"
+    if execution_status in {"paused", "stopped", "interrupted"}:
+        return "부분 집계"
+    return "집계 완료"
 
 
 def stringify_dashboard_table_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:

@@ -107,6 +107,13 @@ def build_future_scorecard(
         verified = [
             item for item in comparisons if item.get("result_status") == "official_verified"
         ]
+        formula = frozen.get("frozen_experiment", {})
+        model = frozen.get("model_type")
+        second_prize_evaluable = [
+            item
+            for item in verified
+            if model == "six_number_set" and item.get("actual_bonus") is not None
+        ]
         provisional = [
             item for item in comparisons if item.get("result_status") != "official_verified"
         ]
@@ -114,8 +121,15 @@ def build_future_scorecard(
         distribution = {str(hit_count): 0 for hit_count in range(7)}
         for item in verified:
             distribution[str(int(item.get("ai_hit_count", 0)))] += 1
-        formula = frozen.get("frozen_experiment", {})
-        model = frozen.get("model_type")
+        second_prize_status = (
+            "해당 없음"
+            if model != "six_number_set"
+            else "미수집"
+            if not second_prize_evaluable
+            else "부분 수집"
+            if len(second_prize_evaluable) < len(verified)
+            else "판정 완료"
+        )
         rows.append(
             {
                 "freeze_id": freeze_id,
@@ -152,6 +166,17 @@ def build_future_scorecard(
                     else None
                 ),
                 "hit_distribution_official": distribution,
+                "second_prize_hits_official": (
+                    sum(item.get("prize_tier") == 2 for item in second_prize_evaluable)
+                    if second_prize_evaluable
+                    else None
+                ),
+                "second_prize_evaluable_round_count": len(second_prize_evaluable),
+                "second_prize_unavailable_round_count": len(verified)
+                - len(second_prize_evaluable)
+                if model == "six_number_set"
+                else None,
+                "second_prize_status": second_prize_status,
                 "at_least_3_official": sum(
                     count for hit_count, count in distribution.items() if int(hit_count) >= 3
                 ),

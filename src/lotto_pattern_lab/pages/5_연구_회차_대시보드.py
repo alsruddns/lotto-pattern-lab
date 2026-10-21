@@ -29,10 +29,11 @@ from lotto_pattern_lab.randomized_controls import (
     summarize_matched_random_controls,
 )
 from lotto_pattern_lab.report_clipboard import report_copy_button
-from lotto_pattern_lab.research import load_checkpoint
+from lotto_pattern_lab.research import load_checkpoint, research_worker_active
 from lotto_pattern_lab.research_dashboard import (
     dashboard_failure_records,
     normalize_dashboard_summary,
+    research_aggregation_status,
     stringify_dashboard_table_rows,
     validated_pattern_counts,
 )
@@ -45,6 +46,7 @@ from lotto_pattern_lab.research_rounds import (
     model_metric_stats,
     paired_comparison_summary,
     rebuild_dashboard_summary_from_store,
+    safely_reaggregate_second_prize,
 )
 from lotto_pattern_lab.sqlite_support import is_database_locked, log_database_failure
 from lotto_pattern_lab.storage import ExperimentStore
@@ -174,6 +176,25 @@ def _hit_total(summary: dict, metric: str) -> int | str:
     return sum(int(item.get(metric, 0)) for item in totals.values())
 
 
+def _second_prize_total(summary: dict) -> tuple[int | None, str]:
+    groups = {
+        key: value
+        for key, value in summary.get("hit_totals", {}).items()
+        if key.startswith("six_number_set:") and isinstance(value, dict)
+    }
+    known = sum(int(value.get("2_known", 0) or 0) for value in groups.values())
+    unknown = sum(int(value.get("2_unknown", 0) or 0) for value in groups.values())
+    if known == 0:
+        if (
+            int(summary.get("summary_schema_version", 0) or 0) < SUMMARY_SCHEMA_VERSION
+            and summary.get("completed_experiment_count", 0)
+        ):
+            return None, "재집계 필요"
+        return None, "미수집" if unknown == 0 else "판정 불가"
+    hits = sum(int(value.get("2_exact", 0) or 0) for value in groups.values())
+    return hits, "일부 미수집" if unknown else "판정 완료"
+
+
 def _test_summary(summary: dict) -> str:
     metrics = summary.get("model_metrics", {})
     values = []
@@ -264,11 +285,16 @@ def hydrate_round(
         summary["registration_count_source"] = "pattern_library"
     else:
         summary["registration_metrics_available"] = False
-        summary_diagnostic = summary_diagnostic or pattern_count_diagnostic
+        summary["registration_diagnostic"] = pattern_count_diagnostic
+    summary["aggregation_status"] = research_aggregation_status(
+        hydrated, summary, summary_diagnostic
+    )
     if summary_diagnostic:
         summary["summary_state"] = "pending_or_invalid"
         summary["summary_diagnostic"] = summary_diagnostic
     elif pattern_counts is not None:
+        summary["summary_state"] = "available"
+    else:
         summary["summary_state"] = "available"
     if not summary.get("exact_match_count") and hydrated.get("discovered_exact_matches"):
         summary["exact_match_count"] = len(hydrated.get("discovered_exact_matches", []))
@@ -290,6 +316,7 @@ else:
     for item in rounds:
         summary = item.get("dashboard_summary", {})
         config = item.get("config", {})
+        second_prize_hits, second_prize_status = _second_prize_total(summary)
         list_rows.append(
             {
                 "연구 회차": f"연구 {item['research_round']}회차",
@@ -297,10 +324,9 @@ else:
                 "실행 일시": item.get("started_at") or item.get("created_at"),
                 "연구 시간": format_duration(item.get("total_elapsed_seconds")),
                 "상태": item.get("status", "미수집"),
-                "집계 상태": (
-                    "집계 완료"
-                    if summary.get("summary_state") == "available"
-                    else "집계 대기 또는 점검 필요"
+                "집계 상태": summary.get(
+                    "aggregation_status",
+                    research_aggregation_status(item, summary, summary.get("summary_diagnostic")),
                 ),
                 "탐색 엔진": ", ".join(item.get("engines", [])) or "미수집",
                 "특징 프로파일": config.get("feature_profile", "미수집"),
@@ -321,6 +347,8 @@ else:
                 "3개 이상 반복 평가": format_count(_hit_total(summary, "3_plus")),
                 "4개 이상 반복 평가": format_count(_hit_total(summary, "4_plus")),
                 "5개 이상 반복 평가": format_count(_hit_total(summary, "5_plus")),
+                "2등 일치": second_prize_hits,
+                "2등 통계 상태": second_prize_status,
                 "6개 완전 일치 반복 평가": format_count(_hit_total(summary, "6_exact")),
                 "독립 테스트 요약": _test_summary(summary),
             }
@@ -340,7 +368,9 @@ else:
         "3개 이상 반복 평가": "활성 예측 중 3개 이상 적중한 실험 평가 수입니다.",
         "4개 이상 반복 평가": "활성 예측 중 4개 이상 적중한 실험 평가 수입니다.",
         "5개 이상 반복 평가": "활성 예측 중 5개 이상 적중한 실험 평가 수입니다.",
-        "6개 완전 일치 반복 평가": "6개 번호가 모두 일치한 실험 평가 수입니다.",
+        "2등 일치": "예측한 6개 조합 중 본번호 정확히 5개와 보너스 번호가 함께 일치한 수입니다.",
+        "2등 통계 상태": "보너스 번호가 저장된 활성 6개 조합에 대해서만 판정합니다.",
+        "6개 완전 일치 반복 평가": "본번호 6개 일치입니다. 보너스 번호는 판정에 사용하지 않습니다.",
         "독립 테스트 요약": "독립 테스트 평가 점수의 모델별 평균입니다.",
     }
     list_tooltips["집계 상태"] = "집계 정보의 준비 또는 형식 상태입니다."
@@ -361,6 +391,14 @@ else:
     )
     list_column_config["연구 ID"] = st.column_config.TextColumn(
         "연구 ID", help=list_tooltips["연구 ID"], width="small"
+    )
+    list_column_config["2등 일치"] = st.column_config.NumberColumn(
+        "2등 일치",
+        help=list_tooltips["2등 일치"],
+        format="localized",
+    )
+    list_column_config["2등 통계 상태"] = st.column_config.TextColumn(
+        "2등 통계 상태", help=list_tooltips["2등 통계 상태"]
     )
     list_column_config["독립 테스트 요약"] = st.column_config.TextColumn(
         "독립 테스트 요약", help=list_tooltips["독립 테스트 요약"], width="medium"
@@ -456,6 +494,34 @@ else:
     selected = hydrate_round(choices[selected_label], reaggregate=False)
     summary = selected.get("dashboard_summary", {})
     config = selected.get("config", {})
+    if (
+        int(summary.get("summary_schema_version", 0) or 0) < SUMMARY_SCHEMA_VERSION
+        and summary.get("completed_experiment_count", 0)
+    ):
+        with st.expander("기존 연구의 2등 통계 재집계"):
+            st.caption(
+                "저장된 예측 조합과 정확히 같은 데이터 스냅샷이 확인되는 경우에만 계산합니다. "
+                "기존 3+/4+/5+/6개 값은 대조 후 보존하고, DB 온라인 백업을 먼저 생성합니다."
+            )
+            worker_active = research_worker_active()
+            if worker_active:
+                st.warning("연구 작업 슬롯이 사용 중이라 재집계를 시작할 수 없습니다.")
+            if st.button(
+                "선택 회차 2등 통계 재집계",
+                key=f"reaggregate-second-prize-{selected['research_id']}",
+                disabled=worker_active,
+            ):
+                try:
+                    result = safely_reaggregate_second_prize(
+                        choices[selected_label], experiment_directory
+                    )
+                    st.success(
+                        "2등 통계를 추가했습니다. "
+                        f"기존 연구 DB 온라인 백업: {result['backup_path']}"
+                    )
+                    st.rerun()
+                except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as error:
+                    st.error(f"2등 통계를 안전하게 재집계하지 못했습니다: {error}")
     if summary.get("summary_diagnostic"):
         st.warning(
             f"이 연구의 회차 통계는 집계 대기 또는 점검이 필요합니다: "
@@ -736,17 +802,29 @@ else:
                             ),
                         )
                     ),
-                    "반복 평가 3+ / 4+ / 5+ / 6개": [
-                        repeated.get("3_plus", 0),
-                        repeated.get("4_plus", 0),
-                        repeated.get("5_plus", 0),
-                        repeated.get("6_exact", 0),
+                    "반복 평가 3+ / 4+ / 5+ / 2등 / 6개": [
+                        format_count(repeated.get("3_plus", 0)),
+                        format_count(repeated.get("4_plus", 0)),
+                        format_count(repeated.get("5_plus", 0)),
+                        (
+                            format_count(repeated.get("2_exact"))
+                            if repeated.get("2_known", 0)
+                            else "미수집"
+                        )
+                        if model == "six_number_set"
+                        else "해당 없음",
+                        format_count(repeated.get("6_exact", 0)),
                     ],
-                    "고유 로또 회차 3+ / 4+ / 5+ / 6개": [
-                        unique.get("3_plus", 0),
-                        unique.get("4_plus", 0),
-                        unique.get("5_plus", 0),
-                        unique.get("6_exact", 0),
+                    "고유 로또 회차 3+ / 4+ / 5+ / 2등 / 6개": [
+                        format_count(unique.get("3_plus", 0)),
+                        format_count(unique.get("4_plus", 0)),
+                        format_count(unique.get("5_plus", 0)),
+                        format_count(unique.get("2_exact"))
+                        if model == "six_number_set" and unique.get("2_exact") is not None
+                        else "미수집"
+                        if model == "six_number_set"
+                        else "해당 없음",
+                        format_count(unique.get("6_exact", 0)),
                     ],
                 }
             )
@@ -774,14 +852,15 @@ else:
                 ),
                 format="%.4f",
             ),
-            "반복 평가 3+ / 4+ / 5+ / 6개": st.column_config.TextColumn(
-                "반복 평가 3+ / 4+ / 5+ / 6개",
+            "반복 평가 3+ / 4+ / 5+ / 2등 / 6개": st.column_config.TextColumn(
+                "반복 평가 3+ / 4+ / 5+ / 2등 / 6개",
                 help=(
-                    "실험별 평가를 합산한 3개 이상, 4개 이상, 5개 이상, 6개 완전 일치 횟수입니다."
+                    "실험별 평가를 합산한 누적 3개 이상·4개 이상·5개 이상, "
+                    "정확한 2등, 본번호 6개 일치입니다."
                 ),
             ),
-            "고유 로또 회차 3+ / 4+ / 5+ / 6개": st.column_config.TextColumn(
-                "고유 로또 회차 3+ / 4+ / 5+ / 6개",
+            "고유 로또 회차 3+ / 4+ / 5+ / 2등 / 6개": st.column_config.TextColumn(
+                "고유 로또 회차 3+ / 4+ / 5+ / 2등 / 6개",
                 help="같은 로또 회차가 여러 실험에 포함돼도 한 번만 세어 계산한 횟수입니다.",
             ),
         },

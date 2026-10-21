@@ -856,7 +856,16 @@ def run_research_schedule(
                 dashboard_summary["paired_metrics"].setdefault(model_key, []).append(metrics)
             for key, values in compact_summary["hits"].items():
                 totals = dashboard_summary["hit_totals"].setdefault(
-                    key, {"3_plus": 0, "4_plus": 0, "5_plus": 0, "6_exact": 0}
+                    key,
+                    {
+                        "3_plus": 0,
+                        "4_plus": 0,
+                        "5_plus": 0,
+                        "6_exact": 0,
+                        "2_exact": 0,
+                        "2_known": 0,
+                        "2_unknown": 0,
+                    },
                 )
                 for metric, value in values.items():
                     totals[metric] += int(value)

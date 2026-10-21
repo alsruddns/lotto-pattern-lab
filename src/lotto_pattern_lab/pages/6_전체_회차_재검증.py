@@ -268,13 +268,19 @@ if jobs:
                 st.error(f"작업을 다시 시작하지 못했습니다: {error}")
     if job.get("status") == "completed" and job.get("result_path"):
         summary = job.get("result_summary") or {}
+        second_prize_display = (
+            summary.get("second_prize_exact")
+            if summary.get("second_prize_evaluable_count")
+            else "미수집"
+        )
         st.write(
             f"대상 {summary.get('target_round_count', 0)}회 · "
             f"평가 {summary.get('evaluable_round_count', 0)}회 · "
             f"3개 이상 {summary.get('at_least_3', 0)}회 · "
             f"4개 이상 {summary.get('at_least_4', 0)}회 · "
             f"5개 이상 {summary.get('at_least_5', 0)}회 · "
-            f"6개 {summary.get('at_least_6', 0)}회"
+            f"2등 {second_prize_display}회 · "
+            f"본번호 6개 {summary.get('at_least_6', 0)}회"
         )
         result_path = project_path(job["result_path"])
         if result_path.is_file():
@@ -299,9 +305,11 @@ if jobs:
                 writer.writeheader()
                 writer.writerows(display_rows)
                 threshold_filter = st.selectbox(
-                    "회차 결과 필터", ("전체", "3개 이상", "4개 이상", "5개 이상", "6개")
+                    "회차 결과 필터", ("전체", "3개 이상", "4개 이상", "5개 이상", "2등", "6개")
                 )
-                if threshold_filter != "전체":
+                if threshold_filter == "2등":
+                    display_rows = [row for row in display_rows if row.get("prize_tier") == 2]
+                elif threshold_filter != "전체":
                     minimum_hits = int(threshold_filter[0])
                     display_rows = [
                         row

@@ -32,7 +32,7 @@ from .pattern_library import (
     register_experiment_candidates,
     register_experiment_exact_matches,
 )
-from .prize_evaluation import evaluate_prize_predictions
+from .prize_evaluation import classify_prize_tier, evaluate_prize_predictions
 from .research_features import (
     ResearchFeatureConfig,
     build_research_examples,
@@ -110,6 +110,43 @@ def _search_dict(result: IntermittentSearchResult) -> dict[str, object]:
     }
 
 
+def _annotate_candidate_prizes(
+    candidate: dict[str, object], dataset: DrawDataset, split_rounds: dict[str, set[int]]
+) -> None:
+    draws = {record.round_number: record.draw for record in dataset.records}
+    per_rule: dict[str, dict[str, dict[str, int]]] = {}
+    for event in candidate.get("activation_events", []):
+        if not event.get("active") or len(event.get("predicted_numbers", [])) != 6:
+            continue
+        round_number = int(event["round_number"])
+        draw = draws[round_number]
+        classification = classify_prize_tier(
+            event["predicted_numbers"], tuple(draw.numbers), draw.bonus
+        )
+        event["actual_bonus_number"] = draw.bonus
+        event["prize_tier"] = classification["prize_tier"]
+        event["prize_tier_status"] = classification["prize_tier_status"]
+        rule_key = str(event.get("rule_index", 0))
+        phase = next(
+            (name for name, values in split_rounds.items() if round_number in values), None
+        )
+        if phase is None:
+            continue
+        group = per_rule.setdefault(
+            rule_key,
+            {
+                name: {"hits": 0, "known": 0, "unknown": 0}
+                for name in split_rounds
+            },
+        )[phase]
+        if draw.bonus is None:
+            group["unknown"] += 1
+        else:
+            group["known"] += 1
+            group["hits"] += int(classification["prize_tier"] == 2)
+    candidate["second_prize_by_rule_split"] = per_rule
+
+
 def _splits_for(dataset: DrawDataset, config: IntermittentConfig) -> tuple[tuple, DataSplits]:
     if config.feature_profile == "calendar_round":
         examples = build_research_examples(
@@ -184,12 +221,25 @@ def _state_conditioned_metrics(
 
 
 def _with_state_tags(
-    candidate: IntermittentCandidate, state_by_round: dict[int, str]
+    candidate: IntermittentCandidate,
+    state_by_round: dict[int, str],
+    dataset: DrawDataset,
 ) -> list[dict[str, object]]:
-    return [
-        {**event, "hypothetical_state": state_by_round[int(event["round_number"])]}
-        for event in candidate.activation_events
-    ]
+    draws_by_round = {record.round_number: record.draw for record in dataset.records}
+    rows = []
+    for event in candidate.activation_events:
+        round_number = int(event["round_number"])
+        draw = draws_by_round[round_number]
+        row = {**event, "hypothetical_state": state_by_round[round_number]}
+        if candidate.outputs_per_event == 6 and event.get("active"):
+            tier = classify_prize_tier(
+                event["predicted_numbers"], tuple(draw.numbers), draw.bonus
+            )
+            row["actual_bonus_number"] = draw.bonus
+            row["prize_tier"] = tier["prize_tier"]
+            row["prize_tier_status"] = tier["prize_tier_status"]
+        rows.append(row)
+    return rows
 
 
 def _empirical_p(observed: float, controls: list[float]) -> float | None:
@@ -319,6 +369,14 @@ def run_intermittent_experiment(
     change_points = [row for row in state_rows if row["online_change_point"]]
     one_dict = _search_dict(one_number)
     set_dict = _search_dict(set_model)
+    prize_split_rounds = {
+        "training": {example.round_number for example in splits.train},
+        "validation": {example.round_number for example in splits.validation},
+        "independent_test": {example.round_number for example in splits.test},
+    }
+    for saved_candidate in set_dict["candidates"]:
+        _annotate_candidate_prizes(saved_candidate, dataset, prize_split_rounds)
+    _annotate_candidate_prizes(set_dict["selected"], dataset, prize_split_rounds)
     bonus_dict = _search_dict(bonus_model) if bonus_model else None
     if bonus_dict is not None and bonus_model is not None:
         bonus_dict["elite_seeding_compatibility"] = {
@@ -327,39 +385,42 @@ def run_intermittent_experiment(
             "skipped": bonus_elite_skipped,
         }
     one_dict["selected"]["activation_events"] = _with_state_tags(
-        one_number.selected, state_by_round
+        one_number.selected, state_by_round, dataset
     )
-    set_dict["selected"]["activation_events"] = _with_state_tags(set_model.selected, state_by_round)
-    prize_tier_backtest = None
-    if bonus_model is not None and bonus_dict is not None:
-        bonus_events = {
-            int(event["round_number"]): event
-            for event in bonus_model.selected.activation_events
-            if int(event["round_number"]) in set_model.test_rounds
-        }
-        main_events = {
-            int(event["round_number"]): event
-            for event in set_model.selected.activation_events
-            if int(event["round_number"]) in set_model.test_rounds
-        }
-        prize_tier_backtest = evaluate_prize_predictions(
-            dataset,
-            {
-                round_number: main_events[round_number]["predicted_numbers"]
-                for round_number in set_model.test_rounds
-            },
-            {
-                round_number: (
-                    bonus_events[round_number]["predicted_numbers"][0]
-                    if bonus_events[round_number]["predicted_numbers"]
-                    else None
-                )
-                for round_number in set_model.test_rounds
-            },
-        )
-        prize_tier_backtest["evaluation_kind"] = (
-            "chronological_backtest_not_pre_draw_predictions"
-        )
+    set_dict["selected"]["activation_events"] = _with_state_tags(
+        set_model.selected, state_by_round, dataset
+    )
+    bonus_events = {
+        int(event["round_number"]): event
+        for event in bonus_model.selected.activation_events
+        if int(event["round_number"]) in set_model.test_rounds
+    } if bonus_model is not None else {}
+    main_events = {
+        int(event["round_number"]): event
+        for event in set_model.selected.activation_events
+        if int(event["round_number"]) in set_model.test_rounds
+        and event.get("active")
+        and len(event.get("predicted_numbers", ())) == 6
+    }
+    prize_tier_backtest = evaluate_prize_predictions(
+        dataset,
+        {
+            round_number: event["predicted_numbers"]
+            for round_number, event in main_events.items()
+        },
+        {
+            round_number: (
+                bonus_events[round_number]["predicted_numbers"][0]
+                if round_number in bonus_events and bonus_events[round_number]["predicted_numbers"]
+                else None
+            )
+            for round_number in main_events
+        },
+    )
+    prize_tier_backtest["evaluation_kind"] = (
+        "chronological_backtest_not_pre_draw_predictions"
+    )
+    if bonus_model is not None:
         prize_tier_backtest["bonus_elite_seeding"] = {
             "enabled": config.elite_seeding_enabled,
             "source_pattern_ids": bonus_model.seeding.get("source_pattern_ids", []),

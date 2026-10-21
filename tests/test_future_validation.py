@@ -91,6 +91,40 @@ def test_future_scorecard_separates_official_provisional_and_pending_results() -
     assert row["mean_random_hits_official"] == 3
     assert row["hit_distribution_official"]["5"] == 1
     assert row["validation_status"] == "표본 부족"
+    assert row["second_prize_hits_official"] is None
+    assert row["second_prize_status"] == "미수집"
+
+
+def test_future_scorecard_marks_second_prize_not_applicable_for_single_number_model():
+    frozen = {
+        "freeze_id": "single",
+        "model_type": "one_number",
+        "frozen_at": "2026-01-01T00:00:00+00:00",
+    }
+    row = build_future_scorecard(
+        [
+            {
+                "freeze_id": "single",
+                "recommendation_id": "one",
+                "recommendation_status": "pre_draw_prediction",
+                "target_round": 1300,
+            }
+        ],
+        [
+            {
+                "event_type": "future_result_registered",
+                "payload": {
+                    "recommendation_id": "one",
+                    "result_status": "official_verified",
+                    "actual_bonus": 17,
+                    "prize_tier": None,
+                },
+            }
+        ],
+        [frozen],
+    )[0]
+    assert row["second_prize_hits_official"] is None
+    assert row["second_prize_status"] == "해당 없음"
 def test_frozen_formula_is_immutable_and_hash_checked(tmp_path) -> None:
     frozen = freeze_formula(
         _experiment(),

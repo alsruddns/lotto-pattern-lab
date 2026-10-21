@@ -20,9 +20,10 @@ from .feature_schema import PRIMITIVE_SET_VERSION, feature_mapping
 from .features import build_bonus_examples, build_examples
 from .gp_engine import _make_primitive_set
 from .intermittent import _gate_rule, _predict_numbers, _validate_formula_ast
+from .prize_evaluation import classify_prize_tier
 from .research_features import ResearchFeatureConfig, build_research_examples
 
-REPLAY_VERSION = "formula-full-historical-replay-v1"
+REPLAY_VERSION = "formula-full-historical-replay-v2"
 DEFAULT_START_ROUND = 753
 DEFAULT_END_ROUND = 1246
 _RANDOM_MEAN_HITS_SIX_NUMBERS = 36 / 45
@@ -126,6 +127,9 @@ def replay_formula(
     rows: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     matches: Counter[int] = Counter()
+    second_prize_hits = 0
+    second_prize_known = 0
+    second_prize_unknown = 0
     training_rounds = set((experiment.get(model_key) or {}).get("train_rounds", ()))
     validation_rounds = set((experiment.get(model_key) or {}).get("validation_rounds", ()))
     test_rounds = set((experiment.get(model_key) or {}).get("test_rounds", ()))
@@ -168,6 +172,9 @@ def replay_formula(
                     "winning_numbers": [],
                     "matched_numbers": [],
                     "match_count": None,
+                    "actual_bonus_number": None,
+                    "prize_tier": None,
+                    "prize_tier_status": "판정 불가",
                     "evaluation_segment": _score_segment(round_number, model_rounds),
                     "validation_status": "INPUT_UNAVAILABLE",
                     "reason": "대상 회차 또는 이전 회차 데이터가 스냅샷에 없습니다.",
@@ -191,6 +198,9 @@ def replay_formula(
                     "winning_numbers": sorted(record.draw.numbers),
                     "matched_numbers": [],
                     "match_count": None,
+                    "actual_bonus_number": record.draw.bonus,
+                    "prize_tier": None,
+                    "prize_tier_status": "판정 불가",
                     "evaluation_segment": _score_segment(round_number, model_rounds),
                     "validation_status": "INPUT_UNAVAILABLE",
                     "reason": f"{max_lag}회 lag 입력이 없거나 연속 회차가 아닙니다.",
@@ -219,6 +229,14 @@ def replay_formula(
                 counts["INACTIVE"] += 1
             if rule_index:
                 matches[match_count] += 1
+                tier = classify_prize_tier(predicted, tuple(record.draw.numbers), record.draw.bonus)
+                if record.draw.bonus is None:
+                    second_prize_unknown += 1
+                else:
+                    second_prize_known += 1
+                    second_prize_hits += int(tier["prize_tier"] == 2)
+            else:
+                tier = None
             rows.append(
                 {
                     "round_number": round_number,
@@ -232,6 +250,11 @@ def replay_formula(
                     "winning_numbers": sorted(winning),
                     "matched_numbers": matched,
                     "match_count": match_count,
+                    "actual_bonus_number": record.draw.bonus,
+                    "prize_tier": tier["prize_tier"] if tier is not None else None,
+                    "prize_tier_status": (
+                        tier["prize_tier_status"] if tier is not None else "활성 예측 없음"
+                    ),
                     "evaluation_segment": _score_segment(round_number, model_rounds),
                     "validation_status": status,
                     "reason": None,
@@ -251,6 +274,9 @@ def replay_formula(
                     "winning_numbers": sorted(record.draw.numbers),
                     "matched_numbers": [],
                     "match_count": None,
+                    "actual_bonus_number": record.draw.bonus,
+                    "prize_tier": None,
+                    "prize_tier_status": "판정 불가",
                     "evaluation_segment": _score_segment(round_number, model_rounds),
                     "validation_status": "EXECUTION_ERROR",
                     "reason": f"{type(error).__name__}: {error}",
@@ -267,6 +293,7 @@ def replay_formula(
                 {
                     "round": item.round_number,
                     "numbers": item.draw.numbers,
+                    "bonus": item.draw.bonus,
                     "date": item.draw_date.isoformat() if item.draw_date else None,
                 }
                 for item in dataset.records
@@ -300,6 +327,9 @@ def replay_formula(
         "at_least_4": sum(matches[index] for index in range(4, 7)),
         "at_least_5": sum(matches[index] for index in range(5, 7)),
         "at_least_6": matches[6],
+        "second_prize_exact": second_prize_hits if second_prize_known else None,
+        "second_prize_evaluable_count": second_prize_known,
+        "second_prize_unavailable_count": second_prize_unknown,
         "mean_hits_when_active": (
             sum(index * matches[index] for index in range(7)) / active_predictions
             if active_predictions

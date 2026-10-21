@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import sqlite3
 import statistics
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import interprocess_lock
+from .dataset import load_csv
 from .paths import project_path
 from .presentation import (
     format_count,
@@ -20,10 +24,11 @@ from .presentation import (
     format_probability,
     pretty_formula,
 )
+from .prize_evaluation import classify_prize_tier
 from .sqlite_support import retry_sqlite_operation, run_with_busy_retry
 from .storage import ExperimentStore
 
-SUMMARY_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 3
 
 
 def _read_top_level_fields(path: Path, wanted: set[str]) -> dict[str, Any]:
@@ -569,13 +574,18 @@ def summarize_experiment(
                         if event.get("active")
                         and _event_phase(event, result) == phase
                         and (
+                            event.get("prize_tier") == 2
+                            if threshold == 2
+                            else
                             bool(event.get("full_set_match"))
                             if threshold == 6
                             else int(event.get("hit_count") or 0) >= threshold
                         )
                     }
                 )
-                for threshold in (3, 4, 5, 6)
+                for threshold in (
+                    (2, 3, 4, 5, 6) if short_key == "six_number_set" else (3, 4, 5, 6)
+                )
             }
             for phase in ("training", "validation", "independent_test")
         }
@@ -587,6 +597,36 @@ def summarize_experiment(
                 "5_plus": sum(int(v) for k, v in distribution.items() if int(k) >= 5),
                 "6_exact": int(distribution.get("6", 0) or 0),
             }
+            if short_key == "six_number_set":
+                active_events = [
+                    event
+                    for event in events
+                    if event.get("active") and _event_phase(event, result) == split
+                ]
+                known = [
+                    event
+                    for event in active_events
+                    if event.get("actual_bonus_number") is not None
+                ]
+                output["hits"][key].update(
+                    {
+                        "2_exact": sum(event.get("prize_tier") == 2 for event in known),
+                        "2_known": len(known),
+                        "2_unknown": len(active_events) - len(known),
+                    }
+                )
+    for split, metrics in (result.get("six_number_set_metrics") or {}).items():
+        if not isinstance(metrics, dict):
+            continue
+        output["hits"][f"six_number_set:{split}"] = {
+            "3_plus": int(metrics.get("three_plus", 0) or 0),
+            "4_plus": int(metrics.get("four_plus", 0) or 0),
+            "5_plus": int(metrics.get("five_plus", 0) or 0),
+            "6_exact": int(metrics.get("six_exact", 0) or 0),
+            "2_exact": int(metrics.get("second_prize_exact") or 0),
+            "2_known": int(metrics.get("second_prize_known", 0) or 0),
+            "2_unknown": int(metrics.get("second_prize_unknown", 0) or 0),
+        }
     paired = result.get("paired_unseeded_comparison") or {}
     progress = result.get("progress", [])
     actual_progress_span = _progress_span(progress, "actual_")
@@ -690,7 +730,13 @@ def merge_unique_hit_rounds(
     summary["unique_hit_totals"] = {
         model: {
             phase: {
-                f"{threshold}_plus" if int(threshold) < 6 else "6_exact": len(rounds)
+                (
+                    "2_exact"
+                    if int(threshold) == 2
+                    else f"{threshold}_plus"
+                    if int(threshold) < 6
+                    else "6_exact"
+                ): len(rounds)
                 for threshold, rounds in thresholds.items()
             }
             for phase, thresholds in phases.items()
@@ -771,7 +817,16 @@ def rebuild_dashboard_summary(
             summary["paired_metrics"].setdefault(model, []).append(values)
         for key, values in compact["hits"].items():
             target = summary["hit_totals"].setdefault(
-                key, {"3_plus": 0, "4_plus": 0, "5_plus": 0, "6_exact": 0}
+                key,
+                {
+                    "3_plus": 0,
+                    "4_plus": 0,
+                    "5_plus": 0,
+                    "6_exact": 0,
+                    "2_exact": 0,
+                    "2_known": 0,
+                    "2_unknown": 0,
+                },
             )
             for metric, value in values.items():
                 target[metric] += int(value)
@@ -792,7 +847,13 @@ def rebuild_dashboard_summary(
     summary["unique_hit_totals"] = {
         model: {
             phase: {
-                    f"{threshold}_plus" if int(threshold) < 6 else "6_exact": len(rounds)
+                    (
+                        "2_exact"
+                        if int(threshold) == 2
+                        else f"{threshold}_plus"
+                        if int(threshold) < 6
+                        else "6_exact"
+                    ): len(rounds)
                 for threshold, rounds in thresholds.items()
             }
             for phase, thresholds in phases.items()
@@ -824,6 +885,7 @@ def rebuild_dashboard_summary_from_store(
             experiment = store.load(str(experiment_id), expand_details=True)
         except (OSError, ValueError):
             continue
+        _attach_verified_bonus_outcomes(experiment)
         compact_experiments.append(summarize_experiment(experiment))
     failures = research_record.get("failed_runs", [])
     failed_count = (
@@ -839,6 +901,174 @@ def rebuild_dashboard_summary_from_store(
     )
 
 
+@lru_cache(maxsize=2)
+def _official_bonus_dataset(path: str) -> tuple[str, dict[int, Any]]:
+    dataset = load_csv(path)
+    from .experiment import dataset_metadata
+
+    return dataset_metadata(dataset)["dataset_sha256"], {
+        record.round_number: record.draw for record in dataset.records
+    }
+
+
+def _attach_verified_bonus_outcomes(experiment: dict[str, Any]) -> None:
+    """Add bonus labels only for an exact saved data snapshot and matching main results."""
+    expected_hash = (experiment.get("dataset") or {}).get("dataset_sha256")
+    if not expected_hash:
+        return
+    verified_draws = None
+    for relative in (
+        "data/raw/lotto_draws_753_1246_with_bonus.csv",
+        "data/official/draws.csv",
+    ):
+        path = project_path(relative)
+        if not path.is_file():
+            continue
+        try:
+            data_hash, draws = _official_bonus_dataset(str(path))
+        except (OSError, ValueError):
+            continue
+        if data_hash == expected_hash:
+            verified_draws = draws
+            break
+    if verified_draws is None:
+        return
+    selected = (experiment.get("six_number_set_model") or {}).get("selected") or {}
+    events = selected.get("activation_events")
+    if not isinstance(events, list):
+        return
+    for event in events:
+        if not isinstance(event, dict) or not event.get("active"):
+            continue
+        try:
+            round_number = int(event["round_number"])
+            draw = verified_draws[round_number]
+            prediction = event["predicted_numbers"]
+            if len(prediction) != 6 or set(event.get("winning_numbers", ())) != set(draw.numbers):
+                continue
+            classification = classify_prize_tier(prediction, tuple(draw.numbers), draw.bonus)
+        except (KeyError, TypeError, ValueError):
+            continue
+        event["actual_bonus_number"] = draw.bonus
+        event["prize_tier"] = classification["prize_tier"]
+        event["prize_tier_status"] = classification["prize_tier_status"]
+
+
+def safely_reaggregate_second_prize(
+    research_record: dict[str, Any],
+    experiment_directory: str | Path,
+    database: str | Path = "data/database/patterns.sqlite",
+) -> dict[str, Any]:
+    """Add verified second-prize totals while preserving every existing metric and record."""
+    rebuilt = rebuild_dashboard_summary_from_store(research_record, experiment_directory)
+    database_path = project_path(database)
+    lock_path = project_path("checkpoints/research_global")
+    backup_directory = project_path("data/backups")
+    backup_directory.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_directory / (
+        f"patterns_before_second_prize_{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}_"
+        f"{uuid.uuid4().hex[:8]}.sqlite"
+    )
+
+    with interprocess_lock(lock_path, timeout=0, scope="research-global"):
+        connection = sqlite3.connect(database_path, timeout=30)
+        try:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise RuntimeError(f"연구 DB 사전 무결성 검사 실패: {integrity}")
+            backup = sqlite3.connect(backup_path)
+            try:
+                connection.backup(backup)
+                backup_integrity = backup.execute("PRAGMA integrity_check").fetchone()[0]
+                if backup_integrity != "ok":
+                    raise RuntimeError(f"온라인 백업 무결성 검사 실패: {backup_integrity}")
+            finally:
+                backup.close()
+
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT metadata_json FROM research_rounds WHERE research_id=?",
+                (str(research_record["research_id"]),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"연구 회차가 존재하지 않습니다: {research_record['research_id']}")
+            metadata = json.loads(row[0])
+            original_summary = metadata.get("dashboard_summary")
+            if isinstance(original_summary, str):
+                original_summary = json.loads(original_summary)
+            if not isinstance(original_summary, dict):
+                raise ValueError("기존 dashboard_summary 형식이 올바르지 않아 갱신을 중단했습니다.")
+            old_totals = original_summary.get("hit_totals", {})
+            new_totals = rebuilt.get("hit_totals", {})
+            core_metrics = ("3_plus", "4_plus", "5_plus", "6_exact")
+            for key, old in old_totals.items():
+                if not isinstance(old, dict):
+                    raise ValueError(f"기존 적중 통계 형식이 올바르지 않습니다: {key}")
+                new = new_totals.get(key)
+                core_metrics_changed = new is None or any(
+                    old.get(metric) != new.get(metric) for metric in core_metrics
+                )
+                if core_metrics_changed:
+                    raise ValueError(
+                        f"기존 {key}의 3+/4+/5+/6개 통계와 재구성 값이 달라 "
+                        "기존 집계를 보존하고 갱신을 중단했습니다."
+                    )
+
+            summary = json.loads(json.dumps(original_summary, ensure_ascii=False))
+            totals = summary.setdefault("hit_totals", {})
+            updates = 0
+            for key, values in new_totals.items():
+                if not key.startswith("six_number_set:"):
+                    continue
+                target = totals.setdefault(key, {})
+                for metric in ("2_exact", "2_known", "2_unknown"):
+                    value = values.get(metric)
+                    if value is None:
+                        continue
+                    existing = target.get(metric)
+                    if existing is not None and existing != value:
+                        raise ValueError(
+                            f"기존 {key}.{metric} 값({existing})과 확인된 값({value})이 달라 "
+                            "갱신을 중단했습니다."
+                        )
+                    target[metric] = int(value)
+                has_second_metrics = any(
+                    metric in values for metric in ("2_exact", "2_known", "2_unknown")
+                )
+                updates += int(has_second_metrics)
+            if updates == 0:
+                raise ValueError("저장된 예측 조합에서 추가 판정 가능한 2등 통계가 없습니다.")
+            unique_totals = summary.setdefault("unique_hit_totals", {})
+            for model, phases in rebuilt.get("unique_hit_totals", {}).items():
+                if model != "six_number_set":
+                    continue
+                model_target = unique_totals.setdefault(model, {})
+                for phase, values in phases.items():
+                    if "2_exact" in values:
+                        model_target.setdefault(phase, {})["2_exact"] = values["2_exact"]
+            summary["summary_schema_version"] = SUMMARY_SCHEMA_VERSION
+            summary["second_prize_aggregation_source"] = (
+                "검증된 데이터 해시와 저장 예측 조합을 사용한 추가 집계"
+            )
+            summary["second_prize_reaggregated_at"] = datetime.now(UTC).isoformat()
+            metadata["dashboard_summary"] = summary
+            connection.execute(
+                "UPDATE research_rounds SET metadata_json=? WHERE research_id=?",
+                (
+                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                    str(research_record["research_id"]),
+                ),
+            )
+            connection.commit()
+            after_integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if after_integrity != "ok":
+                raise RuntimeError(f"갱신 후 연구 DB 무결성 검사 실패: {after_integrity}")
+            return {"backup_path": str(backup_path), "summary": summary}
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 def load_round_experiments(
     record: dict[str, Any], experiment_directory: str | Path
 ) -> list[dict[str, Any]]:
@@ -1152,15 +1382,23 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         lines.append(
             f"- {key}: 3+ {format_count(values['3_plus'])}, "
             f"4+ {format_count(values['4_plus'])}, "
-            f"5+ {format_count(values['5_plus'])}, 6개 {format_count(values['6_exact'])}"
+            f"5+ {format_count(values['5_plus'])}, "
+            f"2등 {format_count(values.get('2_exact')) if values.get('2_known') else '미수집'}, "
+            f"본번호 6개 {format_count(values['6_exact'])}"
         )
     lines.append("- 위 적중 횟수는 모델·실험·평가 구간별 활성 예측을 모두 합한 반복 평가 수입니다.")
     for model, phases in summary.get("unique_hit_totals", {}).items():
         for phase, counts in phases.items():
+            second_count = (
+                format_count(counts.get("2_exact"))
+                if counts.get("2_exact") is not None
+                else "미수집"
+            )
             lines.append(
                 f"- 고유 회차 {model}/{phase}: 3+ {format_count(counts.get('3_plus', 0))}, "
                 f"4+ {format_count(counts.get('4_plus', 0))}, "
                 f"5+ {format_count(counts.get('5_plus', 0))}, "
+                f"2등 {second_count}, "
                 f"6개 {format_count(counts.get('6_exact', 0))}"
             )
     lines.append(

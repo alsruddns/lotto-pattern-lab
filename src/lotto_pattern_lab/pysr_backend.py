@@ -28,6 +28,7 @@ from .evaluation_cache import (
 from .feature_schema import feature_mapping, feature_schema_version
 from .features import Example, build_bonus_examples, build_examples
 from .paths import project_path
+from .prize_evaluation import classify_prize_tier
 from .research_features import ResearchFeatureConfig, build_research_examples
 from .storage import ExperimentStore
 
@@ -506,6 +507,7 @@ def run_pysr_experiment(
             progress({"stage": "pysr_target_complete", "target": target_name})
     duration = time.monotonic() - started
     set_metrics: dict[str, Any] = {}
+    draw_by_round = {record.round_number: record.draw for record in dataset.records}
     if config.target == "main_positions":
         for split_name, target_rounds in (
             ("training", splits.train),
@@ -513,6 +515,9 @@ def run_pysr_experiment(
             ("independent_test", splits.test),
         ):
             hit_counts: list[int] = []
+            second_prize_hits = 0
+            second_prize_known = 0
+            second_prize_unknown = 0
             for round_index, example in enumerate(target_rounds):
                 used: set[int] = set()
                 for position in range(1, 7):
@@ -522,6 +527,17 @@ def run_pysr_experiment(
                     )
                     used.add(number)
                 hit_counts.append(len(used & set(example.winning_numbers)))
+                actual_draw = draw_by_round[example.round_number]
+                if actual_draw.bonus is None:
+                    second_prize_unknown += 1
+                else:
+                    second_prize_known += 1
+                    second_prize_hits += int(
+                        classify_prize_tier(used, tuple(actual_draw.numbers), actual_draw.bonus)[
+                            "prize_tier"
+                        ]
+                        == 2
+                    )
             set_metrics[split_name] = {
                 "target_round_count": len(target_rounds),
                 "mean_hits": float(np.mean(hit_counts)) if hit_counts else None,
@@ -529,6 +545,9 @@ def run_pysr_experiment(
                 "four_plus": sum(value >= 4 for value in hit_counts),
                 "five_plus": sum(value >= 5 for value in hit_counts),
                 "six_exact": sum(value == 6 for value in hit_counts),
+                "second_prize_exact": second_prize_hits if second_prize_known else None,
+                "second_prize_known": second_prize_known,
+                "second_prize_unknown": second_prize_unknown,
                 "match_distribution": {
                     str(value): hit_counts.count(value) for value in range(7)
                 },

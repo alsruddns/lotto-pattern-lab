@@ -66,8 +66,42 @@ visible = (
     if status == "전체"
     else [item for item in records if (item.get("status") or "미분류") == status]
 )
+visible_patterns = []
+for item in visible:
+    payload = json.loads(item.get("payload") or "{}")
+    performance = payload.get("second_prize_by_split", {}).get("independent_test", {})
+    model_type = item.get("model_type") or payload.get("model_type")
+    known = int(performance.get("known", 0) or 0)
+    visible_patterns.append(
+        {
+            **{key: value for key, value in item.items() if key != "payload"},
+            "2등 독립 테스트": performance.get("hits") if known else None,
+            "2등 판정 가능 조합": known if performance else None,
+            "2등 통계 상태": (
+                "판정 완료"
+                if known and model_type == "six_number_set"
+                else "미수집"
+                if model_type == "six_number_set"
+                else "해당 없음"
+            ),
+        }
+    )
 st.dataframe(
-    [{key: value for key, value in item.items() if key != "payload"} for item in visible],
+    visible_patterns,
+    column_config={
+        "2등 독립 테스트": st.column_config.NumberColumn(
+            "2등 독립 테스트",
+            help=(
+                "독립 테스트에서 본번호 정확히 5개와 예측 6개 안의 "
+                "실제 보너스가 일치한 횟수입니다."
+            ),
+            format="localized",
+        ),
+        "2등 판정 가능 조합": st.column_config.NumberColumn(
+            "2등 판정 가능 조합", format="localized"
+        ),
+        "2등 통계 상태": st.column_config.TextColumn("2등 통계 상태"),
+    },
     width="stretch",
     hide_index=True,
 )

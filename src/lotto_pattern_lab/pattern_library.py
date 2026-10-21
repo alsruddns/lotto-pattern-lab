@@ -1251,6 +1251,13 @@ def register_experiment_candidates(
                             "test_full_set_matches",
                         )
                     },
+                    "second_prize_by_split": (
+                        candidate.get("second_prize_by_rule_split", {}).get(
+                            str(rule_index + 1), {}
+                        )
+                        if outputs == 6
+                        else None
+                    ),
                     "active_rounds": [
                         int(event["round_number"])
                         for event in candidate.get("activation_events", ())

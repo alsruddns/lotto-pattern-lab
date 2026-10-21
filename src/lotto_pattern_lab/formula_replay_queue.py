@@ -504,7 +504,7 @@ def _execute_job_unlocked(job_id: str, directory: Path) -> None:
                 completed_at=datetime.now(UTC).isoformat(),
                 elapsed_seconds=result["runtime_seconds"],
                 result_summary={
-                    key: result[key]
+                    key: result.get(key)
                     for key in (
                         "target_round_count",
                         "evaluable_round_count",
@@ -515,6 +515,9 @@ def _execute_job_unlocked(job_id: str, directory: Path) -> None:
                         "at_least_4",
                         "at_least_5",
                         "at_least_6",
+                        "second_prize_exact",
+                        "second_prize_evaluable_count",
+                        "second_prize_unavailable_count",
                         "mean_hits_when_active",
                     )
                 },

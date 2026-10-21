@@ -41,6 +41,7 @@ from .gp_engine import (
 )
 from .paths import project_path
 from .pattern_library import pattern_fingerprint
+from .prize_evaluation import classify_prize_tier
 from .research_features import (
     ResearchFeatureConfig,
     build_research_features_for_target,
@@ -718,21 +719,18 @@ def compare_recommendation(
     predicted = set(recommendation["recommended_numbers"])
     random_numbers = set(recommendation["random_baseline"]["numbers"])
     hit_count = len(predicted & actual)
-    bonus_in_prediction = actual_bonus is not None and actual_bonus in predicted
     if recommendation["model_type"] != "six_number_set":
         prize_tier = None
-    elif hit_count == 6:
-        prize_tier = 1
-    elif hit_count == 5 and bonus_in_prediction:
-        prize_tier = 2
-    elif hit_count == 5:
-        prize_tier = 3
-    elif hit_count == 4:
-        prize_tier = 4
-    elif hit_count == 3:
-        prize_tier = 5
+        prize_tier_status = "해당 없음"
     else:
-        prize_tier = None
+        classification = classify_prize_tier(
+            recommendation["recommended_numbers"], tuple(actual_numbers), actual_bonus
+        )
+        prize_tier = classification["prize_tier"]
+        prize_tier_status = classification["prize_tier_status"]
+    bonus_in_prediction = (
+        None if actual_bonus is None else actual_bonus in recommendation["recommended_numbers"]
+    )
     return {
         "recommendation_id": recommendation["recommendation_id"],
         "target_round": recommendation["target_round"],
@@ -743,6 +741,7 @@ def compare_recommendation(
         "ai_hit_count": hit_count,
         "bonus_in_prediction": bonus_in_prediction,
         "prize_tier": prize_tier,
+        "prize_tier_status": prize_tier_status,
         "random_hits": sorted(random_numbers & actual),
         "random_hit_count": len(random_numbers & actual),
         "gate_branch": recommendation["gate_result"]["branch"],
@@ -778,6 +777,8 @@ def summarize_prediction_history(
                 "five_or_more": 0,
                 "six_exact": 0,
                 "second_prize_bonus": 0,
+                "second_prize_bonus_evaluated": 0,
+                "second_prize_bonus_unknown": 0,
                 "highest_hit_count": 0,
                 "recommendation_combinations": 0,
                 "by_gate_branch": {},
@@ -800,8 +801,17 @@ def summarize_prediction_history(
         row["six_exact"] += int(hit_count == 6)
         row["highest_hit_count"] = max(row["highest_hit_count"], hit_count)
         row["recommendation_combinations"] += 1
-        if model_type == "six_number_set" and hit_count == 5 and actual_draw.bonus in predicted:
-            row["second_prize_bonus"] += 1
+        if model_type == "six_number_set":
+            classification = classify_prize_tier(
+                recommendation["recommended_numbers"],
+                actual_draw.numbers,
+                actual_draw.bonus,
+            )
+            if actual_draw.bonus is None:
+                row["second_prize_bonus_unknown"] += 1
+            else:
+                row["second_prize_bonus_evaluated"] += 1
+                row["second_prize_bonus"] += int(classification["prize_tier"] == 2)
         branch = str(recommendation["gate_result"]["branch"])
         branch_summary = row["by_gate_branch"].setdefault(
             branch, {"recommendations": 0, "ai_hits": 0, "actual_draws": 0}
@@ -809,9 +819,19 @@ def summarize_prediction_history(
         branch_summary["recommendations"] += 1
         branch_summary["ai_hits"] += len(hits)
         branch_summary["actual_draws"] += 1
-    for row in summaries.values():
+    for model_type, row in summaries.items():
         row["ai_hit_rate_per_number"] = row["ai_hits"] / max(row["ai_numbers"], 1)
         row["random_hit_rate_per_number"] = row["random_hits"] / max(row["random_numbers"], 1)
+        if model_type != "six_number_set":
+            row["second_prize_bonus"] = None
+            row["second_prize_status"] = "해당 없음"
+        elif row["second_prize_bonus_evaluated"] == 0:
+            row["second_prize_bonus"] = None
+            row["second_prize_status"] = "미수집"
+        elif row["second_prize_bonus_unknown"]:
+            row["second_prize_status"] = "부분 수집"
+        else:
+            row["second_prize_status"] = "판정 완료"
     return summaries
 
 

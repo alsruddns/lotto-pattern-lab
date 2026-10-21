@@ -110,18 +110,21 @@ def evaluate_paired_prize_backtest(
     if set(events) != set(test_rounds):
         raise ValueError("Main model is missing events for part of the shared test range.")
     main_predictions = {
-        round_number: events[round_number]["predicted_numbers"] for round_number in test_rounds
+        round_number: events[round_number]["predicted_numbers"]
+        for round_number in test_rounds
+        if len(events[round_number].get("predicted_numbers", ())) == 6
     }
     bonus_predictions = {}
     for round_number in test_rounds:
         features = build_bonus_features_for_target(
             dataset, int(round_number), int(bonus_experiment["config"]["max_lag"])
         )
-        bonus_predictions[int(round_number)] = evaluate_formula(
-            str(bonus_candidate["formula"]),
-            features,
-            tuple(bonus_experiment["feature_variables"].values()),
-        )["number"]
+        if int(round_number) in main_predictions:
+            bonus_predictions[int(round_number)] = evaluate_formula(
+                str(bonus_candidate["formula"]),
+                features,
+                tuple(bonus_experiment["feature_variables"].values()),
+            )["number"]
     evaluation = evaluate_prize_predictions(dataset, main_predictions, bonus_predictions)
     return {
         **evaluation,
@@ -130,4 +133,7 @@ def evaluate_paired_prize_backtest(
         "bonus_model_experiment_id": bonus_experiment["experiment_id"],
         "main_model_profile": main_experiment["config"].get("feature_profile", "legacy"),
         "bonus_model_profile": "bonus_lag_v1",
+        "requested_test_round_count": len(test_rounds),
+        "active_prediction_round_count": len(main_predictions),
+        "bonus_model_output_used_for_prize_tier": False,
     }
