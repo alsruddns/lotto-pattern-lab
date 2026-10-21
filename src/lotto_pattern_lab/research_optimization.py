@@ -6,6 +6,8 @@ import importlib.util
 import json
 import re
 import sqlite3
+import statistics
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -146,6 +148,33 @@ def list_optimization_studies(
     return sorted(records.values(), key=lambda item: str(item.get("study_name", "")).casefold())
 
 
+def list_optimization_run_states(
+    storage_directory: str | Path = "data/optimizations",
+) -> list[dict[str, Any]]:
+    """Read only the small JSON state files used to identify live optimization workers."""
+    root = project_path(storage_directory)
+    if not root.is_dir():
+        return []
+    records = []
+    for state_path in root.glob("*.state.json"):
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            name = str(state.get("study_name") or state_path.name.removesuffix(".state.json"))
+            records.append(
+                {
+                    **state,
+                    "study_name": name,
+                    "state_path": str(state_path),
+                    "database_path": str(root / f"{_study_slug(name)}.sqlite"),
+                }
+            )
+        except (OSError, ValueError, TypeError):
+            continue
+    return records
+
+
 def optuna_status() -> dict[str, Any]:
     available = importlib.util.find_spec("optuna") is not None
     return {
@@ -226,6 +255,7 @@ def optimize_gp(
     storage_directory: str | Path = "data/optimizations",
     experiment_directory: str | Path = "experiments/optimization_trials",
     progress: Callable[[dict[str, Any]], None] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Run/resume a persisted Optuna study; study best-trial selection uses validation only."""
     if mode not in {"quick", "standard", "deep"}:
@@ -248,6 +278,8 @@ def optimize_gp(
     study_db = storage_root / f"{slug}.sqlite"
     storage_uri = f"sqlite:///{study_db.as_posix()}"
     state_file = storage_root / f"{slug}.state.json"
+    stop_file = Path(f"{state_file}.stop.json")
+    active_run_id = run_id or str(uuid.uuid4())
     if action == "new" and (study_db.exists() or state_file.exists()):
         raise FileExistsError(
             "같은 이름의 최적화 기록이 이미 있습니다. 기존 연구 이어하기를 선택하세요."
@@ -292,26 +324,36 @@ def optimize_gp(
         if mismatched:
             raise ValueError(
                 "기존 Optuna 기록의 엔진·프로파일·데이터 스냅샷과 다릅니다. "
-                "기록을 변경하지 않고 실행을 중단했습니다: "
-                + ", ".join(mismatched)
+                "기록을 변경하지 않고 실행을 중단했습니다: " + ", ".join(mismatched)
             )
     trial_store = ExperimentStore(Path(experiment_directory) / slug)
     started_at = datetime.now(UTC).isoformat()
+    starting_trial_count = len(study.trials)
+    starting_state_counts = _trial_state_counts(study.trials)
 
     def write_state(event: dict[str, Any]) -> None:
+        try:
+            previous = json.loads(state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            previous = {}
+        payload = {**previous, **event}
         atomic_write_bytes(
             state_file,
-            (json.dumps(event, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+            (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
         )
 
     write_state(
         {
             "study_name": slug,
+            "run_id": active_run_id,
             "mode": mode,
             "status": "running",
-            "completed_trials": len(study.trials),
+            "completed_trials": starting_state_counts["complete"],
+            "failed_trials": starting_state_counts["failed"],
+            "pruned_trials": starting_state_counts["pruned"],
             "requested_additional_trials": n_trials,
-            "starting_trial_count": len(study.trials),
+            "starting_trial_count": starting_trial_count,
+            "starting_state_counts": starting_state_counts,
             "study_database": str(study_db),
             "action": action,
             "started_at": started_at,
@@ -320,6 +362,19 @@ def optimize_gp(
     )
 
     def objective(trial: Any) -> float:
+        write_state(
+            {
+                "study_name": slug,
+                "run_id": active_run_id,
+                "status": "running",
+                "current_trial_number": trial.number,
+                "current_trial_started_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
+                "starting_trial_count": starting_trial_count,
+                "requested_additional_trials": n_trials,
+                "study_database": str(study_db),
+            }
+        )
         config = _trial_config(trial, base_config, mode)
         experiment = run_intermittent_experiment(dataset, config, trial_store)
         value, components = validation_objective(experiment)
@@ -329,21 +384,40 @@ def optimize_gp(
         return value
 
     def report(study_state: Any, trial: Any) -> None:
+        state_counts = _trial_state_counts(study_state.trials)
         event = {
             "study_name": slug,
+            "run_id": active_run_id,
             "mode": mode,
-            "completed_trials": len(study_state.trials),
+            "status": "running",
+            "completed_trials": state_counts["complete"],
+            "failed_trials": state_counts["failed"],
+            "pruned_trials": state_counts["pruned"],
+            "starting_trial_count": starting_trial_count,
+            "starting_state_counts": starting_state_counts,
             "requested_additional_trials": n_trials,
             "best_value": study_state.best_value if study_state.best_trial else None,
             "best_trial_number": study_state.best_trial.number if study_state.best_trial else None,
+            "best_parameters": study_state.best_trial.params if study_state.best_trial else {},
             "last_trial_number": trial.number,
             "last_trial_state": str(trial.state),
+            "current_trial_number": None,
+            "current_trial_started_at": None,
             "study_database": str(study_db),
             "updated_at": datetime.now(UTC).isoformat(),
         }
-        write_state({**event, "status": "running"})
         if progress:
             progress(event)
+        stop_requested = _optimization_stop_requested(stop_file, active_run_id)
+        event["status"] = "stopping" if stop_requested else "running"
+        event["stop_requested_at"] = (
+            json.loads(stop_file.read_text(encoding="utf-8")).get("requested_at")
+            if stop_requested
+            else None
+        )
+        write_state(event)
+        if stop_requested:
+            study_state.stop()
 
     try:
         study.optimize(
@@ -355,18 +429,25 @@ def optimize_gp(
             gc_after_trial=True,
         )
     except Exception as error:
+        failed_state_counts = _trial_state_counts(study.trials)
         write_state(
             {
                 "study_name": slug,
+                "run_id": active_run_id,
                 "mode": mode,
                 "status": "failed",
-                "completed_trials": len(study.trials),
+                "completed_trials": failed_state_counts["complete"],
+                "failed_trials": failed_state_counts["failed"],
+                "pruned_trials": failed_state_counts["pruned"],
                 "error_type": type(error).__name__,
                 "error": str(error),
                 "study_database": str(study_db),
                 "finished_at": datetime.now(UTC).isoformat(),
+                "updated_at": datetime.now(UTC).isoformat(),
             }
         )
+        if _optimization_stop_requested(stop_file, active_run_id):
+            stop_file.unlink(missing_ok=True)
         raise
     from optuna.trial import TrialState
 
@@ -375,27 +456,43 @@ def optimize_gp(
     )
     if best_trial is not None:
         best_trial = study.best_trial
-    final_status = "completed" if best_trial is not None else "failed_no_completed_trials"
+    was_stopped = _optimization_stop_requested(stop_file, active_run_id)
+    final_status = (
+        "stopped"
+        if was_stopped
+        else "completed"
+        if best_trial is not None
+        else "failed_no_completed_trials"
+    )
+    final_state_counts = _trial_state_counts(study.trials)
     write_state(
         {
             "study_name": slug,
+            "run_id": active_run_id,
             "mode": mode,
             "status": final_status,
-            "completed_trials": len(study.trials),
+            "completed_trials": final_state_counts["complete"],
+            "failed_trials": final_state_counts["failed"],
+            "pruned_trials": final_state_counts["pruned"],
+            "starting_trial_count": starting_trial_count,
+            "starting_state_counts": starting_state_counts,
+            "requested_additional_trials": n_trials,
             "best_trial_number": best_trial.number if best_trial else None,
             "best_value": best_trial.value if best_trial else None,
             "best_parameters": best_trial.params if best_trial else {},
             "started_at": started_at,
             "finished_at": datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
             "study_database": str(study_db),
         }
     )
+    stop_file.unlink(missing_ok=True)
     return {
         "study_name": slug,
         "status": final_status,
         "mode": mode,
         "database_path": str(study_db),
-        "completed_trial_count": len(study.trials),
+        "completed_trial_count": final_state_counts["complete"],
         "best_trial_number": best_trial.number if best_trial else None,
         "best_value": best_trial.value if best_trial else None,
         "best_parameters": best_trial.params if best_trial else {},
@@ -403,3 +500,159 @@ def optimize_gp(
         "final_test_used_for_selection": False,
         "resume_supported": True,
     }
+
+
+def _trial_state_counts(trials: list[Any]) -> dict[str, int]:
+    counts = {"complete": 0, "failed": 0, "pruned": 0, "running": 0, "waiting": 0}
+    for trial in trials:
+        state = str(trial.state).split(".")[-1].casefold()
+        if state in counts:
+            counts[state] += 1
+    return counts
+
+
+def _optimization_stop_requested(path: Path, run_id: str) -> bool:
+    try:
+        request = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, TypeError):
+        return False
+    return request.get("run_id") == run_id
+
+
+def request_optimization_stop(state_path: str | Path, *, run_id: str) -> Path:
+    """Request a safe stop after the current trial reaches its boundary."""
+    state_file = Path(state_path)
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("최적화 상태를 읽을 수 없어 중지를 요청하지 못했습니다.") from error
+    if state.get("run_id") != run_id or state.get("status") not in {"running", "stopping"}:
+        raise RuntimeError("해당 최적화 실행이 더 이상 진행 중이지 않습니다.")
+    stop_file = Path(f"{state_file}.stop.json")
+    request = {"run_id": run_id, "requested_at": datetime.now(UTC).isoformat()}
+    atomic_write_bytes(stop_file, (json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+    state.update(status="stopping", stop_requested_at=request["requested_at"])
+    atomic_write_bytes(
+        state_file,
+        (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
+    return stop_file
+
+
+def format_optimization_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "산출 불가"
+    days, remainder = divmod(max(0, seconds), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{days * 24 + hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def estimate_optimization_remaining_seconds(
+    remaining_trials: int,
+    mean_trial_seconds: float | None,
+    sampled_trial_durations: int,
+    current_trial_elapsed_seconds: int = 0,
+) -> int | None:
+    if remaining_trials <= 0:
+        return 0
+    if mean_trial_seconds is None or sampled_trial_durations < 2:
+        return None
+    return max(
+        0,
+        int(remaining_trials * mean_trial_seconds) - max(0, current_trial_elapsed_seconds),
+    )
+
+
+def optimization_monitor_snapshot(
+    record: dict[str, Any], *, recent_limit: int = 20
+) -> dict[str, Any]:
+    """Read compact trial progress and recent results from an Optuna SQLite study."""
+    database = Path(str(record.get("database_path", "")))
+    if not database.is_file():
+        return {"available": False, "trials": [], "counts": {}}
+    try:
+        uri = database.resolve().as_uri() + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+            connection.row_factory = sqlite3.Row
+            study_row = connection.execute(
+                "SELECT study_id FROM studies WHERE study_name=?", (record["study_name"],)
+            ).fetchone()
+            if study_row is None:
+                return {"available": False, "trials": [], "counts": {}}
+            study_id = int(study_row["study_id"])
+            rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM trials WHERE study_id=? GROUP BY state",
+                (study_id,),
+            ).fetchall()
+            counts = {str(row["state"]).casefold(): int(row["count"]) for row in rows}
+            trials = connection.execute(
+                """SELECT t.trial_id, t.number, t.state, t.datetime_start, t.datetime_complete,
+                          tv.value
+                   FROM trials t LEFT JOIN trial_values tv
+                     ON tv.trial_id=t.trial_id AND tv.objective=0
+                   WHERE t.study_id=? ORDER BY t.number DESC LIMIT ?""",
+                (study_id, max(1, min(100, recent_limit))),
+            ).fetchall()
+            results = []
+            for row in trials:
+                params = connection.execute(
+                    "SELECT param_name, param_value FROM trial_params "
+                    "WHERE trial_id=? ORDER BY param_name",
+                    (row["trial_id"],),
+                ).fetchall()
+                system_attrs = connection.execute(
+                    "SELECT key, value_json FROM trial_system_attributes WHERE trial_id=?",
+                    (row["trial_id"],),
+                ).fetchall()
+                failure_reason = None
+                for attribute in system_attrs:
+                    if str(attribute["key"]).casefold() in {"fail_reason", "failure_reason"}:
+                        try:
+                            failure_reason = json.loads(attribute["value_json"])
+                        except (TypeError, ValueError):
+                            failure_reason = attribute["value_json"]
+                        break
+                started, finished = row["datetime_start"], row["datetime_complete"]
+                duration = None
+                if started and finished:
+                    try:
+                        duration = max(
+                            0.0,
+                            (
+                                datetime.fromisoformat(finished) - datetime.fromisoformat(started)
+                            ).total_seconds(),
+                        )
+                    except ValueError:
+                        pass
+                results.append(
+                    {
+                        "number": int(row["number"]),
+                        "state": str(row["state"]),
+                        "started_at": started,
+                        "finished_at": finished,
+                        "duration_seconds": duration,
+                        "value": float(row["value"]) if row["value"] is not None else None,
+                        "failure_reason": failure_reason,
+                        "parameters": {
+                            str(parameter["param_name"]): float(parameter["param_value"])
+                            for parameter in params
+                        },
+                    }
+                )
+            durations = [
+                item["duration_seconds"]
+                for item in results
+                if item["state"] == "COMPLETE" and item["duration_seconds"] is not None
+            ]
+            return {
+                "available": True,
+                "counts": counts,
+                "trials": results,
+                "mean_trial_seconds": statistics.mean(durations) if len(durations) >= 2 else None,
+                "sampled_trial_durations": len(durations),
+            }
+    except (OSError, sqlite3.Error):
+        return {"available": False, "trials": [], "counts": {}}

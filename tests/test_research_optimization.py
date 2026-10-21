@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 import lotto_pattern_lab.research_optimization as optimization
@@ -14,6 +16,14 @@ class _Trial:
 
     def suggest_float(self, name, low, high):
         return (low + high) / 2
+
+
+def test_optimization_duration_and_eta_require_real_samples() -> None:
+    assert optimization.format_optimization_duration(5 * 3600 + 7) == "05:00:07"
+    assert optimization.format_optimization_duration(26 * 3600 + 3) == "26:00:03"
+    assert optimization.estimate_optimization_remaining_seconds(4, 30.0, 1) is None
+    assert optimization.estimate_optimization_remaining_seconds(4, 30.0, 2, 15) == 105
+    assert optimization.estimate_optimization_remaining_seconds(0, None, 0) == 0
 
 
 def test_quick_optimizer_trials_use_bounded_configs_and_disable_nested_controls() -> None:
@@ -186,9 +196,7 @@ def test_new_optuna_study_records_exact_dataset_snapshot_and_resume_is_immutable
         experiment_directory=tmp_path / "experiments",
     )
     record = optimization.list_optimization_studies(tmp_path)[0]
-    assert record["dataset_snapshot_sha256"] == dataset_hashes(dataset)[
-        "bonus_inclusive_sha256"
-    ]
+    assert record["dataset_snapshot_sha256"] == dataset_hashes(dataset)["bonus_inclusive_sha256"]
     assert record["dataset_hash_algorithm"] == dataset_hashes(dataset)["algorithm_version"]
 
     database = tmp_path / "snapshot-study.sqlite"
@@ -206,3 +214,62 @@ def test_new_optuna_study_records_exact_dataset_snapshot_and_resume_is_immutable
             experiment_directory=tmp_path / "experiments",
         )
     assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+
+
+def test_optimization_stop_is_safe_and_persisted_study_can_resume(tmp_path, monkeypatch) -> None:
+    import json
+
+    from lotto_pattern_lab.dataset import make_random_dataset
+
+    monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
+    selected = {
+        "training_score": 0.2,
+        "validation_score": 0.1,
+        "independent_test_score": None,
+        "complexity": 3,
+    }
+    monkeypatch.setattr(
+        optimization,
+        "run_intermittent_experiment",
+        lambda *_args, **_kwargs: {
+            "experiment_id": "mock-experiment",
+            "runtime_seconds": 0.01,
+            "one_number_model": {"selected": selected},
+            "six_number_set_model": {"selected": selected},
+        },
+    )
+    state_path = tmp_path / "safe-stop.state.json"
+    run_id = "test-run-1"
+
+    def request_after_first_trial(_event):
+        if not state_path.exists():
+            return
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("status") == "running":
+            optimization.request_optimization_stop(state_path, run_id=run_id)
+
+    result = optimization.optimize_gp(
+        make_random_dataset(30, seed=41),
+        IntermittentConfig(population_size=8, generations=1, max_depth=2, workers=1),
+        study_name="safe-stop",
+        mode="quick",
+        action="new",
+        n_trials=4,
+        storage_directory=tmp_path,
+        experiment_directory=tmp_path / "experiments",
+        progress=request_after_first_trial,
+        run_id=run_id,
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert result["status"] == "stopped"
+    assert state["status"] == "stopped"
+    assert state["run_id"] == run_id
+    assert state["completed_trials"] == 1
+    assert not Path(f"{state_path}.stop.json").exists()
+    snapshot = optimization.optimization_monitor_snapshot(
+        {"study_name": "safe-stop", "database_path": str(tmp_path / "safe-stop.sqlite")}
+    )
+    assert snapshot["available"] is True
+    assert snapshot["counts"]["complete"] == 1
+    assert snapshot["trials"][0]["number"] == 0

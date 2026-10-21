@@ -69,7 +69,8 @@ visible = (
 visible_patterns = []
 for item in visible:
     payload = json.loads(item.get("payload") or "{}")
-    performance = payload.get("second_prize_by_split", {}).get("independent_test", {})
+    second_prize = payload.get("second_prize_by_split") or {}
+    performance = second_prize.get("independent_test") or {}
     model_type = item.get("model_type") or payload.get("model_type")
     known = int(performance.get("known", 0) or 0)
     visible_patterns.append(
@@ -92,8 +93,7 @@ st.dataframe(
         "2등 독립 테스트": st.column_config.NumberColumn(
             "2등 독립 테스트",
             help=(
-                "독립 테스트에서 본번호 정확히 5개와 예측 6개 안의 "
-                "실제 보너스가 일치한 횟수입니다."
+                "독립 테스트에서 본번호 정확히 5개와 예측 6개 안의 실제 보너스가 일치한 횟수입니다."
             ),
             format="localized",
         ),
@@ -148,9 +148,7 @@ except (SyntaxError, ValueError, TypeError) as error:
     st.error(f"수식 구조를 비교하지 못했습니다: {error}")
 if similarity:
     group_by_id = {
-        member_id: group
-        for group in similarity["groups"]
-        for member_id in group["member_ids"]
+        member_id: group for group in similarity["groups"] for member_id in group["member_ids"]
     }
     pair_by_id = {}
     for pair in similarity["pairwise"]:
@@ -162,9 +160,7 @@ if similarity:
         group = group_by_id[pattern_id]
         pairs = pair_by_id.get(pattern_id, [])
         exact = any(item["exact_duplicate"] for item in pairs)
-        structural = any(
-            item["structural_similarity"] >= similarity_threshold for item in pairs
-        )
+        structural = any(item["structural_similarity"] >= similarity_threshold for item in pairs)
         output_similar = any(
             item.get("output_similarity") is not None
             and item["output_similarity"] >= similarity_threshold
@@ -235,14 +231,12 @@ with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as lineage_connec
     ]
 if lineage_rows:
     st.caption(
-        "저장된 부모·자식 연결만 표시합니다. "
-        "연결이 없는 과거 공식의 계보는 미확인 상태입니다."
+        "저장된 부모·자식 연결만 표시합니다. 연결이 없는 과거 공식의 계보는 미확인 상태입니다."
     )
     st.dataframe(lineage_rows, hide_index=True, width="stretch")
 else:
     st.info(
-        "확인된 공식 계보 기록이 없습니다. "
-        "계보 정보가 없는 과거 기록은 임의로 연결하지 않습니다."
+        "확인된 공식 계보 기록이 없습니다. 계보 정보가 없는 과거 기록은 임의로 연결하지 않습니다."
     )
 selected_id = st.selectbox("공식 상세 보기", [item["pattern_id"] for item in visible])
 selected = next(item for item in visible if item["pattern_id"] == selected_id)
@@ -374,8 +368,10 @@ with st.expander("실험 후보에서 단순화 버전 만들기", expanded=Fals
         else:
             st.info("선택한 실험에 6개 집합 GP 후보가 없습니다.")
 
-saved_simplifications = sorted(
-    project_path("data/formula_simplifications").glob("*.json")
-) if project_path("data/formula_simplifications").is_dir() else []
+saved_simplifications = (
+    sorted(project_path("data/formula_simplifications").glob("*.json"))
+    if project_path("data/formula_simplifications").is_dir()
+    else []
+)
 if saved_simplifications:
     st.caption(f"동등성 검증된 별도 단순화 버전: {len(saved_simplifications)}개")

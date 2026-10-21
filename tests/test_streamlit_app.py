@@ -93,6 +93,8 @@ def test_optimization_tab_shows_history_and_separates_new_and_resume() -> None:
         (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
     )
     app = AppTest.from_file(page).run(timeout=60)
+    app.session_state["research_workspace_tab"] = app.tabs[-4].label
+    app.run(timeout=60)
 
     assert not app.exception, [exception.message for exception in app.exception]
     labels = [tab.label for tab in app.tabs]

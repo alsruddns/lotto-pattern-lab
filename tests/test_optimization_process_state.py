@@ -30,11 +30,13 @@ def test_optuna_worker_start_persists_only_explicit_json_safe_fields(tmp_path) -
         tmp_path / "study.log",
         output,
         study_name="study-a",
+        run_id="run-a",
     )
 
     loaded = json.loads(output.read_text(encoding="utf-8"))
     assert state.pid == 48123
     assert loaded["study_name"] == "study-a"
+    assert loaded["run_id"] == "run-a"
     assert loaded["pid"] == 48123
     assert loaded["command"] == command
     assert datetime.fromisoformat(loaded["started_at"]).tzinfo == UTC

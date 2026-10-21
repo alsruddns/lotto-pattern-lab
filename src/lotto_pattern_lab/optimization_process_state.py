@@ -20,6 +20,7 @@ class OptimizationProcessState:
     pid: int
     started_at: str
     command: tuple[str, ...]
+    run_id: str | None = None
 
     @classmethod
     def from_process(
@@ -28,6 +29,7 @@ class OptimizationProcessState:
         *,
         study_name: str,
         command: list[str],
+        run_id: str | None = None,
         started_at: datetime | None = None,
     ) -> OptimizationProcessState:
         pid = process.pid
@@ -41,6 +43,7 @@ class OptimizationProcessState:
             pid=pid,
             started_at=timestamp.astimezone(UTC).isoformat(),
             command=tuple(str(part) for part in command),
+            run_id=run_id,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -53,6 +56,7 @@ def write_optimization_process_state(
     *,
     study_name: str,
     command: list[str],
+    run_id: str | None = None,
     started_at: datetime | None = None,
 ) -> OptimizationProcessState:
     """Persist only a JSON-safe DTO while keeping ``process`` runtime-only."""
@@ -60,11 +64,10 @@ def write_optimization_process_state(
         process,
         study_name=study_name,
         command=command,
+        run_id=run_id,
         started_at=started_at,
     )
-    payload = (json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n").encode(
-        "utf-8"
-    )
+    payload = (json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     atomic_write_bytes(Path(path), payload)
     return state
 
@@ -77,6 +80,7 @@ def launch_optimization_worker(
     process_record_path: str | Path,
     *,
     study_name: str,
+    run_id: str | None = None,
 ) -> OptimizationProcessState:
     """Start an optimization worker and persist its JSON-safe launch record."""
     process = launcher(command, Path(checkpoint_path), Path(log_path))
@@ -85,4 +89,5 @@ def launch_optimization_worker(
         process_record_path,
         study_name=study_name,
         command=command,
+        run_id=run_id,
     )

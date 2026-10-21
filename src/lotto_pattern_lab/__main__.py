@@ -4,9 +4,9 @@ import argparse
 import json
 import re
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 
-from .atomic_io import interprocess_lock
+from .atomic_io import LockTimeoutError, atomic_write_bytes, interprocess_lock
 from .dataset import load_csv, make_random_dataset, save_official_csv
 from .draw import Draw
 from .experiment import run_experiment
@@ -217,6 +217,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
         elite_seeding_enabled=args.elite_seeding,
         elite_seed_ratio=args.elite_seed_ratio,
     )
+
     def report(event: dict[str, object]) -> None:
         print(
             f"[{event['run']}] 세대 {event['generation']}/{event['generations']} "
@@ -256,9 +257,7 @@ def _run_research_cli(argv: list[str]) -> None:
         "--stop", action="store_true", help="request a stop at the next trial boundary"
     )
     parser.add_argument("--max-runs", type=int)
-    parser.add_argument(
-        "--candidate-replay-threshold", type=int, choices=(3, 4, 5, 6), default=5
-    )
+    parser.add_argument("--candidate-replay-threshold", type=int, choices=(3, 4, 5, 6), default=5)
     parser.add_argument("--engine", action="append", choices=SUPPORTED_ENGINES)
     parser.add_argument(
         "--feature-profile",
@@ -373,9 +372,7 @@ def _run_research_cli(argv: list[str]) -> None:
         engines=tuple(args.engine or DEFAULT_ENGINES),
         research_mode=args.research_mode,
         optimization_origin=json.loads(args.optimization_origin_json),
-        pysr_config=pysr_config
-        if "pysr_symbolic_regression" in (args.engine or ())
-        else None,
+        pysr_config=pysr_config if "pysr_symbolic_regression" in (args.engine or ()) else None,
         candidate_replay_threshold=args.candidate_replay_threshold,
         progress=report,
     )
@@ -388,10 +385,9 @@ def _run_optimization_cli(argv: list[str]) -> None:
     )
     parser.add_argument("--csv", required=True)
     parser.add_argument("--study-name", required=True)
+    parser.add_argument("--run-id")
     parser.add_argument("--mode", choices=("quick", "standard", "deep"), default="standard")
-    parser.add_argument(
-        "--action", choices=("new", "resume", "add_trials"), default="resume"
-    )
+    parser.add_argument("--action", choices=("new", "resume", "add_trials"), default="resume")
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--timeout-seconds", type=float)
     parser.add_argument("--population", type=int, default=GP_DEFAULTS.population_size)
@@ -421,20 +417,42 @@ def _run_optimization_cli(argv: list[str]) -> None:
     storage_root.mkdir(parents=True, exist_ok=True)
     study_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.study_name).strip(".-")[:80]
     state_path = storage_root / f"{study_slug}.state.json"
-    with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
-        with interprocess_lock(state_path, scope="research-worker"):
-            result = optimize_gp(
-                dataset,
-                config,
-                study_name=args.study_name,
-                mode=args.mode,
-                action=args.action,
-                n_trials=args.trials,
-                timeout_seconds=args.timeout_seconds,
-                storage_directory=args.storage_directory,
-                experiment_directory=args.experiment_directory,
-                progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
-            )
+    try:
+        with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
+            with interprocess_lock(state_path, scope="research-worker"):
+                result = optimize_gp(
+                    dataset,
+                    config,
+                    study_name=args.study_name,
+                    mode=args.mode,
+                    action=args.action,
+                    n_trials=args.trials,
+                    timeout_seconds=args.timeout_seconds,
+                    storage_directory=args.storage_directory,
+                    experiment_directory=args.experiment_directory,
+                    progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
+                    run_id=args.run_id,
+                )
+    except LockTimeoutError as error:
+        # A competing project worker owns the shared CPU slot. Record a precise
+        # launch failure only if this study does not already have a live worker.
+        try:
+            with interprocess_lock(state_path, timeout=0, scope="research-worker"):
+                payload = {
+                    "study_name": study_slug,
+                    "run_id": args.run_id,
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                    "finished_at": datetime.now(UTC).isoformat(),
+                }
+                atomic_write_bytes(
+                    state_path,
+                    (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+                )
+        except LockTimeoutError:
+            pass
+        raise
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

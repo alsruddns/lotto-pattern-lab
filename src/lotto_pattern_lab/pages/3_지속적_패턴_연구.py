@@ -10,6 +10,7 @@ import runpy
 import sqlite3
 import subprocess
 import sys
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,15 @@ import streamlit as st
 from lotto_pattern_lab.optimization_process_state import launch_optimization_worker
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
 from lotto_pattern_lab.research import research_worker_active
-from lotto_pattern_lab.research_optimization import list_optimization_studies, optuna_status
+from lotto_pattern_lab.research_optimization import (
+    estimate_optimization_remaining_seconds,
+    format_optimization_duration,
+    list_optimization_run_states,
+    list_optimization_studies,
+    optimization_monitor_snapshot,
+    optuna_status,
+    request_optimization_stop,
+)
 from lotto_pattern_lab.research_optimization_apply import (
     OPTUNA_TO_RESEARCH_KEYS,
     validate_optimization_compatibility,
@@ -114,12 +123,24 @@ def render_optimization() -> None:
     status = optuna_status()
     records = list_optimization_studies()
 
-    @st.fragment(run_every="5s")
+    monitor_states = list_optimization_run_states()
+    monitor_refresh = st.session_state.get("optimization_monitor_start_pending", False) or any(
+        _worker_active(
+            Path(
+                item.get("state_path")
+                or project_path(f"data/optimizations/{item['study_name']}.state.json")
+            )
+        )
+        for item in monitor_states
+    )
+
+    @st.fragment(run_every="5s" if monitor_refresh else None)
     def optimization_monitor() -> None:
+        fresh_records = list_optimization_run_states()
         active = next(
             (
                 item
-                for item in records
+                for item in fresh_records
                 if _worker_active(
                     Path(
                         item.get("state_path")
@@ -129,79 +150,282 @@ def render_optimization() -> None:
             ),
             None,
         )
+        labels = {
+            "running": "최적화 진행 중",
+            "stopping": "중지 요청 중 · 현재 Trial 종료 대기",
+            "completed": "최적화 완료",
+            "stopped": "안전하게 중지됨",
+            "failed": "최적화 실패",
+            "failed_no_completed_trials": "완료 Trial 없음",
+        }
         if active:
+            st.session_state["optimization_monitor_was_active"] = True
+            if st.session_state.get("optimization_monitor_pending_run_id") == active.get("run_id"):
+                st.session_state.pop("optimization_monitor_start_pending", None)
+                st.session_state.pop("optimization_monitor_pending_since", None)
+                st.session_state.pop("optimization_monitor_pending_run_id", None)
             state_path = Path(
                 active.get("state_path")
                 or project_path(f"data/optimizations/{active['study_name']}.state.json")
             )
-            process_path = Path(f"{state_path}.process.json")
-            process_info = {}
             try:
-                process_info = json.loads(process_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
-            fresh = next(
-                (
-                    row
-                    for row in list_optimization_studies()
-                    if row["study_name"] == active["study_name"]
-                ),
-                active,
-            )
-            started = process_info.get("started_at") or fresh.get("started_at")
-            elapsed = "기록 없음"
-            if started:
+                process_info = json.loads(
+                    Path(f"{state_path}.process.json").read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError, TypeError):
+                process_info = {}
+            state = active
+            run_id = state.get("run_id")
+            status_value = str(state.get("status", "preparing"))
+            started_at = process_info.get("started_at") or state.get("started_at")
+            elapsed_seconds = None
+            if started_at:
                 try:
-                    elapsed = format_duration(
-                        max(
-                            0,
-                            int(
-                                (
-                                    datetime.now(UTC) - datetime.fromisoformat(started)
-                                ).total_seconds()
-                            ),
-                        )
+                    elapsed_seconds = max(
+                        0,
+                        int(
+                            (datetime.now(UTC) - datetime.fromisoformat(started_at)).total_seconds()
+                        ),
                     )
                 except (TypeError, ValueError):
                     pass
-            target_trials = int(fresh.get("starting_trial_count", 0)) + int(
-                fresh.get("requested_additional_trials", 0)
+            snapshot = optimization_monitor_snapshot(active, recent_limit=20)
+            counts = snapshot.get("counts", {})
+            complete_total = int(counts.get("complete", state.get("completed_trials", 0)) or 0)
+            failed_total = int(counts.get("fail", state.get("failed_trials", 0)) or 0)
+            pruned_total = int(counts.get("pruned", state.get("pruned_trials", 0)) or 0)
+            running_trial = next(
+                (trial for trial in snapshot.get("trials", []) if trial["state"] == "RUNNING"), None
             )
-            st.info("자동 최적화 실행 중 · 5초마다 상태를 확인합니다.")
-            cols = st.columns(6)
-            cols[0].metric("연구 이름", fresh["study_name"])
-            cols[1].metric("PID", process_info.get("pid", "확인 중"))
-            cols[2].metric(
-                "완료 Trial", f"{fresh.get('completed_trials', 0):,} / {target_trials:,}"
+            start_count = int(state.get("starting_trial_count", 0) or 0)
+            prior = state.get("starting_state_counts") or {}
+            current_run_complete = max(0, complete_total - int(prior.get("complete", 0) or 0))
+            requested = int(state.get("requested_additional_trials", 0) or 0)
+            terminal_in_run = max(
+                0,
+                sum(int(counts.get(key, 0) or 0) for key in ("complete", "fail", "pruned"))
+                - sum(int(prior.get(key, 0) or 0) for key in ("complete", "failed", "pruned")),
             )
-            cols[3].metric("최고 Trial", fresh.get("best_trial_number", "—"))
-            cols[4].metric("최고 내부 평가 점수", _display_score(fresh.get("best_value")))
-            cols[5].metric("경과 시간", elapsed)
-            if fresh.get("last_trial_number") is not None:
+            remaining_trials = max(0, requested - terminal_in_run)
+            mean_trial_seconds = snapshot.get("mean_trial_seconds")
+            running_elapsed_seconds = 0
+            if running_trial and running_trial.get("started_at"):
+                try:
+                    trial_started = datetime.fromisoformat(running_trial["started_at"])
+                    if trial_started.tzinfo is None:
+                        trial_started = trial_started.replace(tzinfo=UTC)
+                    running_elapsed_seconds = max(
+                        0, int((datetime.now(UTC) - trial_started).total_seconds())
+                    )
+                except (TypeError, ValueError):
+                    running_elapsed_seconds = 0
+            eta_seconds = estimate_optimization_remaining_seconds(
+                remaining_trials,
+                mean_trial_seconds,
+                int(snapshot.get("sampled_trial_durations", 0)),
+                running_elapsed_seconds,
+            )
+            st.markdown("### 자동 최적화 실시간 현황")
+            display_status = labels.get(status_value, "실행 준비 또는 상태 확인 중")
+            st.info(f"**{display_status}** · Study {active['study_name']}")
+            cols = st.columns(5)
+            cols[0].metric("실행 ID", str(run_id or "확인 중")[:12])
+            cols[1].metric("워커 PID", process_info.get("pid", "확인 중"))
+            cols[2].metric("목표 Trial", f"{requested:,}")
+            cols[3].metric("이번 실행 완료", f"{current_run_complete:,} / {requested:,}")
+            cols[4].metric("경과 시간", format_optimization_duration(elapsed_seconds))
+            progress = min(1.0, current_run_complete / requested) if requested else 0.0
+            st.progress(
+                progress,
+                text=f"Trial 처리 진행률 {progress:.0%} · 과거 Study 전체 Trial {start_count:,}개",
+            )
+            failed_this_run = max(0, failed_total - int(prior.get("failed", 0) or 0))
+            pruned_this_run = max(0, pruned_total - int(prior.get("pruned", 0) or 0))
+            st.caption(
+                f"이번 실행 완료 {current_run_complete:,} · 실패 {failed_this_run:,} · "
+                f"가지치기 {pruned_this_run:,}"
+            )
+            trial_cols = st.columns(5)
+            trial_cols[0].metric("현재 Trial", running_trial["number"] if running_trial else "대기")
+            trial_cols[1].metric("완료", f"{complete_total:,}")
+            trial_cols[2].metric("실패", f"{failed_total:,}")
+            trial_cols[3].metric("가지치기", f"{pruned_total:,}")
+            trial_cols[4].metric(
+                "예상 남은 시간",
+                format_optimization_duration(eta_seconds) if eta_seconds is not None else "예측 중",
+            )
+            if running_trial and running_trial.get("started_at"):
                 st.caption(
-                    f"마지막 처리 Trial: {fresh['last_trial_number']} · "
-                    f"상태: {fresh.get('last_trial_state', '확인 중')}"
+                    f"현재 Trial #{running_trial['number']} 경과: "
+                    f"{format_optimization_duration(running_elapsed_seconds)}"
                 )
-            log_path = project_path(f"logs/{fresh['study_name']}_optimization.log")
+            if eta_seconds is not None and started_at:
+                from datetime import timedelta
+
+                eta_at = datetime.now(UTC) + timedelta(seconds=eta_seconds)
+                st.caption(
+                    f"예상 종료 시각: {eta_at.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}"
+                )
+            st.caption(
+                f"마지막 상태 갱신: {state.get('updated_at') or '기록 대기'} · "
+                "Objective는 내부 검증 점수이며 당첨 확률이 아닙니다."
+            )
+            if state.get("best_value") is not None:
+                st.metric("현재 최고 Objective 점수", f"{float(state['best_value']):.6f}")
+                st.caption(
+                    f"최고 Trial #{state.get('best_trial_number', '—')} · "
+                    f"최적 파라미터: {state.get('best_parameters') or 'Study 조회 중'}"
+                )
+            if snapshot.get("available") and snapshot.get("trials"):
+                rows = []
+                for trial in reversed(snapshot["trials"]):
+                    rows.append(
+                        {
+                            "Trial": trial["number"],
+                            "상태": trial["state"],
+                            "시작": trial.get("started_at"),
+                            "종료": trial.get("finished_at"),
+                            "소요 시간(초)": trial.get("duration_seconds"),
+                            "Objective": trial.get("value"),
+                            "실패 사유": trial.get("failure_reason"),
+                            "주요 GP 파라미터": ", ".join(
+                                f"{key}={value:g}"
+                                for key, value in trial.get("parameters", {}).items()
+                            ),
+                        }
+                    )
+                st.dataframe(rows, hide_index=True, use_container_width=True)
+                scores = [
+                    {"Trial": trial["number"], "Objective": trial["value"]}
+                    for trial in reversed(snapshot["trials"])
+                    if trial["state"] == "COMPLETE" and trial.get("value") is not None
+                ]
+                if scores:
+                    st.line_chart(scores, x="Trial", y="Objective")
+            elif not snapshot.get("available"):
+                st.caption("Optuna Study를 읽을 수 없습니다. 워커 로그와 상태 파일을 확인하세요.")
+            log_path = project_path(f"logs/{active['study_name']}_optimization.log")
             if log_path.is_file():
                 try:
                     st.code(
                         "\n".join(
                             log_path.read_text(encoding="utf-8", errors="replace").splitlines()[
-                                -18:
+                                -12:
                             ]
                         ),
                         language="text",
                     )
                 except OSError:
-                    st.caption("실행 로그를 읽지 못했습니다.")
+                    st.caption("최적화 로그를 읽지 못했습니다.")
+            if status_value in {"running", "stopping"} and run_id:
+                if status_value == "running" and st.button(
+                    "최적화 중지", key="optimization_stop_request"
+                ):
+                    st.session_state["optimization_stop_confirm"] = True
+                if st.session_state.get("optimization_stop_confirm"):
+                    st.warning("현재 Trial을 마친 뒤 새 Trial을 시작하지 않고 안전하게 중지합니다.")
+                    left, right = st.columns(2)
+                    if left.button("중지 요청 확인", key="confirm_optimization_stop"):
+                        try:
+                            request_optimization_stop(state_path, run_id=str(run_id))
+                            st.session_state["optimization_stop_confirm"] = False
+                            st.success("안전한 중지 요청을 전달했습니다.")
+                        except RuntimeError as error:
+                            st.error(str(error))
+                    if right.button("계속 실행", key="cancel_optimization_stop"):
+                        st.session_state["optimization_stop_confirm"] = False
         else:
-            st.caption("현재 실행 중인 자동 최적화가 없습니다.")
+            if st.session_state.pop("optimization_monitor_was_active", False):
+                st.session_state.pop("optimization_monitor_start_pending", None)
+                st.session_state.pop("optimization_monitor_pending_since", None)
+                st.rerun()
+            if st.session_state.get("optimization_monitor_start_pending"):
+                pending_study = st.session_state.get("optimization_monitor_pending_study")
+                pending_record = next(
+                    (item for item in fresh_records if item["study_name"] == pending_study),
+                    None,
+                )
+                if pending_record and pending_record.get("status") in {
+                    "failed",
+                    "failed_no_completed_trials",
+                    "completed",
+                    "stopped",
+                }:
+                    st.session_state.pop("optimization_monitor_start_pending", None)
+                    st.session_state.pop("optimization_monitor_pending_since", None)
+                    st.session_state.pop("optimization_monitor_pending_run_id", None)
+                    st.session_state.pop("optimization_monitor_pending_study", None)
+                    st.rerun()
+                pending_since = st.session_state.get("optimization_monitor_pending_since")
+                if pending_since and (datetime.now(UTC) - pending_since).total_seconds() > 120:
+                    st.session_state.pop("optimization_monitor_start_pending", None)
+                    st.session_state.pop("optimization_monitor_pending_since", None)
+                    st.session_state.pop("optimization_monitor_pending_run_id", None)
+                    st.session_state.pop("optimization_monitor_pending_study", None)
+                    st.rerun()
+                st.info("최적화 워커 실행을 확인 중이며 전역 CPU 실행 슬롯을 검사하고 있습니다.")
+            stale = next(
+                (
+                    item
+                    for item in fresh_records
+                    if item.get("status") in {"running", "stopping"}
+                    and not _worker_active(
+                        Path(
+                            item.get("state_path")
+                            or project_path(f"data/optimizations/{item['study_name']}.state.json")
+                        )
+                    )
+                ),
+                None,
+            )
+            if stale:
+                st.warning(
+                    f"Study {stale['study_name']} 상태 파일은 {stale.get('status')}이지만 "
+                    "실행 잠금이 없습니다. 워커가 종료됐거나 시작에 실패했을 수 있습니다. "
+                    "상태를 완료로 추정하지 않았으며 로그를 확인해 주세요."
+                )
+                stale_snapshot = optimization_monitor_snapshot(stale, recent_limit=5)
+                unfinished = int(stale_snapshot.get("counts", {}).get("running", 0) or 0)
+                if unfinished:
+                    st.caption(
+                        f"Optuna DB에 RUNNING 상태로 남은 Trial {unfinished}개가 있습니다. "
+                        "워커 잠금은 해제됐지만 해당 Trial 완료 여부는 확정하지 않았습니다."
+                    )
+            elif research_worker_active() and not st.session_state.get(
+                "optimization_monitor_start_pending"
+            ):
+                st.warning(
+                    _execution_conflict(fresh_records)
+                    or "다른 작업이 공용 연구 실행 자원을 사용 중입니다."
+                )
+            else:
+                terminal = next(
+                    (
+                        item
+                        for item in sorted(
+                            fresh_records,
+                            key=lambda row: str(row.get("updated_at", row.get("finished_at", ""))),
+                            reverse=True,
+                        )
+                        if item.get("status")
+                        in {"completed", "stopped", "failed", "failed_no_completed_trials"}
+                    ),
+                    None,
+                )
+                if terminal:
+                    st.info(
+                        f"최근 실행: {terminal['study_name']} · "
+                        f"{labels.get(terminal.get('status'), terminal.get('status'))} · "
+                        f"완료 Trial {int(terminal.get('completed_trials', 0) or 0):,}"
+                    )
+                    if terminal.get("error"):
+                        st.error(str(terminal["error"]))
+                else:
+                    st.caption("현재 자동 최적화 실행은 없습니다.")
 
     def _display_score(value: Any) -> str:
         return "기록 없음" if value is None else f"{float(value):.6f}"
 
-    optimization_monitor()
     if not status["available"]:
         st.warning(
             "Optuna 선택 기능이 설치되지 않았습니다. "
@@ -411,18 +635,10 @@ def render_optimization() -> None:
                 profile = selected.get("feature_profile")
                 normalized, compatibility_error = validate_optimization_compatibility(
                     selected,
-                    current_engines=tuple(
-                        st.session_state.get("research_current_engine_ids", ())
-                    ),
-                    current_dataset_range=st.session_state.get(
-                        "research_current_dataset_range"
-                    ),
-                    dataset_integrity=st.session_state.get(
-                        "research_current_dataset_integrity"
-                    ),
-                    current_dataset_sha256=st.session_state.get(
-                        "research_current_dataset_sha256"
-                    ),
+                    current_engines=tuple(st.session_state.get("research_current_engine_ids", ())),
+                    current_dataset_range=st.session_state.get("research_current_dataset_range"),
+                    dataset_integrity=st.session_state.get("research_current_dataset_integrity"),
+                    current_dataset_sha256=st.session_state.get("research_current_dataset_sha256"),
                 )
                 if (
                     selected.get("status") != "completed"
@@ -465,9 +681,7 @@ def render_optimization() -> None:
                         )
                         == selected_name
                     ):
-                        st.warning(
-                            "최종 확인 후 적용됩니다. 연구는 자동으로 시작하지 않습니다."
-                        )
+                        st.warning("최종 확인 후 적용됩니다. 연구는 자동으로 시작하지 않습니다.")
                         if st.button("설정 적용 확인", key="confirm_optimization_apply"):
                             still_compatible, apply_error = validate_optimization_compatibility(
                                 selected,
@@ -486,8 +700,7 @@ def render_optimization() -> None:
                             )
                             if apply_error or still_compatible != normalized:
                                 st.session_state["optimization_apply_failure"] = (
-                                    apply_error
-                                    or "확인 단계에서 최고 Trial의 값이 달라졌습니다."
+                                    apply_error or "확인 단계에서 최고 Trial의 값이 달라졌습니다."
                                 )
                             else:
                                 current_settings = dict(
@@ -526,6 +739,8 @@ def render_optimization() -> None:
             else:
                 st.info("최적 파라미터가 저장되지 않았거나 SQLite 데이터베이스를 읽을 수 없습니다.")
 
+    optimization_monitor()
+
 
 def _display_score(value: Any) -> str:
     return "기록 없음" if value is None else f"{float(value):.6f}"
@@ -541,7 +756,9 @@ def _status_label(record: dict[str, Any]) -> str:
         return "실행 중"
     labels = {
         "completed": "완료",
+        "stopped": "안전 중지",
         "failed": "실패",
+        "preparing": "실행 준비 중",
         "failed_no_completed_trials": "완료 Trial 없음",
         "running": "중단 또는 상태 확인 필요",
         "state_unreadable": "상태 파일 손상",
@@ -562,6 +779,39 @@ def _any_optimization_active(records: list[dict[str, Any]]) -> bool:
         )
         for row in records
     )
+
+
+def _execution_conflict(records: list[dict[str, Any]]) -> str | None:
+    for record in records:
+        state_path = Path(
+            record.get("state_path")
+            or project_path(f"data/optimizations/{record['study_name']}.state.json")
+        )
+        if _worker_active(state_path):
+            return (
+                f"현재 연구조건 자동 최적화 {record['study_name']} (실행 ID "
+                f"{record.get('run_id', '확인 중')})가 CPU 실행 슬롯을 사용 중입니다."
+            )
+    if not research_worker_active():
+        return None
+    for checkpoint in project_path("checkpoints").rglob("research*.json"):
+        try:
+            state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if state.get("status") not in {"running", "pause_requested"}:
+            continue
+        if not _worker_active(checkpoint):
+            continue
+        research_id = state.get("research_id", "확인 중")
+        started_at = state.get("started_at", "시각 미기록")
+        job_type = "예약 연구" if "research_queue" in str(checkpoint) else "일반 연구"
+        return (
+            f"현재 {job_type} (연구 ID {research_id}, 시작 {started_at})가 "
+            "CPU 실행 슬롯을 사용 중입니다. "
+            "실행 종료 후 자동 최적화를 시작해 주세요."
+        )
+    return "다른 연구 워커 또는 예약 작업이 공용 CPU 실행 슬롯을 사용 중입니다."
 
 
 def _start_optimization(
@@ -588,6 +838,7 @@ def _start_optimization(
             "기존 연구 이어하기 탭을 사용하세요. 자료는 변경하지 않았습니다."
         )
         return
+    started = False
     try:
         from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
 
@@ -597,8 +848,10 @@ def _start_optimization(
             raise ValueError("선택한 데이터에 보너스 번호가 없습니다.")
         if profile == "calendar_round" and not integrity["all_draws_dated"]:
             raise ValueError("선택한 데이터에 추첨일이 없습니다.")
-        if _any_optimization_active(records):
-            raise RuntimeError("다른 연구 또는 최적화 작업이 실행 중입니다.")
+        conflict = _execution_conflict(records)
+        if conflict:
+            raise RuntimeError(conflict)
+        run_id = str(uuid.uuid4())
         command = [
             sys.executable,
             "-m",
@@ -610,6 +863,8 @@ def _start_optimization(
             str(data_path.resolve()),
             "--study-name",
             slug,
+            "--run-id",
+            run_id,
             "--mode",
             mode,
             "--trials",
@@ -631,13 +886,21 @@ def _start_optimization(
                 project_path(f"logs/{slug}_optimization.log"),
                 project_path(f"data/optimizations/{slug}.state.json.process.json"),
                 study_name=slug,
+                run_id=run_id,
             )
             pid = process_state.pid
             st.write(f"실행 상태를 확인했습니다. PID {pid}")
             status_box.update(label="자동 최적화 실행 중", state="complete", expanded=False)
         st.success(f"자동 최적화를 시작했습니다: {slug}")
+        st.session_state["optimization_monitor_start_pending"] = True
+        st.session_state["optimization_monitor_pending_since"] = datetime.now(UTC)
+        st.session_state["optimization_monitor_pending_run_id"] = run_id
+        st.session_state["optimization_monitor_pending_study"] = slug
+        started = True
     except Exception as error:
         st.error(f"최적화 실행 준비 실패: {error}")
+    if started:
+        st.rerun()
 
 
 def _start_existing_optimization(
@@ -674,6 +937,7 @@ def _start_existing_optimization(
     if selected is None:
         st.error("저장된 데이터 범위와 일치하는 파일이 없어 실행하지 않았습니다.")
         return
+    run_id = str(uuid.uuid4())
     command = [
         sys.executable,
         "-m",
@@ -685,6 +949,8 @@ def _start_existing_optimization(
         str(selected.resolve()),
         "--study-name",
         record["study_name"],
+        "--run-id",
+        run_id,
         "--mode",
         record.get("mode", "standard"),
         "--trials",
@@ -694,9 +960,11 @@ def _start_existing_optimization(
         "--feature-profile",
         profile,
     ]
+    started = False
     try:
-        if _any_optimization_active(list_optimization_studies()):
-            raise RuntimeError("다른 연구 또는 최적화 작업이 실행 중입니다.")
+        conflict = _execution_conflict(list_optimization_studies())
+        if conflict:
+            raise RuntimeError(conflict)
         with st.status(
             "기존 Optuna 연구를 확인하고 이어서 실행합니다", expanded=True
         ) as status_box:
@@ -706,16 +974,22 @@ def _start_existing_optimization(
                 command,
                 project_path(f"data/optimizations/{record['study_name']}.state.json"),
                 project_path(f"logs/{record['study_name']}_optimization.log"),
-                project_path(
-                    f"data/optimizations/{record['study_name']}.state.json.process.json"
-                ),
+                project_path(f"data/optimizations/{record['study_name']}.state.json.process.json"),
                 study_name=record["study_name"],
+                run_id=run_id,
             )
             pid = process_state.pid
             status_box.update(label="기존 연구 이어서 실행 중", state="complete", expanded=False)
         st.success(f"기존 연구를 실행했습니다. PID {pid}")
+        st.session_state["optimization_monitor_start_pending"] = True
+        st.session_state["optimization_monitor_pending_since"] = datetime.now(UTC)
+        st.session_state["optimization_monitor_pending_run_id"] = run_id
+        st.session_state["optimization_monitor_pending_study"] = record["study_name"]
+        started = True
     except Exception as error:
         st.error(f"기존 연구를 시작하지 못했습니다: {error}")
+    if started:
+        st.rerun()
 
 
 with optimization_tab:
