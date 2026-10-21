@@ -287,6 +287,7 @@ def render_optimization() -> None:
                             "종료": trial.get("finished_at"),
                             "소요 시간(초)": trial.get("duration_seconds"),
                             "Objective": trial.get("value"),
+                            "현재 최고 기록": trial["number"] == state.get("best_trial_number"),
                             "실패 사유": trial.get("failure_reason"),
                             "주요 GP 파라미터": ", ".join(
                                 f"{key}={value:g}"
