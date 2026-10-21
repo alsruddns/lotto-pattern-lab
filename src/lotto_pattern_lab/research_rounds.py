@@ -416,6 +416,26 @@ class ResearchRoundStore:
             ).fetchall()
         return [self._decode(row) for row in rows]
 
+    def list_overview(self) -> list[dict[str, Any]]:
+        """Read live round status and aggregates without per-experiment detail arrays."""
+        connection = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, timeout=0.25)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            rows = connection.execute(
+                """SELECT round_number,research_id,created_at,
+                          json_remove(metadata_json,
+                            '$.dashboard_summary.experiment_summaries',
+                            '$.dashboard_summary.paired_metrics',
+                            '$.dashboard_summary.unique_hit_round_sets',
+                            '$.dashboard_summary.unique_hit_totals',
+                            '$.dashboard_summary.p_value_distributions') AS metadata_json
+                   FROM research_rounds ORDER BY round_number DESC"""
+            ).fetchall()
+        finally:
+            connection.close()
+        return [self._decode(row) for row in rows]
+
     def experiment_ids(self, research_id: str) -> list[str]:
         with self._connect() as connection:
             rows = connection.execute(

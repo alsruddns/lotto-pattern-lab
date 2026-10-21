@@ -84,6 +84,47 @@ def test_concurrent_research_round_registration_has_unique_numbers(tmp_path) -> 
     assert {item["research_id"] for item in registry.list()} == set(ids)
 
 
+def test_round_overview_omits_experiment_details_without_writing(tmp_path) -> None:
+    database = tmp_path / "patterns.sqlite"
+    registry = ResearchRoundStore(database)
+    checkpoints = tmp_path / "checkpoints"
+    experiments = tmp_path / "experiments"
+    checkpoints.mkdir()
+    experiments.mkdir()
+    registry.ensure_round(
+        "overview-round",
+        {
+            "status": "completed",
+            "completed_experiment_ids": ["experiment-1"],
+            "dashboard_summary": {
+                "summary_schema_version": 3,
+                "completed_experiment_count": 1,
+                "failed_experiment_count": 0,
+                "hit_totals": {"six_number_set:independent_test": {"4_plus": 2}},
+                "experiment_summaries": [
+                    {"experiment_id": "experiment-1", "payload": "x" * 10000}
+                ],
+                "model_metrics": {
+                    "six_number_set": [{"independent_test_score": 0.1}]
+                },
+            },
+        },
+        checkpoints,
+        experiments,
+    )
+    before = registry.get("overview-round")
+
+    overview = registry.list_overview()
+
+    assert len(overview) == 1
+    summary = overview[0]["dashboard_summary"]
+    assert summary["completed_experiment_count"] == 1
+    assert summary["hit_totals"]["six_number_set:independent_test"]["4_plus"] == 2
+    assert "experiment_summaries" not in summary
+    assert summary["model_metrics"]["six_number_set"][0]["independent_test_score"] == 0.1
+    assert registry.get("overview-round") == before
+
+
 def test_legacy_experiment_metadata_scan_does_not_load_detail_payload(tmp_path) -> None:
     experiment_dir = tmp_path / "experiments"
     experiment_dir.mkdir()

@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -19,6 +20,12 @@ from lotto_pattern_lab.formula_replay_queue import (
     resume_replay_job,
 )
 from lotto_pattern_lab.paths import project_path
+from lotto_pattern_lab.revalidation_catalog import (
+    build_experiment_catalog,
+    experiment_choice_label,
+    filter_experiment_catalog,
+    sort_experiment_catalog,
+)
 from lotto_pattern_lab.storage import ExperimentStore
 from lotto_pattern_lab.temporal_analysis import analyze_temporal_performance
 
@@ -44,19 +51,187 @@ st.caption(
 )
 
 experiments_directory = project_path("experiments")
-experiment_paths = sorted(
-    experiments_directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True
-)
-if not experiment_paths:
-    st.info("저장된 실험이 없습니다.")
+research_database = project_path("data/database/patterns.sqlite")
+
+LABEL = {
+    "refresh": "\uc2e4\ud5d8 \ubaa9\ub85d \uc0c8\ub85c\uace0\uce68",
+    "all": "\uc804\uccb4",
+    "engine": "\ud0d0\uc0c9 \uc5d4\uc9c4",
+    "profile": "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
+    "validation": "\uac80\uc99d \uc0c1\ud0dc",
+    "independent": "\ub3c5\ub9bd \ud14c\uc2a4\ud2b8",
+    "has_result": "\uacb0\uacfc \uc788\uc74c",
+    "missing": "\ubbf8\uc218\uc9d1",
+    "date_range": "\uc5f0\uad6c \ub0a0\uc9dc \ubc94\uc704",
+    "use_date_filter": "\ub0a0\uc9dc \ubc94\uc704 \ud544\ud130 \uc801\uc6a9",
+    "sort": "\uc815\ub82c",
+    "recent": "\ucd5c\uadfc \uc5f0\uad6c\uc21c",
+    "rate4": "\ub3c5\ub9bd \ud14c\uc2a4\ud2b8 4\uac1c+ \ube44\uc728",
+    "rate5": "\ub3c5\ub9bd \ud14c\uc2a4\ud2b8 5\uac1c+ \ube44\uc728",
+    "rate2": "2\ub4f1 \ube44\uc728",
+    "rate6": "6\uac1c \uc644\uc804 \uc77c\uce58 \ube44\uc728",
+    "random_p": "\ubb34\uc791\uc704 \ube44\uad50 p\uac12 \ub0ae\uc740 \uc21c",
+    "no_matches": (
+        "\uc120\ud0dd\ud55c \ud544\ud130\uc5d0 \ub9de\ub294 "
+        "\uc2e4\ud5d8\uc774 \uc5c6\uc2b5\ub2c8\ub2e4.",
+    ),
+    "no_experiments": (
+        "\uc7ac\uac80\uc99d\ud560 \uc218 \uc788\ub294 "
+        "\uc800\uc7a5 \uc2e4\ud5d8\uc774 \uc5c6\uc2b5\ub2c8\ub2e4.",
+    ),
+}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def _cached_experiment_catalog(database: str, directory: str) -> list[dict]:
+    return build_experiment_catalog(database, directory)
+
+
+if st.button(LABEL["refresh"], key="refresh_revalidation_catalog"):
+    _cached_experiment_catalog.clear()
+try:
+    catalog = _cached_experiment_catalog(str(research_database), str(experiments_directory))
+except (OSError, ValueError, sqlite3.Error) as error:
+    st.error(
+        f"\uc2e4\ud5d8 \ubaa9\ub85d\uc744 \uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4: {error}"
+    )
+    st.stop()
+if not catalog:
+    st.info(LABEL["no_experiments"])
     st.stop()
 
+engine_values = sorted({str(item["engine"]) for item in catalog if item.get("engine")})
+profile_values = sorted(
+    {str(item["feature_profile"]) for item in catalog if item.get("feature_profile")}
+)
+validation_values = sorted(
+    {str(item["validation_status"]) for item in catalog if item.get("validation_status")}
+)
+filter_cols = st.columns(4)
+engine_filter = filter_cols[0].selectbox(LABEL["engine"], [LABEL["all"], *engine_values])
+profile_filter = filter_cols[1].selectbox(LABEL["profile"], [LABEL["all"], *profile_values])
+validation_filter = filter_cols[2].selectbox(
+    LABEL["validation"], [LABEL["all"], *validation_values]
+)
+independent_filter = filter_cols[3].selectbox(
+    LABEL["independent"], [LABEL["all"], LABEL["has_result"], LABEL["missing"]]
+)
+hit_filter = st.selectbox(
+    "\uc801\uc911 \uc218\uc900",
+    [
+        LABEL["all"],
+        "3\uac1c \uc774\uc0c1 \uae30\ub85d",
+        "4\uac1c \uc774\uc0c1 \uae30\ub85d",
+        "5\uac1c \uc774\uc0c1 \uae30\ub85d",
+        "2\ub4f1 \uae30\ub85d",
+        "6\uac1c \uc644\uc804 \uc77c\uce58",
+    ],
+)
+
+available_dates = sorted(
+    str(item["research_date"]) for item in catalog if item.get("research_date")
+)
+if available_dates and st.checkbox(LABEL["use_date_filter"], value=False):
+    from datetime import date
+
+    date_range = st.date_input(
+        LABEL["date_range"],
+        value=(date.fromisoformat(available_dates[0]), date.fromisoformat(available_dates[-1])),
+        key="revalidation_research_date_range",
+    )
+else:
+    date_range = ()
+
+sort_options = [LABEL[key] for key in ("recent", "rate4", "rate5", "rate2", "rate6", "random_p")]
+sort_label = st.selectbox(LABEL["sort"], sort_options)
+sort_keys = {
+    LABEL["recent"]: ("research_date", True),
+    LABEL["rate4"]: ("rate_4_plus", True),
+    LABEL["rate5"]: ("rate_5_plus", True),
+    LABEL["rate2"]: ("second_prize_rate", True),
+    LABEL["rate6"]: ("rate_6_exact", True),
+    LABEL["random_p"]: ("random_comparison_p", False),
+}
+hit_key = {
+    "3\uac1c \uc774\uc0c1 \uae30\ub85d": "hits_3_plus",
+    "4\uac1c \uc774\uc0c1 \uae30\ub85d": "hits_4_plus",
+    "5\uac1c \uc774\uc0c1 \uae30\ub85d": "hits_5_plus",
+    "2\ub4f1 \uae30\ub85d": "second_prize",
+    "6\uac1c \uc644\uc804 \uc77c\uce58": "hits_6_exact",
+}.get(hit_filter)
+if date_range and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date = end_date = None
+filtered = filter_experiment_catalog(
+    catalog,
+    engine=engine_filter if engine_filter != LABEL["all"] else None,
+    feature_profile=profile_filter if profile_filter != LABEL["all"] else None,
+    validation_status=validation_filter if validation_filter != LABEL["all"] else None,
+    independent_test=True
+    if independent_filter == LABEL["has_result"]
+    else False
+    if independent_filter == LABEL["missing"]
+    else None,
+    hit_key=hit_key,
+    start_date=start_date,
+    end_date=end_date,
+)
+sort_key, descending = sort_keys[sort_label]
+filtered = sort_experiment_catalog(filtered, key=sort_key, descending=descending)
+if not filtered:
+    st.info(LABEL["no_matches"])
+    st.stop()
+
+selected_by_id = {item["experiment_id"]: item for item in filtered}
+selected_experiment_id = st.selectbox(
+    "\uc6d0\ubcf8 \uc2e4\ud5d8",
+    list(selected_by_id),
+    format_func=lambda experiment_id: experiment_choice_label(selected_by_id[experiment_id]),
+    key="revalidation_source_experiment_id",
+)
+source_summary = selected_by_id[selected_experiment_id]
+st.dataframe(
+    [
+        {
+            "\uc5f0\uad6c ID": source_summary.get("research_id") or "\uc815\ubcf4 \uc5c6\uc74c",
+            "\uc5f0\uad6c \ud68c\ucc28": source_summary.get("research_round"),
+            "\ud0d0\uc0c9 \uc5d4\uc9c4": source_summary.get("engine"),
+            "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c": source_summary.get("feature_profile"),
+            "\uc2e4\ud589 \uc0c1\ud0dc": source_summary.get("status"),
+            "\uac80\uc99d \uc0c1\ud0dc": source_summary.get("validation_status"),
+            "\ud3c9\uac00 \uc870\ud569 \uc218": source_summary.get("evaluation_count"),
+            "3\uac1c+": source_summary.get("hits_3_plus"),
+            "4\uac1c+": source_summary.get("hits_4_plus"),
+            "5\uac1c+": source_summary.get("hits_5_plus"),
+            "2\ub4f1": source_summary.get("second_prize"),
+            "2\ub4f1 \ud310\uc815 \uac00\ub2a5 \uc870\ud569": source_summary.get(
+                "second_prize_known"
+            ),
+            "6\uac1c \uc644\uc804 \uc77c\uce58": source_summary.get("hits_6_exact"),
+            "4\uac1c+ 독립 비율": source_summary.get("rate_4_plus"),
+            "5\uac1c+ 독립 비율": source_summary.get("rate_5_plus"),
+            "2등 판정 비율": source_summary.get("second_prize_rate"),
+            "6개 독립 비율": source_summary.get("rate_6_exact"),
+            "\ub3c5\ub9bd \ud14c\uc2a4\ud2b8 \uc810\uc218": source_summary.get(
+                "independent_test_score"
+            ),
+            "\ubb34\uc791\uc704 \ube44\uad50 p\uac12": source_summary.get("random_comparison_p"),
+        }
+    ],
+    hide_index=True,
+    width="stretch",
+)
+st.caption(f"\uc2e4\ud5d8 ID: {selected_experiment_id}")
+
 store = ExperimentStore(experiments_directory)
-selected_path = st.selectbox("원본 실험", experiment_paths, format_func=lambda path: path.stem)
 try:
-    experiment = store.load(selected_path.stem)
+    experiment = store.load(selected_experiment_id)
 except (OSError, ValueError, KeyError) as error:
-    st.error(f"실험 기록을 읽지 못했습니다: {error}")
+    st.error(
+        f"\uc120\ud0dd\ud55c \uc2e4\ud5d8 \uc0c1\uc138\ub97c "
+        f"\uc77d\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4: {error}"
+    )
     st.stop()
 
 model = experiment.get("six_number_set_model") or {}
@@ -325,9 +500,7 @@ if jobs:
                         help="각 점은 선택한 수의 연속 평가 회차를 요약합니다.",
                         key=f"temporal-window:{job['job_id']}",
                     )
-                    temporal = analyze_temporal_performance(
-                        rows, window_size=int(window_size)
-                    )
+                    temporal = analyze_temporal_performance(rows, window_size=int(window_size))
                     st.caption(
                         f"평가 가능 {temporal['evaluable_round_count']}회 · "
                         f"구간 {temporal['window_count']}개 · "

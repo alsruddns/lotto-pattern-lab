@@ -158,13 +158,17 @@ def _feature_rows(formulas: list[str], profile: str, max_lag: int) -> list[dict[
     return rows
 
 
+@st.cache_resource
+def _pattern_library() -> PatternLibrary:
+    return PatternLibrary()
+
+
 checkpoint_directory = project_path("checkpoints")
 experiment_directory = project_path("experiments")
 try:
     rounds_store = ResearchRoundStore()
-    pattern_library = PatternLibrary()
     rounds_store.migrate_legacy(checkpoint_directory, experiment_directory)
-    rounds = rounds_store.list()
+    rounds = rounds_store.list_overview()
 except sqlite3.OperationalError as error:
     _stop_on_database_error("research_dashboard_initialization", error)
 
@@ -185,10 +189,9 @@ def _second_prize_total(summary: dict) -> tuple[int | None, str]:
     known = sum(int(value.get("2_known", 0) or 0) for value in groups.values())
     unknown = sum(int(value.get("2_unknown", 0) or 0) for value in groups.values())
     if known == 0:
-        if (
-            int(summary.get("summary_schema_version", 0) or 0) < SUMMARY_SCHEMA_VERSION
-            and summary.get("completed_experiment_count", 0)
-        ):
+        if int(
+            summary.get("summary_schema_version", 0) or 0
+        ) < SUMMARY_SCHEMA_VERSION and summary.get("completed_experiment_count", 0):
             return None, "재집계 필요"
         return None, "미수집" if unknown == 0 else "판정 불가"
     hits = sum(int(value.get("2_exact", 0) or 0) for value in groups.values())
@@ -227,13 +230,19 @@ def _summary_count(summary: dict, key: str, fallback: object = None) -> object:
 
 
 def hydrate_round(
-    record: dict, *, reaggregate: bool = False, library: PatternLibrary = pattern_library
+    record: dict,
+    *,
+    reaggregate: bool = False,
+    load_checkpoint_data: bool = True,
+    include_pattern_counts: bool = True,
+    library: PatternLibrary | None = None,
 ) -> dict:
     hydrated = dict(record)
     checkpoint_path = record.get("checkpoint_path")
     resolved_checkpoint = project_path(checkpoint_path) if checkpoint_path else None
     if (
-        resolved_checkpoint
+        load_checkpoint_data
+        and resolved_checkpoint
         and resolved_checkpoint.is_relative_to(PROJECT_ROOT)
         and resolved_checkpoint.is_file()
     ):
@@ -274,25 +283,27 @@ def hydrate_round(
             rebuilt_summary = rebuild_dashboard_summary_from_store(hydrated, experiment_directory)
         summary, summary_diagnostic = normalize_dashboard_summary(rebuilt_summary)
         hydrated["dashboard_summary"] = summary
-    try:
-        raw_pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
-    except sqlite3.OperationalError as error:
-        _stop_on_database_error("research_pattern_count_lookup", error)
-    pattern_counts, pattern_count_diagnostic = validated_pattern_counts(raw_pattern_counts)
-    if pattern_counts is not None:
-        summary.update(pattern_counts)
-        summary["registration_metrics_available"] = True
-        summary["registration_count_source"] = "pattern_library"
-    else:
-        summary["registration_metrics_available"] = False
-        summary["registration_diagnostic"] = pattern_count_diagnostic
+    if include_pattern_counts:
+        library = library or _pattern_library()
+        try:
+            raw_pattern_counts = library.research_pattern_counts(str(hydrated["research_id"]))
+        except sqlite3.OperationalError as error:
+            _stop_on_database_error("research_pattern_count_lookup", error)
+        pattern_counts, pattern_count_diagnostic = validated_pattern_counts(raw_pattern_counts)
+        if pattern_counts is not None:
+            summary.update(pattern_counts)
+            summary["registration_metrics_available"] = True
+            summary["registration_count_source"] = "pattern_library"
+        else:
+            summary["registration_metrics_available"] = False
+            summary["registration_diagnostic"] = pattern_count_diagnostic
     summary["aggregation_status"] = research_aggregation_status(
         hydrated, summary, summary_diagnostic
     )
     if summary_diagnostic:
         summary["summary_state"] = "pending_or_invalid"
         summary["summary_diagnostic"] = summary_diagnostic
-    elif pattern_counts is not None:
+    elif include_pattern_counts and pattern_counts is not None:
         summary["summary_state"] = "available"
     else:
         summary["summary_state"] = "available"
@@ -311,7 +322,10 @@ def hydrate_round(
 if not rounds:
     st.info("기록된 연구 회차가 없습니다. 지속적 패턴 연구를 시작하면 회차가 생성됩니다.")
 else:
-    rounds = [hydrate_round(item) for item in rounds]
+    rounds = [
+        hydrate_round(item, load_checkpoint_data=False, include_pattern_counts=False)
+        for item in rounds
+    ]
     list_rows = []
     for item in rounds:
         summary = item.get("dashboard_summary", {})
@@ -410,93 +424,160 @@ else:
         width="stretch",
     )
 
-    growth = cumulative_growth_summary(rounds)
-    st.divider()
-    st.subheader("누적 연구 성장 분석")
-    st.caption(growth["growth_claim"])
-    growth_first = st.columns(5)
-    growth_first[0].metric("누적 연구 회차", format_count(growth["research_round_count"]))
-    growth_first[1].metric("누적 탐색 후보", format_count(growth["candidate_count"]))
-    growth_first[2].metric("신규 등록 수식 후보", format_count(growth["new_valid_formula_count"]))
-    growth_first[3].metric("재사용된 우수 수식", format_count(growth["reused_elite_formula_count"]))
-    growth_first[4].metric("기존 수식 변형", format_count(growth["modified_formula_count"]))
-    growth_second = st.columns(5)
-    growth_second[0].metric("중복 제외 수식", format_count(growth["duplicate_formula_count"]))
-    growth_second[1].metric("연구 시간", _duration(growth["runtime_seconds"]))
-    rate = growth["new_valid_formulas_per_hour"]
-    growth_second[2].metric("시간당 신규 수식", f"{rate:.2f}" if rate is not None else "평가 불가")
-    growth_second[3].metric(
-        "validation 평균",
-        format_decimal(growth["mean_validation_scores"]["six_number_set"], suffix="점"),
+    show_growth = st.checkbox(
+        (
+            "\uacc4\uc18d \uc131\uc7a5 \ubd84\uc11d\uacfc "
+            "\uc5f0\uad6c \ubc29\uc2dd \ube44\uad50 \ubd88\ub7ec\uc624\uae30"
+        ),
+        key="research_dashboard_show_growth",
+        help=(
+            "\uc120\ud0dd\ud558\uba74 \uc5f0\uad6c\ubcc4 \uc0c1\uc138 \uc694\uc57d\uc744 "
+            "\uc870\ud68c\ud569\ub2c8\ub2e4. \uae30\ubcf8 \ud68c\ucc28 \ubaa9\ub85d\uc740 "
+            "\uc694\uc57d \ud544\ub4dc\ub9cc \uc77d\uc2b5\ub2c8\ub2e4."
+        ),
     )
-    growth_second[4].metric(
-        "독립 테스트 평균",
-        format_decimal(growth["mean_independent_test_scores"]["six_number_set"], suffix="점"),
-    )
-    efficiency_change = growth["efficiency_change_vs_comparable_previous"]
-    st.caption(
-        "이전 동일 데이터·설정 연구 대비 시간당 신규 등록 후보 변화: "
-        + (
-            f"{efficiency_change:+.1%}"
-            if efficiency_change is not None
-            else "비교 가능한 완료 연구가 부족합니다."
+    if show_growth:
+        growth_records = rounds_store.list()
+        growth = cumulative_growth_summary(growth_records)
+        st.divider()
+        st.subheader("누적 연구 성장 분석")
+        st.caption(growth["growth_claim"])
+        growth_first = st.columns(5)
+        growth_first[0].metric("누적 연구 회차", format_count(growth["research_round_count"]))
+        growth_first[1].metric("누적 탐색 후보", format_count(growth["candidate_count"]))
+        growth_first[2].metric(
+            "신규 등록 수식 후보", format_count(growth["new_valid_formula_count"])
         )
-    )
-    random_p_values = growth["random_control_median_p_values"]
-    one_p_value = (
-        random_p_values["one_number"] if random_p_values["one_number"] is not None else "평가 불가"
-    )
-    six_p_value = (
-        random_p_values["six_number_set"]
-        if random_p_values["six_number_set"] is not None
-        else "평가 불가"
-    )
-    st.caption(
-        f"무작위 대조 p 중앙값 · 한 번호: {one_p_value} · 6개 집합: {six_p_value}. "
-        "p 값은 효과 크기나 미래 추첨 예측력을 나타내지 않습니다."
-    )
-    mode_comparison = compare_research_modes(rounds)
-    st.markdown("#### 독립 탐색과 누적 진화 연구 비교")
-    if mode_comparison["available"]:
-        st.caption(mode_comparison["reason"])
-        st.dataframe(
-            [
-                {
-                    "공통 시드 수": item["paired_seed_count"],
-                    "validation 중앙값 차이": item["validation_median_delta"],
-                    "독립 테스트 중앙값 차이": item["independent_test_median_delta"],
-                    "신규 수식 중앙값 차이": item["new_formula_median_delta"],
-                    "복잡도 중앙값 차이": item["complexity_median_delta"],
-                    "실행 시간 중앙값 차이(초)": item["runtime_median_delta_seconds"],
-                    "독립 탐색 무작위 대조 p 중앙값 (6개 집합)": item[
-                        "random_control_median_p_values"
-                    ][INDEPENDENT_MODE]["six_number_set"],
-                    "누적 진화 무작위 대조 p 중앙값 (6개 집합)": item[
-                        "random_control_median_p_values"
-                    ][CUMULATIVE_MODE]["six_number_set"],
-                }
-                for item in mode_comparison["comparisons"]
-            ],
-            hide_index=True,
-            width="stretch",
+        growth_first[3].metric(
+            "재사용된 우수 수식", format_count(growth["reused_elite_formula_count"])
+        )
+        growth_first[4].metric("기존 수식 변형", format_count(growth["modified_formula_count"]))
+        growth_second = st.columns(5)
+        growth_second[0].metric("중복 제외 수식", format_count(growth["duplicate_formula_count"]))
+        growth_second[1].metric("연구 시간", _duration(growth["runtime_seconds"]))
+        rate = growth["new_valid_formulas_per_hour"]
+        growth_second[2].metric(
+            "시간당 신규 수식", f"{rate:.2f}" if rate is not None else "평가 불가"
+        )
+        growth_second[3].metric(
+            "validation 평균",
+            format_decimal(growth["mean_validation_scores"]["six_number_set"], suffix="점"),
+        )
+        growth_second[4].metric(
+            "독립 테스트 평균",
+            format_decimal(growth["mean_independent_test_scores"]["six_number_set"], suffix="점"),
+        )
+        efficiency_change = growth["efficiency_change_vs_comparable_previous"]
+        st.caption(
+            "이전 동일 데이터·설정 연구 대비 시간당 신규 등록 후보 변화: "
+            + (
+                f"{efficiency_change:+.1%}"
+                if efficiency_change is not None
+                else "비교 가능한 완료 연구가 부족합니다."
+            )
+        )
+        random_p_values = growth["random_control_median_p_values"]
+        one_p_value = (
+            random_p_values["one_number"]
+            if random_p_values["one_number"] is not None
+            else "평가 불가"
+        )
+        six_p_value = (
+            random_p_values["six_number_set"]
+            if random_p_values["six_number_set"] is not None
+            else "평가 불가"
         )
         st.caption(
-            "무작위 대조 p 값은 대조 반복에 따른 통계 요약입니다. "
-            "개선 효과의 크기나 미래 당첨번호 예측력을 뜻하지 않습니다."
+            f"무작위 대조 p 중앙값 · 한 번호: {one_p_value} · 6개 집합: {six_p_value}. "
+            "p 값은 효과 크기나 미래 추첨 예측력을 나타내지 않습니다."
         )
-    else:
-        st.info(mode_comparison["reason"])
+        mode_comparison = compare_research_modes(growth_records)
+        st.markdown("#### 독립 탐색과 누적 진화 연구 비교")
+        if mode_comparison["available"]:
+            st.caption(mode_comparison["reason"])
+            st.dataframe(
+                [
+                    {
+                        "공통 시드 수": item["paired_seed_count"],
+                        "validation 중앙값 차이": item["validation_median_delta"],
+                        "독립 테스트 중앙값 차이": item["independent_test_median_delta"],
+                        "신규 수식 중앙값 차이": item["new_formula_median_delta"],
+                        "복잡도 중앙값 차이": item["complexity_median_delta"],
+                        "실행 시간 중앙값 차이(초)": item["runtime_median_delta_seconds"],
+                        "독립 탐색 무작위 대조 p 중앙값 (6개 집합)": item[
+                            "random_control_median_p_values"
+                        ][INDEPENDENT_MODE]["six_number_set"],
+                        "누적 진화 무작위 대조 p 중앙값 (6개 집합)": item[
+                            "random_control_median_p_values"
+                        ][CUMULATIVE_MODE]["six_number_set"],
+                    }
+                    for item in mode_comparison["comparisons"]
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+            st.caption(
+                "무작위 대조 p 값은 대조 반복에 따른 통계 요약입니다. "
+                "개선 효과의 크기나 미래 당첨번호 예측력을 뜻하지 않습니다."
+            )
+        else:
+            st.info(mode_comparison["reason"])
 
     choices = {
         f"연구 {item['research_round']}회차 · {item['research_id'][:8]}": item for item in rounds
     }
-    selected_label = st.selectbox("상세 연구 회차", list(choices))
-    selected = hydrate_round(choices[selected_label], reaggregate=False)
+    selected_label = st.selectbox(
+        "?? ?? ??",
+        list(choices),
+        key="research_dashboard_selected_round",
+    )
+    selected_record = choices[selected_label]
+    selected_research_id = str(selected_record["research_id"])
+    if st.session_state.get("research_dashboard_detail_round_id") != selected_research_id:
+        st.session_state["research_dashboard_detail_round_id"] = selected_research_id
+        st.session_state["research_dashboard_detail_loaded"] = False
+    if not st.session_state.get("research_dashboard_detail_loaded", False):
+        st.info(
+            "\ud68c\ucc28 \uc0c1\uc138 \ub370\uc774\ud130\uc640 "
+            "\uccb4\ud06c\ud3ec\uc778\ud2b8\u00b7\uc608\uce21 \ud30c\uc77c\uc740 "
+            "\uc694\uccad \uc2dc \uc870\ud68c\ud569\ub2c8\ub2e4."
+        )
+        if st.button(
+            "\uc120\ud0dd\ud55c \uc5f0\uad6c \uc0c1\uc138 \uc870\ud68c",
+            key="load_research_round_detail",
+        ):
+            st.session_state["research_dashboard_detail_loaded"] = True
+            st.rerun()
+        st.stop()
+    if st.button("\uc0c1\uc138 \ubcf4\uae30 \ub2eb\uae30", key="close_research_round_detail"):
+        st.session_state["research_dashboard_detail_loaded"] = False
+        st.rerun()
+    detail_cache = st.session_state.setdefault("research_dashboard_detail_cache", {})
+    detail_version = (
+        selected_research_id,
+        selected_record.get("last_updated_at"),
+        selected_record.get("status"),
+    )
+    if st.button("\uc0c1\uc138 \uc0c8\ub85c\uace0\uce68", key="refresh_research_round_detail"):
+        detail_cache.pop(detail_version, None)
+        st.rerun()
+    cached_detail = detail_cache.get(detail_version)
+    if cached_detail is not None and selected_record.get("status") != "running":
+        selected = cached_detail
+    else:
+        detail_record = rounds_store.get(selected_research_id) or selected_record
+        selected = hydrate_round(detail_record, reaggregate=False)
+        selected["prediction_candidates"] = collect_prediction_candidates(
+            list(selected.get("completed_experiment_ids", []))
+        )
+        if selected_record.get("status") != "running":
+            if len(detail_cache) >= 3:
+                detail_cache.pop(next(iter(detail_cache)))
+            detail_cache[detail_version] = selected
     summary = selected.get("dashboard_summary", {})
     config = selected.get("config", {})
-    if (
-        int(summary.get("summary_schema_version", 0) or 0) < SUMMARY_SCHEMA_VERSION
-        and summary.get("completed_experiment_count", 0)
+    if int(summary.get("summary_schema_version", 0) or 0) < SUMMARY_SCHEMA_VERSION and summary.get(
+        "completed_experiment_count", 0
     ):
         with st.expander("기존 연구의 2등 통계 재집계"):
             st.caption(
@@ -519,6 +600,7 @@ else:
                         "2등 통계를 추가했습니다. "
                         f"기존 연구 DB 온라인 백업: {result['backup_path']}"
                     )
+                    detail_cache.pop(detail_version, None)
                     st.rerun()
                 except (OSError, RuntimeError, TimeoutError, ValueError, KeyError) as error:
                     st.error(f"2등 통계를 안전하게 재집계하지 못했습니다: {error}")
@@ -527,9 +609,6 @@ else:
             f"이 연구의 회차 통계는 집계 대기 또는 점검이 필요합니다: "
             f"{summary['summary_diagnostic']}"
         )
-    selected["prediction_candidates"] = collect_prediction_candidates(
-        selected.get("completed_experiment_ids", [])
-    )
 
     st.divider()
     st.subheader(f"연구 {selected['research_round']}회차 상세")
@@ -1063,9 +1142,7 @@ else:
                 }
             )
     if compare_rows:
-        st.dataframe(
-            stringify_dashboard_table_rows(compare_rows), hide_index=True, width="stretch"
-        )
+        st.dataframe(stringify_dashboard_table_rows(compare_rows), hide_index=True, width="stretch")
 
     st.markdown("#### 완전 일치 패턴 상세")
     matches = selected.get("discovered_exact_matches", [])
@@ -1100,7 +1177,7 @@ else:
                 "상세 조회할 일치 패턴", pattern_ids, key=f"exact-pattern:{selected['research_id']}"
             )
             try:
-                pattern_detail = pattern_library.get_pattern(selected_pattern_id)
+                pattern_detail = _pattern_library().get_pattern(selected_pattern_id)
             except sqlite3.OperationalError as error:
                 _stop_on_database_error("pattern_detail_lookup", error)
             except KeyError:
@@ -1490,8 +1567,12 @@ else:
             "비교할 연구 B", labels, index=min(1, len(labels) - 1), key="round_compare_right"
         )
         if selected_left != selected_right:
-            left_record = hydrate_round(choices[selected_left], reaggregate=False)
-            right_record = hydrate_round(choices[selected_right], reaggregate=False)
+            left_record = hydrate_round(
+                rounds_store.get(str(choices[selected_left]["research_id"])), reaggregate=False
+            )
+            right_record = hydrate_round(
+                rounds_store.get(str(choices[selected_right]["research_id"])), reaggregate=False
+            )
             comparison = compare_research_rounds(left_record, right_record)
             if comparison["directly_comparable"]:
                 st.success(
