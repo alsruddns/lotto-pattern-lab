@@ -209,3 +209,20 @@ def dashboard_failure_records(record: Mapping[str, Any]) -> list[dict[str, Any]]
     if isinstance(startup_failures, list):
         return copy.deepcopy(startup_failures)
     return failures if isinstance(failures, int) else None
+
+
+def stringify_dashboard_table_rows(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Create a presentation-only all-string table without changing source metrics."""
+
+    def display(value: Any) -> str:
+        if value is None:
+            return "해당 없음"
+        if isinstance(value, bool):
+            return "예" if value else "아니오"
+        if isinstance(value, int):
+            return f"{value:,}"
+        if isinstance(value, float):
+            return format(value, ".6g")
+        return str(value)
+
+    return [{key: display(value) for key, value in row.items()} for row in rows]

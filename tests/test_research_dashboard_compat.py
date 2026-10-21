@@ -7,6 +7,7 @@ import pytest
 from lotto_pattern_lab.research_dashboard import (
     dashboard_failure_records,
     normalize_dashboard_summary,
+    stringify_dashboard_table_rows,
     validated_pattern_counts,
 )
 from lotto_pattern_lab.research_startup import research_startup_message
@@ -116,6 +117,28 @@ def test_dashboard_exposes_startup_failure_without_counting_it_as_an_experiment(
         startup_failure
     )
     assert dashboard_failure_records({"failed_runs": 0}) == 0
+
+
+def test_comparison_table_converts_missing_and_numeric_values_to_arrow_safe_display_strings():
+    import pandas as pd
+    import pyarrow as pa
+
+    rows = stringify_dashboard_table_rows(
+        [
+            {"일반 GP 검증": 0.125, "일반 GP 독립 테스트": None, "대조 반복": 4},
+            {"일반 GP 검증": None, "일반 GP 독립 테스트": 0.5, "대조 반복": None},
+        ]
+    )
+    frame = pd.DataFrame(rows)
+
+    assert rows[0]["일반 GP 검증"] == "0.125"
+    assert rows[1]["일반 GP 검증"] == "해당 없음"
+    assert rows[0]["대조 반복"] == "4"
+    assert all(
+        all(isinstance(value, str) for value in frame[column].tolist())
+        for column in frame.columns
+    )
+    assert pa.Table.from_pandas(frame, preserve_index=False).num_rows == 2
 
 
 @pytest.mark.parametrize(

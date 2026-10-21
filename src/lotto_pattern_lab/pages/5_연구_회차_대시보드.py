@@ -33,6 +33,7 @@ from lotto_pattern_lab.research import load_checkpoint
 from lotto_pattern_lab.research_dashboard import (
     dashboard_failure_records,
     normalize_dashboard_summary,
+    stringify_dashboard_table_rows,
     validated_pattern_counts,
 )
 from lotto_pattern_lab.research_rounds import (
@@ -983,7 +984,9 @@ else:
                 }
             )
     if compare_rows:
-        st.dataframe(compare_rows, hide_index=True, width="stretch")
+        st.dataframe(
+            stringify_dashboard_table_rows(compare_rows), hide_index=True, width="stretch"
+        )
 
     st.markdown("#### 완전 일치 패턴 상세")
     matches = selected.get("discovered_exact_matches", [])

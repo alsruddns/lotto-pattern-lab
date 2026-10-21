@@ -8,6 +8,7 @@ import json
 import re
 import runpy
 import sqlite3
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any
 
 import streamlit as st
 
+from lotto_pattern_lab.optimization_process_state import launch_optimization_worker
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
 from lotto_pattern_lab.research import research_worker_active
 from lotto_pattern_lab.research_optimization import list_optimization_studies, optuna_status
@@ -90,7 +92,9 @@ def _worker_active(checkpoint_path: Path) -> bool:
     return _continuous_runtime["_worker_active"](checkpoint_path)
 
 
-def _launch_worker(command: list[str], checkpoint_path: Path, log_path: Path) -> int:
+def _launch_worker(
+    command: list[str], checkpoint_path: Path, log_path: Path
+) -> subprocess.Popen[bytes]:
     return _continuous_runtime["_launch_worker"](command, checkpoint_path, log_path)
 
 
@@ -620,20 +624,15 @@ def _start_optimization(
             st.write("기존 이름과 SQLite 기록을 확인했습니다.")
             st.write("실행 환경과 저장 경로를 준비했습니다.")
             st.write("백그라운드 프로세스를 시작합니다.")
-            pid = _launch_worker(
+            process_state = launch_optimization_worker(
+                _launch_worker,
                 command,
                 project_path(f"data/optimizations/{slug}.state.json"),
                 project_path(f"logs/{slug}_optimization.log"),
+                project_path(f"data/optimizations/{slug}.state.json.process.json"),
+                study_name=slug,
             )
-            process_record = project_path(f"data/optimizations/{slug}.state.json.process.json")
-            process_record.write_text(
-                json.dumps(
-                    {"pid": pid, "started_at": datetime.now(UTC).isoformat()},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            pid = process_state.pid
             st.write(f"실행 상태를 확인했습니다. PID {pid}")
             status_box.update(label="자동 최적화 실행 중", state="complete", expanded=False)
         st.success(f"자동 최적화를 시작했습니다: {slug}")
@@ -702,22 +701,17 @@ def _start_existing_optimization(
             "기존 Optuna 연구를 확인하고 이어서 실행합니다", expanded=True
         ) as status_box:
             st.write(f"기존 완료 Trial {record.get('completed_trials', 0)}개를 보존합니다.")
-            pid = _launch_worker(
+            process_state = launch_optimization_worker(
+                _launch_worker,
                 command,
                 project_path(f"data/optimizations/{record['study_name']}.state.json"),
                 project_path(f"logs/{record['study_name']}_optimization.log"),
-            )
-            process_record = project_path(
-                f"data/optimizations/{record['study_name']}.state.json.process.json"
-            )
-            process_record.write_text(
-                json.dumps(
-                    {"pid": pid, "started_at": datetime.now(UTC).isoformat()},
-                    ensure_ascii=False,
-                    indent=2,
+                project_path(
+                    f"data/optimizations/{record['study_name']}.state.json.process.json"
                 ),
-                encoding="utf-8",
+                study_name=record["study_name"],
             )
+            pid = process_state.pid
             status_box.update(label="기존 연구 이어서 실행 중", state="complete", expanded=False)
         st.success(f"기존 연구를 실행했습니다. PID {pid}")
     except Exception as error:
