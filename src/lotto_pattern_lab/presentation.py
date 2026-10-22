@@ -86,6 +86,11 @@ def format_count(value: object) -> str:
     return f"{int(number):,}"
 
 
+def format_research_round(value: object) -> str:
+    """Format an optional research round for a homogeneous display-only column."""
+    return "미배정" if value is None else str(value)
+
+
 def format_duration(seconds: object) -> str:
     """Format elapsed seconds as Korean hours, minutes, and seconds."""
     missing = _missing_label(seconds)

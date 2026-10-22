@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from lotto_pattern_lab.storage import ExperimentStore
 from lotto_pattern_lab.storage_management import (
     checkpoint_cleanup_plan,
@@ -141,6 +143,99 @@ def test_storage_inventory_and_quota_warning(tmp_path: Path) -> None:
     assert report["folders"][0]["file_count"] == 1
     assert storage_over_quota(report, 16)
     assert not storage_over_quota(report, 17)
+
+
+def test_storage_inventory_skips_checkpoint_temps_and_disappeared_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    stable_checkpoint = checkpoint_dir / "stable.json"
+    stable_checkpoint.write_text("{}", encoding="utf-8")
+    temporary_checkpoint = checkpoint_dir / "active.json.tmp"
+    temporary_checkpoint.write_bytes(b"incomplete")
+    replaced_checkpoint = checkpoint_dir / "replaced.json"
+    replaced_checkpoint.write_text("{}", encoding="utf-8")
+
+    original_stat = Path.stat
+
+    def stat(path: Path, *args: object, **kwargs: object):
+        if path == replaced_checkpoint:
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+    inventory = storage_inventory(tmp_path)
+    checkpoint_usage = next(
+        item for item in inventory["folders"] if item["folder"] == "checkpoints"
+    )
+
+    assert checkpoint_usage["file_count"] == 1
+    assert checkpoint_usage["bytes"] == len(b"{}")
+    assert inventory["total_bytes"] == len(b"{}")
+    assert temporary_checkpoint.exists()
+
+
+def test_storage_inventory_logs_non_missing_stat_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    checkpoint_dir = tmp_path / "checkpoints"
+    checkpoint_dir.mkdir()
+    inaccessible = checkpoint_dir / "inaccessible.json"
+    inaccessible.write_text("{}", encoding="utf-8")
+    original_stat = Path.stat
+
+    def stat(path: Path, *args: object, **kwargs: object):
+        if path == inaccessible:
+            raise PermissionError("test access denied")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+    inventory = storage_inventory(tmp_path)
+    checkpoint_usage = next(
+        item for item in inventory["folders"] if item["folder"] == "checkpoints"
+    )
+
+    assert checkpoint_usage["file_count"] == 0
+    assert "파일 크기를 조회하지 못했습니다" in caplog.text
+
+
+def test_single_exploration_page_renders_with_temporary_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from streamlit.testing.v1 import AppTest
+
+    from lotto_pattern_lab import paths, storage_management
+
+    page = next((paths.PROJECT_ROOT / "src/lotto_pattern_lab/pages").glob("1_*.py"))
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        storage_management,
+        "load_storage_settings",
+        lambda path=storage_management.SETTINGS_PATH: {
+            "quota_bytes": 10**9,
+            "automatic_checkpoint_cleanup": False,
+            "checkpoint_keep": 5,
+        },
+    )
+    monkeypatch.setattr(
+        storage_management,
+        "storage_inventory",
+        lambda root=".": {
+            "folders": [],
+            "total_bytes": 0,
+            "file_types": {},
+            "research_usage": {},
+            "scanned_at": "test",
+        },
+    )
+
+    app = AppTest.from_file(str(page)).run(timeout=30)
+
+    assert not app.exception
+    assert app.title
 
 
 def test_storage_inventory_counts_sqlite_pysr_artifacts_and_research_usage(

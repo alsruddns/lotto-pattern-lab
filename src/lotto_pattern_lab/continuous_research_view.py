@@ -37,7 +37,7 @@ from lotto_pattern_lab.preflight_cache import (
     load_preflight_cache,
     preflight_report_is_fresh,
 )
-from lotto_pattern_lab.presentation import format_count, format_duration
+from lotto_pattern_lab.presentation import format_count, format_duration, format_research_round
 from lotto_pattern_lab.pysr_backend import PySRConfig, optional_backend_status
 from lotto_pattern_lab.queue_scheduler import start_detached_scheduler
 from lotto_pattern_lab.research import (
@@ -2552,7 +2552,7 @@ with queue_tab:
                     ),
                     "\uc2dc\ub4dc": item["config"].get("seed"),
                     "\uc0c1\ud0dc": _queue_item_status(item, live_research),
-                    "\uc5f0\uad6c \ud68c\ucc28": item["research_round"] or "\ubbf8\ubc30\uc815",
+                    "\uc5f0\uad6c \ud68c\ucc28": format_research_round(item.get("research_round")),
                     "\uc644\ub8cc \uc2e4\ud5d8": (
                         len(
                             load_checkpoint(item["checkpoint_path"]).get(

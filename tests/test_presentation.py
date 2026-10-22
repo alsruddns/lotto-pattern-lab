@@ -8,8 +8,43 @@ from lotto_pattern_lab.presentation import (
     format_duration,
     format_percent,
     format_probability,
+    format_research_round,
     pretty_formula,
 )
+
+
+def test_queue_research_round_display_is_arrow_compatible_and_keeps_ids() -> None:
+    import pyarrow as pa
+
+    records = [
+        {"research_id": "round-two", "research_round": 2},
+        {"research_id": "unassigned", "research_round": None},
+        {"research_id": "round-ten", "research_round": 10},
+    ]
+    ordered = sorted(
+        records,
+        key=lambda item: (
+            item["research_round"] is None,
+            item["research_round"] if item["research_round"] is not None else 0,
+        ),
+    )
+    display_rows = [
+        {
+            "연구 ID": item["research_id"],
+            "연구 회차": format_research_round(item["research_round"]),
+        }
+        for item in ordered
+    ]
+
+    table = pa.Table.from_pylist(display_rows)
+
+    assert table.schema.field("연구 회차").type == pa.string()
+    assert table.column("연구 회차").to_pylist() == ["2", "10", "미배정"]
+    assert table.column("연구 ID").to_pylist() == [
+        "round-two",
+        "round-ten",
+        "unassigned",
+    ]
 
 
 @pytest.mark.parametrize(

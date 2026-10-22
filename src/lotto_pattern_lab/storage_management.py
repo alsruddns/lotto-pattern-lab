@@ -3,8 +3,10 @@
 import gzip
 import hashlib
 import json
+import logging
 import os
 import sqlite3
+import stat as stat_module
 import tempfile
 import zipfile
 from datetime import UTC, datetime
@@ -27,6 +29,7 @@ DEFAULT_QUOTA_BYTES = 10 * 1024**3
 DEFAULT_CHECKPOINT_KEEP = 5
 EXPERIMENT_COMPRESSION_THRESHOLD = 1_000_000
 SETTINGS_PATH = PROJECT_ROOT / ".storage_settings.json"
+logger = logging.getLogger(__name__)
 
 
 def load_storage_settings(path: str | Path = SETTINGS_PATH) -> dict[str, Any]:
@@ -63,10 +66,30 @@ def storage_inventory(root: str | Path = ".") -> dict[str, Any]:
     research_usage: dict[str, dict[str, int]] = {}
     for name in MANAGED_DIRS:
         folder = base / name
-        files = [path for path in folder.rglob("*") if path.is_file()] if folder.exists() else []
+        candidates = (
+            [
+                path
+                for path in folder.rglob("*")
+                if path.suffix.lower() != ".tmp"
+            ]
+            if folder.exists()
+            else []
+        )
         folder_bytes = 0
-        for path in files:
-            size = path.stat().st_size
+        file_count = 0
+        for path in candidates:
+            try:
+                file_stat = path.stat()
+            except FileNotFoundError:
+                # Atomic checkpoint replacement can remove a listed file before stat().
+                continue
+            except OSError:
+                logger.warning("저장 공간 파일 크기를 조회하지 못했습니다: %s", path, exc_info=True)
+                continue
+            if not stat_module.S_ISREG(file_stat.st_mode):
+                continue
+            size = file_stat.st_size
+            file_count += 1
             folder_bytes += size
             extension = ".".join(path.name.split(".")[1:]) or "[no extension]"
             bucket = file_types.setdefault(extension, {"file_count": 0, "bytes": 0})
@@ -75,7 +98,12 @@ def storage_inventory(root: str | Path = ".") -> dict[str, Any]:
             if path.suffix.lower() == ".json" and not path.name.endswith(".details.json"):
                 try:
                     payload = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError):
+                except OSError:
+                    logger.warning(
+                        "저장 공간 메타데이터를 읽지 못했습니다: %s", path, exc_info=True
+                    )
+                    continue
+                except json.JSONDecodeError:
                     continue
                 research_id = payload.get("research_id") or payload.get("research_round_id")
                 if research_id:
@@ -88,7 +116,7 @@ def storage_inventory(root: str | Path = ".") -> dict[str, Any]:
             {
                 "folder": name,
                 "exists": folder.exists(),
-                "file_count": len(files),
+                "file_count": file_count,
                 "bytes": folder_bytes,
             }
         )
