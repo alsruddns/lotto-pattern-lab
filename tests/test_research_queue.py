@@ -84,6 +84,28 @@ def test_lease_allows_one_scheduler_owner(tmp_path: Path) -> None:
     assert store.acquire_lease("owner-b", queue)
 
 
+def test_integrated_profile_reservation_round_trips_and_resumes_with_same_profile(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "queue.sqlite"
+    store = ResearchQueueStore(database)
+    queue = store.create_queue()
+    item_id = store.add_item(
+        queue,
+        engine="intermittent_gp",
+        feature_profile="integrated_v1",
+        duration_seconds=60,
+        config={"feature_profile": "integrated_v1", "seed": 71},
+    )
+
+    saved = ResearchQueueStore(database).list_items(queue)[0]
+    assert saved["item_id"] == item_id
+    assert saved["feature_profile"] == saved["config"]["feature_profile"] == "integrated_v1"
+    command = _research_command(saved, tmp_path / "integrated.json", "research-id", resume=True)
+    assert command[command.index("--feature-profile") + 1] == "integrated_v1"
+    assert "--resume" in command
+
+
 def test_mock_scheduler_runs_independent_items_in_order(tmp_path: Path) -> None:
     store = ResearchQueueStore(tmp_path / "queue.sqlite")
     queue = store.create_queue()

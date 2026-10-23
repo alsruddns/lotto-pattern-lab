@@ -44,7 +44,9 @@ from .pattern_library import pattern_fingerprint
 from .prize_evaluation import classify_prize_tier
 from .research_features import (
     ResearchFeatureConfig,
+    build_integrated_features_for_target,
     build_research_features_for_target,
+    integrated_feature_names,
     research_feature_names,
 )
 
@@ -510,7 +512,12 @@ def create_recommendation(
     config = experiment.get("config", {})
     max_lag = int(config.get("max_lag", 10))
     feature_profile = str(config.get("feature_profile", "legacy"))
-    if feature_profile == "calendar_round":
+    if feature_profile == "integrated_v1":
+        features = build_integrated_features_for_target(
+            dataset, target_round, target_date, max_lag
+        )
+        mapping = integrated_feature_names(max_lag)
+    elif feature_profile == "calendar_round":
         feature_config = ResearchFeatureConfig(include_calendar=True, include_round_digits=True)
         features = build_research_features_for_target(
             dataset, target_round, target_date, max_lag, feature_config

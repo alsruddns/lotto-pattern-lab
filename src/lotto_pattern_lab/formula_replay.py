@@ -21,7 +21,11 @@ from .features import build_bonus_examples, build_examples
 from .gp_engine import _make_primitive_set
 from .intermittent import _gate_rule, _predict_numbers, _validate_formula_ast
 from .prize_evaluation import classify_prize_tier
-from .research_features import ResearchFeatureConfig, build_research_examples
+from .research_features import (
+    ResearchFeatureConfig,
+    build_integrated_examples,
+    build_research_examples,
+)
 
 REPLAY_VERSION = "formula-full-historical-replay-v2"
 DEFAULT_START_ROUND = 753
@@ -30,6 +34,8 @@ _RANDOM_MEAN_HITS_SIX_NUMBERS = 36 / 45
 
 
 def _examples_for_profile(dataset: DrawDataset, profile: str, max_lag: int):
+    if profile == "integrated_v1":
+        return build_integrated_examples(dataset, max_lag)
     if profile == "calendar_round":
         return build_research_examples(
             dataset,

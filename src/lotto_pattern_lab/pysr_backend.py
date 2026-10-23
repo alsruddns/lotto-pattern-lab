@@ -25,11 +25,15 @@ from .evaluation_cache import (
     classify_candidate,
     evaluation_fingerprint,
 )
-from .feature_schema import feature_mapping, feature_schema_version
+from .feature_schema import FEATURE_PROFILES, feature_mapping, feature_schema_version
 from .features import Example, build_bonus_examples, build_examples
 from .paths import project_path
 from .prize_evaluation import classify_prize_tier
-from .research_features import ResearchFeatureConfig, build_research_examples
+from .research_features import (
+    ResearchFeatureConfig,
+    build_integrated_examples,
+    build_research_examples,
+)
 from .storage import ExperimentStore
 
 PYSR_VERSION_RANGE = ">=2.7.0,<3"
@@ -78,7 +82,7 @@ class PySRConfig:
     def __post_init__(self) -> None:
         if self.target not in {"one_number", "main_positions", "bonus"}:
             raise ValueError("PySR target must be one_number, main_positions, or bonus.")
-        if self.feature_profile not in {"legacy", "bonus_lag_v1", "calendar_round"}:
+        if self.feature_profile not in FEATURE_PROFILES:
             raise ValueError("Unsupported feature profile.")
         if self.target == "bonus" and self.feature_profile == "legacy":
             raise ValueError("Bonus-target research must use bonus_lag_v1 or calendar_round.")
@@ -156,6 +160,8 @@ def initialize_optional_backend() -> tuple[Any | None, dict[str, Any]]:
 
 
 def _examples(dataset: DrawDataset, config: PySRConfig) -> tuple[Example, ...]:
+    if config.feature_profile == "integrated_v1":
+        return build_integrated_examples(dataset, config.max_lag)
     if config.feature_profile == "calendar_round":
         return build_research_examples(
             dataset,

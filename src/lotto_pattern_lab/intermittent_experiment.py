@@ -35,6 +35,8 @@ from .pattern_library import (
 from .prize_evaluation import classify_prize_tier, evaluate_prize_predictions
 from .research_features import (
     ResearchFeatureConfig,
+    build_integrated_bonus_examples,
+    build_integrated_examples,
     build_research_examples,
     research_feature_names,
 )
@@ -148,7 +150,9 @@ def _annotate_candidate_prizes(
 
 
 def _splits_for(dataset: DrawDataset, config: IntermittentConfig) -> tuple[tuple, DataSplits]:
-    if config.feature_profile == "calendar_round":
+    if config.feature_profile == "integrated_v1":
+        examples = build_integrated_examples(dataset, config.max_lag)
+    elif config.feature_profile == "calendar_round":
         examples = build_research_examples(
             dataset,
             config.max_lag,
@@ -304,11 +308,11 @@ def run_intermittent_experiment(
     bonus_model = None
     bonus_elite_seeds: list[dict[str, object]] = []
     bonus_elite_skipped: list[dict[str, str]] = []
-    if config.feature_profile == "bonus_lag_v1":
+    if config.feature_profile in {"bonus_lag_v1", "integrated_v1"}:
         if config.elite_seeding_enabled:
             bonus_library = pattern_library or PatternLibrary()
             bonus_elite_seeds, bonus_elite_skipped = bonus_library.select_elite_candidates(
-                feature_profile="bonus_lag_v1",
+                feature_profile=config.feature_profile,
                 max_lag=config.max_lag,
                 max_candidates=math.ceil(config.population_size * config.elite_seed_ratio) * 2,
                 target_model_type="bonus_number",
@@ -439,9 +443,9 @@ def run_intermittent_experiment(
             len(dataset.records),
             data_seed,
             first_round=dataset.records[0].round_number,
-            include_bonus=config.feature_profile == "bonus_lag_v1",
+            include_bonus=config.feature_profile in {"bonus_lag_v1", "integrated_v1"},
         )
-        if config.feature_profile == "calendar_round":
+        if config.feature_profile in {"calendar_round", "integrated_v1"}:
             control_dataset = DrawDataset(
                 tuple(
                     DrawRecord(random_record.round_number, random_record.draw, actual.draw_date)
@@ -479,8 +483,12 @@ def run_intermittent_experiment(
             run_label=f"random_{control_index + 1}_six_number_set",
         )
         control_bonus = None
-        if config.feature_profile == "bonus_lag_v1":
-            bonus_control_examples = build_bonus_examples(control_dataset, config.max_lag)
+        if config.feature_profile in {"bonus_lag_v1", "integrated_v1"}:
+            bonus_control_examples = (
+                build_integrated_bonus_examples(control_dataset, config.max_lag)
+                if config.feature_profile == "integrated_v1"
+                else build_bonus_examples(control_dataset, config.max_lag)
+            )
             bonus_control_splits = chronological_split(
                 bonus_control_examples, config.train_ratio, config.validation_ratio
             )
@@ -567,11 +575,14 @@ def run_intermittent_experiment(
                 feature_names(config.max_lag)
                 + (
                     research_feature_names(ResearchFeatureConfig())
-                    if config.feature_profile == "calendar_round"
-                    else tuple(f"lag{lag}_bonus" for lag in range(1, config.max_lag + 1))
-                    if config.feature_profile == "bonus_lag_v1"
+                    if config.feature_profile in {"calendar_round", "integrated_v1"}
                     else ()
                 )
+            + (
+                tuple(f"lag{lag}_bonus" for lag in range(1, config.max_lag + 1))
+                if config.feature_profile in {"bonus_lag_v1", "integrated_v1"}
+                else ()
+            )
             )
         },
         "seed": config.seed,

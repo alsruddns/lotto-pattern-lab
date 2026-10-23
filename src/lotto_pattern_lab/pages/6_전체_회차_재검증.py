@@ -256,7 +256,7 @@ profile = (experiment.get("feature_schema") or {}).get(
 )
 dataset_path = project_path(
     "data/raw/lotto_draws_753_1246_with_bonus.csv"
-    if profile == "bonus_lag_v1"
+    if profile in {"bonus_lag_v1", "integrated_v1"}
     else "data/official/draws.csv"
 )
 if not dataset_path.is_file():

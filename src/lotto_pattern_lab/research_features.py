@@ -4,7 +4,13 @@ from dataclasses import dataclass
 from datetime import date
 
 from .dataset import DrawDataset
-from .features import Example, build_examples
+from .features import (
+    Example,
+    append_lagged_bonus_features,
+    build_bonus_features_for_target,
+    build_examples,
+    feature_names,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +99,31 @@ def research_feature_names(
     return tuple(names)
 
 
+def integrated_feature_names(max_lag: int = 10) -> tuple[str, ...]:
+    """Return the integrated schema with stable first-occurrence deduplication."""
+    names = (
+        *feature_names(max_lag),
+        *research_feature_names(),
+        *(f"lag{lag}_bonus" for lag in range(1, max_lag + 1)),
+    )
+    return tuple(dict.fromkeys(names))
+
+
+def _unique_values(values: tuple[float, ...], max_lag: int) -> tuple[float, ...]:
+    raw_names = (
+        *feature_names(max_lag),
+        *research_feature_names(),
+        *(f"lag{lag}_bonus" for lag in range(1, max_lag + 1)),
+    )
+    selected_indices: list[int] = []
+    seen: set[str] = set()
+    for index, name in enumerate(raw_names):
+        if name not in seen:
+            seen.add(name)
+            selected_indices.append(index)
+    return tuple(values[index] for index in selected_indices)
+
+
 def build_research_examples(
     dataset: DrawDataset,
     max_lag: int = 10,
@@ -149,3 +180,50 @@ def build_research_features_for_target(
     if config.include_round_digits:
         additions.extend(round_feature_values(target_round))
     return legacy + tuple(additions)
+
+
+def build_integrated_examples(dataset: DrawDataset, max_lag: int = 10) -> tuple[Example, ...]:
+    """Build base, date/round, and lagged bonus inputs with the main draw as label."""
+    examples = build_research_examples(dataset, max_lag)
+    merged = append_lagged_bonus_features(examples, dataset, max_lag)
+    return tuple(
+        Example(item.round_number, _unique_values(item.features, max_lag), item.winning_numbers)
+        for item in merged
+    )
+
+
+def build_integrated_bonus_examples(
+    dataset: DrawDataset, max_lag: int = 10
+) -> tuple[Example, ...]:
+    """Build integrated inputs with each target draw's bonus used only as the label."""
+    examples = build_integrated_examples(dataset, max_lag)
+    bonus_by_round = {record.round_number: record.draw.bonus for record in dataset.records}
+    if any(value is None for value in bonus_by_round.values()):
+        raise ValueError("Bonus-number research requires a bonus value for every draw.")
+    return tuple(
+        Example(
+            item.round_number,
+            item.features,
+            frozenset({int(bonus_by_round[item.round_number])}),
+        )
+        for item in examples
+    )
+
+
+def build_integrated_features_for_target(
+    dataset: DrawDataset, target_round: int, target_date: date | None, max_lag: int = 10
+) -> tuple[float, ...]:
+    """Build all integrated inputs from target metadata and draws strictly before target."""
+    calendar_features = build_research_features_for_target(
+        dataset,
+        target_round,
+        target_date,
+        max_lag,
+        ResearchFeatureConfig(include_calendar=True, include_round_digits=True),
+    )
+    bonus_features = build_bonus_features_for_target(dataset, target_round, max_lag)
+    base_count = len(feature_names(max_lag))
+    bonus_count = max_lag
+    return _unique_values(
+        calendar_features + bonus_features[base_count : base_count + bonus_count], max_lag
+    )

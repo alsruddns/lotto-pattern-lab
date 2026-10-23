@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import date, timedelta
 
 import pytest
 
@@ -29,6 +30,10 @@ from lotto_pattern_lab.prize_evaluation import (
     evaluate_prize_predictions,
 )
 from lotto_pattern_lab.research import dataset_digest
+from lotto_pattern_lab.research_features import (
+    build_integrated_examples,
+    build_integrated_features_for_target,
+)
 
 
 def _dataset(count: int = 45) -> DrawDataset:
@@ -121,6 +126,63 @@ def test_bonus_profile_accepts_shared_ids_and_rejects_missing_bonus_feature():
     missing = {"x0": {"feature_id": "lotto.lag1_bonus", "name": "lag1_bonus"}}
     assert remap_formula_features("add(x0,x99)", missing, new_mapping, "bonus_lag_v1")[0] is None
     assert feature_schema_version("bonus_lag_v1") > feature_schema_version("legacy")
+
+
+def test_integrated_profile_merges_three_unique_feature_groups_and_keeps_old_layouts():
+    legacy = feature_mapping("legacy", 10)
+    calendar = feature_mapping("calendar_round", 10)
+    bonus = feature_mapping("bonus_lag_v1", 10)
+    integrated = feature_mapping("integrated_v1", 10)
+
+    assert len(legacy) == 70
+    assert len(calendar) == 90
+    assert len(bonus) == 80
+    assert len(integrated) == 100
+    ids = [item["feature_id"] for item in integrated.values()]
+    assert len(ids) == len(set(ids))
+    assert list(legacy.items()) == list(feature_mapping("legacy", 10).items())
+    assert feature_schema_version("integrated_v1") > feature_schema_version("bonus_lag_v1")
+
+
+def test_integrated_features_use_target_metadata_and_only_prior_draws():
+    original = _dataset()
+    dated = DrawDataset(
+        tuple(
+            DrawRecord(
+                record.round_number,
+                record.draw,
+                date(2000, 1, 1) + timedelta(days=index * 7),
+            )
+            for index, record in enumerate(original.records)
+        ),
+        "synthetic",
+        "dated test data",
+    )
+    target_round = dated.records[20].round_number
+    target_date = dated.records[20].draw_date
+    features = build_integrated_features_for_target(dated, target_round, target_date, 5)
+
+    changed = list(dated.records)
+    target = changed[20]
+    changed[20] = DrawRecord(
+        target.round_number, Draw.from_numbers((1, 2, 3, 4, 5, 6), 45), target.draw_date
+    )
+    changed[21] = DrawRecord(
+        changed[21].round_number,
+        Draw.from_numbers((7, 8, 9, 10, 11, 12), 44),
+        changed[21].draw_date,
+    )
+    changed_dataset = DrawDataset(tuple(changed), "synthetic", "changed target and future")
+    assert build_integrated_features_for_target(
+        changed_dataset, target_round, target_date, 5
+    ) == features
+
+    examples = build_integrated_examples(dated, 5)
+    expected_bonus_lags = tuple(
+        float(dated.records[19 - lag].draw.bonus) for lag in range(5)
+    )
+    assert examples[15].features[-5:] == expected_bonus_lags
+    assert examples[15].round_number == target_round
 
 
 def test_first_and_second_prize_counts_are_separate():

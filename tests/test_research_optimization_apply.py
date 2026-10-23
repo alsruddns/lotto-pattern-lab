@@ -62,6 +62,21 @@ def test_optimization_apply_rejects_engine_and_dataset_mismatch() -> None:
     assert error and "회차 범위" in error
 
 
+def test_integrated_profile_optimization_requires_both_dates_and_bonus_values() -> None:
+    study = _study()
+    study["feature_profile"] = "integrated_v1"
+    assert _compatibility(study)[1] is None
+
+    params, error = validate_optimization_compatibility(
+        study,
+        current_engines=("intermittent_gp",),
+        current_dataset_range=[753, 1246],
+        dataset_integrity={"all_draws_have_bonus": True, "all_draws_dated": False},
+    )
+    assert params is None
+    assert error is not None
+
+
 def test_manual_edits_are_detected_without_changing_optuna_snapshot() -> None:
     applied = {key: 1 for key in OPTUNA_TO_RESEARCH_KEYS.values()}
     current = dict(applied)

@@ -507,6 +507,80 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
         )
 
 
+def test_integrated_profile_executes_and_resumes_without_changing_schema(tmp_path) -> None:
+    source = make_random_dataset(40, seed=902, first_round=753, include_bonus=True)
+    first_date = date(2017, 5, 6)
+    dataset = DrawDataset(
+        tuple(
+            DrawRecord(record.round_number, record.draw, first_date + timedelta(days=7 * index))
+            for index, record in enumerate(source.records)
+        ),
+        "synthetic",
+        "Integrated profile checkpoint fixture.",
+    )
+    checkpoint = tmp_path / "integrated.json"
+    config = IntermittentConfig(
+        population_size=8,
+        generations=1,
+        max_depth=2,
+        seed=41,
+        workers=1,
+        train_ratio=0.55,
+        validation_ratio=0.25,
+        max_lag=7,
+        control_runs=0,
+        hidden_states=3,
+        feature_profile="integrated_v1",
+    )
+    first = run_research_schedule(
+        dataset,
+        config,
+        duration_seconds=120,
+        checkpoint_path=checkpoint,
+        experiment_directory=tmp_path / "experiments",
+        pattern_database=tmp_path / "patterns.sqlite",
+        max_runs=1,
+        research_id="00000000-0000-4000-8000-000000000104",
+    )
+    experiment = json.loads(
+        (tmp_path / "experiments" / f"{first['last_experiment_id']}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert first["config"]["feature_profile"] == "integrated_v1"
+    assert experiment["feature_schema"]["feature_schema_version"] == 3
+    assert len(experiment["feature_schema"]["feature_mapping"]) == 76
+    assert experiment["feature_variables"]["x75"] == "lag7_bonus"
+    assert experiment["six_number_set_model"]["test_rounds"]
+    target_date = dataset.records[-1].draw_date + timedelta(days=7)
+    recommendation = create_recommendation(
+        experiment,
+        dataset,
+        dataset.records[-1].round_number + 1,
+        "six_number_set",
+        target_date=target_date,
+    )
+    assert recommendation["feature_schema"]["profile"] == "integrated_v1"
+    assert len(recommendation["feature_values"]) == 76
+
+    saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+    saved["status"] = "paused"
+    checkpoint.write_text(json.dumps(saved), encoding="utf-8")
+    resumed = run_research_schedule(
+        dataset,
+        config,
+        duration_seconds=120,
+        checkpoint_path=checkpoint,
+        experiment_directory=tmp_path / "experiments",
+        pattern_database=tmp_path / "patterns.sqlite",
+        resume=True,
+        max_runs=2,
+    )
+    assert resumed["config"]["feature_profile"] == "integrated_v1"
+    assert resumed["resume_count"] == 1
+    assert resumed["completed_runs"] == 2
+
+
 def test_calendar_profile_runs_same_search_on_real_and_random_dates(tmp_path) -> None:
     config = IntermittentConfig(
         population_size=8,

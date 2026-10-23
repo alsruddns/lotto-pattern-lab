@@ -282,8 +282,17 @@ def _dataset_for_checkpoint(state: dict[str, Any]) -> tuple[Path | None, str | N
                     candidate,
                     "저장된 calendar_round 프로파일에 필요한 추첨일이 데이터에 없습니다.",
                 )
-            if profile == "bonus_lag_v1" and not integrity["all_draws_have_bonus"]:
+            if (
+                profile in {"bonus_lag_v1", "integrated_v1"}
+                and not integrity["all_draws_have_bonus"]
+            ):
                 return candidate, "저장된 bonus_lag_v1 프로파일에 필요한 보너스 번호가 없습니다."
+            if profile == "integrated_v1" and not integrity["all_draws_dated"]:
+                return candidate, (
+                    "\uc800\uc7a5\ub41c integrated_v1 "
+                    "\ud504\ub85c\ud30c\uc77c\uc5d0 \ud544\uc694\ud55c "
+                    "\ucd94\ucc28\uc77c\uc774 \uc5c6\uc2b5\ub2c8\ub2e4."
+                )
             if not integrity["rounds_contiguous"]:
                 return candidate, "저장된 연구 데이터의 회차가 연속적이지 않습니다."
             recorded_schema = (state.get("elite_seeding") or {}).get("feature_schema_version")
@@ -821,15 +830,29 @@ with new_tab:
         "legacy": "기본 특징",
         "calendar_round": "회차·날짜 특징",
         "bonus_lag_v1": "보너스 번호 포함 특징",
+        "integrated_v1": (
+            "\uc804\uccb4 \ud1b5\ud569 \ud2b9\uc9d5 "
+            "(\uae30\ubcf8 + \ud68c\ucc28\ub0a0\uc9dc + \ubcf4\ub108\uc2a4)"
+        ),
     }
     profile = selector_columns[1].selectbox(
         "특징 프로파일",
-        ("legacy", "calendar_round", "bonus_lag_v1"),
+        ("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
         format_func=lambda value: profile_names[value],
         key="new_profile",
         help="날짜나 보너스 번호 특징을 쓰려면 데이터에 해당 정보가 있어야 합니다.",
         on_change=_apply_research_preset,
     )
+    profile_groups = {
+        "legacy": "\uae30\ubcf8 \ud2b9\uc9d5",
+        "calendar_round": "\uae30\ubcf8 \ud2b9\uc9d5 · \ud68c\ucc28·\ub0a0\uc9dc \ud2b9\uc9d5",
+        "bonus_lag_v1": "\uae30\ubcf8 \ud2b9\uc9d5 · \ubcf4\ub108\uc2a4 \ubc88\ud638 \ud2b9\uc9d5",
+        "integrated_v1": (
+            "\uae30\ubcf8 \ud2b9\uc9d5 · \ud68c\ucc28·\ub0a0\uc9dc \ud2b9\uc9d5 · "
+            "\ubcf4\ub108\uc2a4 \ubc88\ud638 \ud2b9\uc9d5"
+        ),
+    }
+    selector_columns[1].caption(f"포함 특징 그룹: {profile_groups[profile]}")
     duration_mode = selector_columns[2].selectbox(
         "연구 시간 설정",
         ("recommended", "custom"),
@@ -1175,7 +1198,7 @@ with new_tab:
                 )
                 pysr_profile = st.selectbox(
                     "PySR 특징 프로파일",
-                    ("legacy", "calendar_round", "bonus_lag_v1"),
+                    ("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
                     format_func=lambda value: profile_names[value],
                     key="new_pysr_profile",
                     help="비교 모드에서 PySR에만 전달되는 특징 프로파일입니다.",
@@ -1237,7 +1260,9 @@ with new_tab:
                 key="new_elite_seed_ratio",
             )
             pysr_targets = ("main_positions", "one_number") + (
-                ("bonus",) if pysr_profile in {"bonus_lag_v1", "calendar_round"} else ()
+                ("bonus",)
+                if pysr_profile in {"bonus_lag_v1", "calendar_round", "integrated_v1"}
+                else ()
             )
             pysr_target = st.selectbox(
                 "PySR 탐색 목표",
@@ -1450,7 +1475,11 @@ with new_tab:
     if new_dataset is not None and effective_config is not None:
         invalid_profile = (
             (profile == "calendar_round" and not new_integrity["all_draws_dated"])
-            or (profile == "bonus_lag_v1" and not new_integrity["all_draws_have_bonus"])
+            or (
+                profile in {"bonus_lag_v1", "integrated_v1"}
+                and not new_integrity["all_draws_have_bonus"]
+            )
+            or (profile == "integrated_v1" and not new_integrity["all_draws_dated"])
             or not new_integrity["rounds_contiguous"]
         )
         if invalid_profile:
@@ -2525,6 +2554,7 @@ with queue_tab:
                         "legacy": "\uae30\ubcf8 \ud2b9\uc9d5",
                         "calendar_round": "\ub2ec\ub825\u00b7\ud68c\ucc28 \ud2b9\uc9d5",
                         "bonus_lag_v1": "\ubcf4\ub108 \ubc88\ud638 \ud3ec\ud568 \ud2b9\uc9d5",
+                        "integrated_v1": "\uc804\uccb4 \ud1b5\ud569 \ud2b9\uc9d5",
                     }[item["feature_profile"]],
                     "\uc5f0\uad6c \uc2dc\uac04": format_duration(item["duration_seconds"]),
                     "\uc5f0\uad6c \ubc29\uc2dd": (
@@ -2633,7 +2663,7 @@ with queue_tab:
                     }[value],
                     key="queue_edit_engine",
                 )
-                profile_values = ["legacy", "calendar_round", "bonus_lag_v1"]
+                profile_values = ["legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"]
                 edit_profile = st.selectbox(
                     "\uc218\uc815 \ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
                     profile_values,
@@ -2873,12 +2903,12 @@ with queue_tab:
                         )
                         edit_integrity = dataset_integrity_report(edit_dataset)
                         if (
-                            edit_profile == "bonus_lag_v1"
+                            edit_profile in {"bonus_lag_v1", "integrated_v1"}
                             and not edit_integrity["all_draws_have_bonus"]
                         ):
                             raise ValueError("bonus_lag_v1 requires bonus numbers in the data.")
                         if (
-                            edit_profile == "calendar_round"
+                            edit_profile in {"calendar_round", "integrated_v1"}
                             and not edit_integrity["all_draws_dated"]
                         ):
                             raise ValueError("calendar_round requires dates in the data.")

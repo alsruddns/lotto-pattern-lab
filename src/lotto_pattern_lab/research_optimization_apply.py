@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from .feature_schema import FEATURE_PROFILES
+
 OPTUNA_TO_RESEARCH_KEYS = {
     "population_size": "new_population_size",
     "generations": "new_generations",
@@ -39,13 +41,17 @@ def validate_optimization_compatibility(
             "현재 데이터 스냅샷 해시가 최적화 연구의 저장값과 다르거나 기록되지 않았습니다."
         )
     profile = study.get("feature_profile")
-    if profile not in {"legacy", "bonus_lag_v1", "calendar_round"}:
+    if profile not in FEATURE_PROFILES:
         return None, "최적화 연구의 특징 프로파일을 확인할 수 없습니다."
     if dataset_integrity is None:
         return None, "현재 데이터 무결성 정보를 확인할 수 없습니다."
-    if profile == "bonus_lag_v1" and not dataset_integrity.get("all_draws_have_bonus"):
+    if profile in {"bonus_lag_v1", "integrated_v1"} and not dataset_integrity.get(
+        "all_draws_have_bonus"
+    ):
         return None, "보너스 번호 특징에 필요한 데이터가 현재 데이터에 없습니다."
-    if profile == "calendar_round" and not dataset_integrity.get("all_draws_dated"):
+    if profile in {"calendar_round", "integrated_v1"} and not dataset_integrity.get(
+        "all_draws_dated"
+    ):
         return None, "회차·날짜 특징에 필요한 추첨일 데이터가 현재 데이터에 없습니다."
 
     params = study.get("best_parameters")

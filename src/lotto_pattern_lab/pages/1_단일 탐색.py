@@ -201,7 +201,7 @@ if base_dataset is not None:
     )
     feature_profile = st.selectbox(
         "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
-        ("legacy", "calendar_round", "bonus_lag_v1"),
+        ("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
         help="\uae30\uc874\u0020\ud2b9\uc9d5\u0020\ud504\ub85c\ud30c\uc77c\uc785\ub2c8\ub2e4\u002e\u0020\ub0a0\uc9dc\u0020\ud2b9\uc9d5\uc740\u0020\ubaa8\ub4e0\u0020\ud68c\ucc28\uc5d0\u0020\uacf5\uc2dd\u0020\ucd94\ucc28\uc77c\uc774\u0020\uc788\uc744\u0020\ub54c\ub9cc\u0020\uc0ac\uc6a9\ud569\ub2c8\ub2e4\u002e",
         key="general_feature_profile",
     )
@@ -246,7 +246,7 @@ if base_dataset is not None:
             end_date = st.date_input(
                 "종료일", value=latest_date, min_value=first_date, max_value=latest_date
             )
-    if feature_profile == "calendar_round" and any(
+    if feature_profile in {"calendar_round", "integrated_v1"} and any(
         record.draw_date is None for record in base_dataset.records
     ):
         st.warning("Calendar features need dates on every draw. Use the official verified dataset.")
@@ -268,7 +268,7 @@ if base_dataset is not None:
             "보너스 번호를 별도 GP 연구 대상으로 실행",
             value=False,
             disabled=(
-                feature_profile == "bonus_lag_v1"
+                feature_profile in {"bonus_lag_v1", "integrated_v1"}
                 or not all(record.draw.bonus is not None for record in selected_dataset.records)
             ),
             help="1등 6개 번호 모델은 유지하고, 별도 실행으로 보너스 번호 정확 일치를 평가합니다.",
@@ -283,11 +283,11 @@ run_clicked = st.button(
         selected_dataset is None
         or (source_mode == "CSV 업로드" and uploaded is None)
         or (
-            feature_profile == "bonus_lag_v1"
+            feature_profile in {"bonus_lag_v1", "integrated_v1"}
             and not all(record.draw.bonus is not None for record in selected_dataset.records)
         )
         or (
-            feature_profile == "calendar_round"
+            feature_profile in {"calendar_round", "integrated_v1"}
             and any(record.draw_date is None for record in selected_dataset.records)
         )
     ),
@@ -305,7 +305,7 @@ if run_clicked and selected_dataset is not None:
             generations_in_run = max(int(event["generations"]), 1)
             if "validation_score" in event:
                 run_label = str(event["run"])
-                runs_per_seed = 3 if feature_profile == "bonus_lag_v1" else 2
+                runs_per_seed = 3 if feature_profile in {"bonus_lag_v1", "integrated_v1"} else 2
                 if run_label == "actual_one_number":
                     run_index = 0
                 elif run_label == "actual_six_number_set":

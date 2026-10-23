@@ -9,12 +9,14 @@ from collections import Counter, defaultdict
 from typing import Any
 
 from .dataset import DrawDataset, load_csv
+from .feature_schema import feature_mapping
 from .features import build_features_for_target, feature_names
 from .paths import project_path
 from .prediction import evaluate_formula, evaluate_gate
 from .research import dataset_digest
 from .research_features import (
     ResearchFeatureConfig,
+    build_integrated_features_for_target,
     build_research_features_for_target,
     research_feature_names,
 )
@@ -138,6 +140,14 @@ def _target_features(
     config = experiment.get("config", {})
     max_lag = int(config.get("max_lag", 10))
     profile = str(config.get("feature_profile", "legacy"))
+    if profile == "integrated_v1":
+        target_date = next(
+            (row.draw_date for row in dataset.records if row.round_number == target_round), None
+        )
+        return (
+            build_integrated_features_for_target(dataset, target_round, target_date, max_lag),
+            tuple(item["name"] for item in feature_mapping(profile, max_lag).values()),
+        )
     if profile == "legacy":
         return build_features_for_target(dataset, target_round, max_lag), feature_names(max_lag)
     if profile == "bonus_lag_v1":

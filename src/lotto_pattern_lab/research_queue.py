@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .feature_schema import FEATURE_PROFILES
 from .paths import PROJECT_ROOT
 
 QUEUE_DB = PROJECT_ROOT / "data" / "database" / "research_queue.sqlite"
@@ -142,7 +143,7 @@ class ResearchQueueStore:
     ) -> str:
         if engine not in {"intermittent_gp", "pysr_symbolic_regression", "comparison"}:
             raise ValueError("Unsupported research engine.")
-        if feature_profile not in {"legacy", "calendar_round", "bonus_lag_v1"}:
+        if feature_profile not in FEATURE_PROFILES:
             raise ValueError("Unsupported feature profile.")
         if duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive.")
@@ -327,7 +328,7 @@ class ResearchQueueStore:
             "comparison",
         }:
             raise ValueError("Unsupported research engine.")
-        if feature_profile not in {"legacy", "calendar_round", "bonus_lag_v1"}:
+        if feature_profile not in FEATURE_PROFILES:
             raise ValueError("Unsupported feature profile.")
         if duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive.")

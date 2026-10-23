@@ -180,7 +180,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     parser.add_argument("--hidden-states", type=int, default=3)
     parser.add_argument(
         "--feature-profile",
-        choices=("legacy", "calendar_round", "bonus_lag_v1"),
+        choices=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
         default="legacy",
     )
     parser.add_argument("--elite-seeding", action="store_true")
@@ -261,7 +261,7 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument("--engine", action="append", choices=SUPPORTED_ENGINES)
     parser.add_argument(
         "--feature-profile",
-        choices=("legacy", "calendar_round", "bonus_lag_v1"),
+        choices=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
         default="legacy",
     )
     parser.add_argument("--elite-seeding", action="store_true")
@@ -397,7 +397,7 @@ def _run_optimization_cli(argv: list[str]) -> None:
     parser.add_argument("--max-lag", type=int, default=10)
     parser.add_argument(
         "--feature-profile",
-        choices=("legacy", "calendar_round", "bonus_lag_v1"),
+        choices=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
         default="legacy",
     )
     parser.add_argument("--storage-directory", default="data/optimizations")

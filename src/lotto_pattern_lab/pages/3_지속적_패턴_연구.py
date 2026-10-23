@@ -70,7 +70,6 @@ if st.session_state.pop("optimization_reset_pending", False):
 research_tab, optimization_tab = st.tabs(
     ["지속적 패턴 연구", "연구 조건 자동 최적화"],
     key="research_workspace_tab",
-    default=st.session_state.get("research_workspace_tab", "지속적 패턴 연구"),
     on_change="rerun",
 )
 with research_tab:
@@ -475,11 +474,15 @@ def render_optimization() -> None:
                 )
                 new_profile = st.selectbox(
                     "특징 프로파일",
-                    ("legacy", "bonus_lag_v1", "calendar_round"),
+                    ("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
                     format_func=lambda value: {
                         "legacy": "기본 당첨번호 특징",
                         "bonus_lag_v1": "보너스 번호 포함 특징",
                         "calendar_round": "회차 및 날짜 특징",
+                        "integrated_v1": (
+                            "\uc804\uccb4 \ud1b5\ud569 \ud2b9\uc9d5 "
+                            "(\uae30\ubcf8 + \ud68c\ucc28·\ub0a0\uc9dc + \ubcf4\ub108\uc2a4)"
+                        ),
                     }[value],
                     help=(
                         "프로파일은 이름으로 추측하지 않습니다. 선택한 데이터에 "
@@ -952,9 +955,9 @@ def _start_optimization(
 
         dataset = load_csv(data_path)
         integrity = dataset_integrity_report(dataset)
-        if profile == "bonus_lag_v1" and not integrity["all_draws_have_bonus"]:
+        if profile in {"bonus_lag_v1", "integrated_v1"} and not integrity["all_draws_have_bonus"]:
             raise ValueError("선택한 데이터에 보너스 번호가 없습니다.")
-        if profile == "calendar_round" and not integrity["all_draws_dated"]:
+        if profile in {"calendar_round", "integrated_v1"} and not integrity["all_draws_dated"]:
             raise ValueError("선택한 데이터에 추첨일이 없습니다.")
         conflict = _execution_conflict(records)
         if conflict:
@@ -1032,7 +1035,7 @@ def _start_existing_optimization(
         st.error("기존 SQLite 연구 기록을 찾지 못해 이어서 실행할 수 없습니다.")
         return
     profile = record.get("feature_profile")
-    if profile not in {"legacy", "bonus_lag_v1", "calendar_round"}:
+    if profile not in {"legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"}:
         st.error("특징 프로파일이 저장 기록에 없어 이름으로 추정하지 않고 실행을 막았습니다.")
         return
     expected_range = record.get("dataset_range")

@@ -279,7 +279,7 @@ with st.expander("실험 후보에서 단순화 버전 만들기", expanded=Fals
             source_profile = str(experiment.get("config", {}).get("feature_profile", "legacy"))
             input_path = project_path(
                 "data/raw/lotto_draws_753_1246_with_bonus.csv"
-                if source_profile == "bonus_lag_v1"
+                if source_profile in {"bonus_lag_v1", "integrated_v1"}
                 else "data/official/draws.csv"
             )
             if not input_path.is_file():

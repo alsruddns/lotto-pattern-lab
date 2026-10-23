@@ -138,3 +138,25 @@ def build_bonus_features_for_target(
     if any(round_number not in prior or prior[round_number] is None for round_number in needed):
         raise ValueError("Bonus target requires complete preceding bonus history.")
     return main_features + tuple(float(prior[round_number]) for round_number in needed)
+
+
+def append_lagged_bonus_features(
+    examples: tuple[Example, ...], dataset: DrawDataset, max_lag: int = MAX_LAG
+) -> tuple[Example, ...]:
+    """Append only preceding bonus values to existing examples, preserving their labels."""
+    bonus_by_round = {record.round_number: record.draw.bonus for record in dataset.records}
+    if any(value is None for value in bonus_by_round.values()):
+        raise ValueError("Bonus features require a bonus value for every draw.")
+    output: list[Example] = []
+    for example in examples:
+        previous = [bonus_by_round.get(example.round_number - lag) for lag in range(1, max_lag + 1)]
+        if any(value is None for value in previous):
+            raise ValueError("Bonus features require complete contiguous bonus history.")
+        output.append(
+            Example(
+                example.round_number,
+                example.features + tuple(float(value) for value in previous),
+                example.winning_numbers,
+            )
+        )
+    return tuple(output)

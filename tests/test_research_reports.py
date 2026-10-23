@@ -13,7 +13,12 @@ def test_report_includes_reproducibility_and_interpretation_fields() -> None:
             "dataset_sha256": "abc123",
             "dataset_round_range": [753, 1246],
             "engines": ["intermittent_gp"],
-            "config": {"population_size": 32, "generations": 4, "workers": 2},
+            "config": {
+                "population_size": 32,
+                "generations": 4,
+                "workers": 2,
+                "feature_profile": "integrated_v1",
+            },
             "dashboard_summary": {"candidate_count": 7, "completed_experiment_count": 3},
         }
     )
@@ -21,6 +26,7 @@ def test_report_includes_reproducibility_and_interpretation_fields() -> None:
     assert report.startswith("# ")
     assert "abc123" in report
     assert "7" in report
+    assert "integrated_v1" in report
     assert "\uc0ac\uc804 \uc608\uce21" in report
     assert "\ufffd" not in report
 

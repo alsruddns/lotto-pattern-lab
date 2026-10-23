@@ -22,7 +22,11 @@ from .intermittent import _gate_rule, _predict_numbers, _validate_formula_ast
 from .paths import project_path
 from .pattern_library import canonical_formula
 from .prediction import _OPERATIONS
-from .research_features import ResearchFeatureConfig, build_research_examples
+from .research_features import (
+    ResearchFeatureConfig,
+    build_integrated_examples,
+    build_research_examples,
+)
 
 
 def formula_metrics(formula: str) -> dict[str, int | str]:
@@ -109,6 +113,8 @@ def simplify_formula(formula: str) -> dict[str, Any]:
 
 
 def _examples(dataset: DrawDataset, feature_profile: str, max_lag: int):
+    if feature_profile == "integrated_v1":
+        return build_integrated_examples(dataset, max_lag)
     if feature_profile == "calendar_round":
         return build_research_examples(
             dataset,
