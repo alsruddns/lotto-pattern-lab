@@ -410,6 +410,7 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
         control_runs=0,
         min_activation_rate=0.15,
         hidden_states=4,
+        feature_profile="legacy",
     )
     first = run_research_schedule(
         dataset,
@@ -452,6 +453,8 @@ def test_research_scheduler_saves_checkpoint_and_resumes_at_next_trial(tmp_path)
     # The first run hit max_runs; model an explicit pause before testing resume.
     paused_state = json.loads(checkpoint.read_text(encoding="utf-8"))
     paused_state["status"] = "paused"
+    # Older checkpoint versions omit the profile; restore must keep their legacy meaning.
+    paused_state["config"].pop("feature_profile")
     checkpoint.write_text(json.dumps(paused_state), encoding="utf-8")
 
     second = run_research_schedule(

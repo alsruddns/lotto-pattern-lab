@@ -248,12 +248,31 @@ if not research_profiles:
 elif dataset is None:
     st.info("연구 기반 추천을 만들려면 먼저 연속된 과거 회차가 포함된 데이터를 선택하세요.")
 else:
-    profile_index = research_profiles.index("legacy") if "legacy" in research_profiles else 0
+    profile_index = (
+        research_profiles.index("integrated_v1")
+        if "integrated_v1" in research_profiles
+        else 0
+    )
     research_profile = st.selectbox(
         "추천에 사용할 특징 프로파일",
         research_profiles,
         index=profile_index,
+        format_func=lambda value: {
+            "legacy": "기본 특징",
+            "calendar_round": "회차·날짜 특징",
+            "bonus_lag_v1": "보너스 번호 포함 특징",
+            "integrated_v1": "전체 통합 특징",
+        }.get(value, value),
         key="research_prediction_feature_profile",
+    )
+    st.caption(
+        "포함 특징 그룹: "
+        + {
+            "legacy": "기본",
+            "calendar_round": "기본 + 회차·날짜",
+            "bonus_lag_v1": "기본 + 과거 보너스",
+            "integrated_v1": "기본 + 회차·날짜 + 과거 보너스",
+        }.get(research_profile, "저장된 연구 프로파일")
     )
     profile_candidates = [
         item for item in research_candidates if item["feature_profile"] == research_profile

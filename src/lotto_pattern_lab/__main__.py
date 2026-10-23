@@ -10,6 +10,7 @@ from .atomic_io import LockTimeoutError, atomic_write_bytes, interprocess_lock
 from .dataset import load_csv, make_random_dataset, save_official_csv
 from .draw import Draw
 from .experiment import run_experiment
+from .feature_schema import DEFAULT_FEATURE_PROFILE
 from .gp_config import GPConfig
 from .gp_engine import SearchConfig
 from .intermittent import IntermittentConfig
@@ -23,10 +24,11 @@ from .research import (
     DEFAULT_ENGINES,
     GLOBAL_RESEARCH_LOCK,
     SUPPORTED_ENGINES,
+    load_checkpoint,
     request_stop,
     run_research_schedule,
 )
-from .research_optimization import optimize_gp
+from .research_optimization import list_optimization_studies, optimize_gp
 from .storage import ExperimentStore
 from .tabular_models import run_tabular_model
 
@@ -181,7 +183,7 @@ def _run_intermittent_cli(argv: list[str]) -> None:
     parser.add_argument(
         "--feature-profile",
         choices=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
-        default="legacy",
+        default=DEFAULT_FEATURE_PROFILE,
     )
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
@@ -262,7 +264,7 @@ def _run_research_cli(argv: list[str]) -> None:
     parser.add_argument(
         "--feature-profile",
         choices=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
-        default="legacy",
+        default=None,
     )
     parser.add_argument("--elite-seeding", action="store_true")
     parser.add_argument("--elite-seed-ratio", type=float, default=0.2)
@@ -308,6 +310,14 @@ def _run_research_cli(argv: list[str]) -> None:
     if args.stop:
         print(f"Stop requested: {request_stop(args.checkpoint)}")
         return
+    if args.feature_profile is None:
+        if args.resume:
+            # Missing metadata in a historical checkpoint keeps its legacy meaning.
+            args.feature_profile = load_checkpoint(args.checkpoint).get("config", {}).get(
+                "feature_profile", "legacy"
+            )
+        else:
+            args.feature_profile = DEFAULT_FEATURE_PROFILE
     dataset = load_csv(project_path(args.csv))
     config = IntermittentConfig(
         population_size=args.population,
@@ -398,11 +408,25 @@ def _run_optimization_cli(argv: list[str]) -> None:
     parser.add_argument(
         "--feature-profile",
         choices=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
-        default="legacy",
+        default=None,
     )
     parser.add_argument("--storage-directory", default="data/optimizations")
     parser.add_argument("--experiment-directory", default="experiments/optimization_trials")
     args = parser.parse_args(argv)
+    if args.feature_profile is None:
+        if args.action == "new":
+            args.feature_profile = DEFAULT_FEATURE_PROFILE
+        else:
+            stored = next(
+                (
+                    item
+                    for item in list_optimization_studies(args.storage_directory)
+                    if item.get("study_name") == args.study_name
+                ),
+                {},
+            )
+            # Old studies without a profile attribute retain the historical fallback.
+            args.feature_profile = stored.get("feature_profile", "legacy")
     dataset = load_csv(project_path(args.csv))
     config = IntermittentConfig(
         population_size=args.population,

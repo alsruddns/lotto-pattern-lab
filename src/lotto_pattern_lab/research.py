@@ -309,7 +309,11 @@ def run_research_schedule(
             )
         if state.get("dataset_sha256") != data_hash:
             raise ValueError("Cannot resume: checkpoint dataset hash differs from selected data.")
-        stored_config = {**asdict(IntermittentConfig()), **state.get("config", {})}
+        checkpoint_config = state.get("config", {})
+        stored_config = {**asdict(IntermittentConfig()), **checkpoint_config}
+        if "feature_profile" not in checkpoint_config:
+            # Before profile metadata was persisted, GP experiments used legacy features.
+            stored_config["feature_profile"] = "legacy"
         if stored_config != config_payload or tuple(state.get("engines", ())) != engines:
             raise ValueError("Cannot resume: checkpoint configuration or engine list differs.")
         stored_pysr_config = state.get("pysr_config")

@@ -20,6 +20,7 @@ from lotto_pattern_lab.storage import ExperimentStore
 
 
 def test_pysr_config_validates_library_native_options() -> None:
+    assert PySRConfig().feature_profile == "integrated_v1"
     with pytest.raises(ValueError, match="Unsupported PySR binary operator"):
         PySRConfig(binary_operators=("bit_xor",))
     with pytest.raises(ValueError, match="less than one"):
@@ -125,7 +126,13 @@ def test_pysr_runner_persists_six_independent_position_fits_without_leakage(
     store = ExperimentStore(tmp_path / "experiments", minimum_compress_bytes=10**9)
     result = run_pysr_experiment(
         dataset,
-        PySRConfig(target="main_positions", niterations=1, population_size=8, populations=1),
+        PySRConfig(
+            target="main_positions",
+            feature_profile="legacy",
+            niterations=1,
+            population_size=8,
+            populations=1,
+        ),
         store,
         cache_path=str(tmp_path / "cache.sqlite"),
     )

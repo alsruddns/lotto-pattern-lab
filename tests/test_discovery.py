@@ -151,6 +151,7 @@ def test_intermittent_experiment_persists_selected_rules_and_control_status(tmp_
         workers=1,
         seed=14,
         control_runs=0,
+        feature_profile="legacy",
     )
     store = ExperimentStore(tmp_path)
 

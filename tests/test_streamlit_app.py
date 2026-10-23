@@ -56,6 +56,11 @@ def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypat
     app = AppTest.from_file(page).run(timeout=60)
 
     assert not app.exception, [exception.message for exception in app.exception]
+    assert app.session_state["new_profile"] == "integrated_v1"
+    app.session_state["new_profile"] = "calendar_round"
+    app.run(timeout=60)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert app.session_state["new_profile"] == "calendar_round"
     tab_labels = [tab.label for tab in app.tabs]
     assert "지속적 패턴 연구" in tab_labels
     assert "연구 조건 자동 최적화" in tab_labels

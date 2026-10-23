@@ -25,7 +25,12 @@ from .evaluation_cache import (
     classify_candidate,
     evaluation_fingerprint,
 )
-from .feature_schema import FEATURE_PROFILES, feature_mapping, feature_schema_version
+from .feature_schema import (
+    DEFAULT_FEATURE_PROFILE,
+    FEATURE_PROFILES,
+    feature_mapping,
+    feature_schema_version,
+)
 from .features import Example, build_bonus_examples, build_examples
 from .paths import project_path
 from .prize_evaluation import classify_prize_tier
@@ -60,7 +65,7 @@ class PySRConfig:
     """PySR-native settings; none of the DEAP-specific probabilities are reused."""
 
     target: str = "main_positions"
-    feature_profile: str = "legacy"
+    feature_profile: str = DEFAULT_FEATURE_PROFILE
     train_ratio: float = 0.6
     validation_ratio: float = 0.2
     max_lag: int = 10

@@ -17,6 +17,7 @@ from typing import Any
 
 import streamlit as st
 
+from lotto_pattern_lab.feature_schema import DEFAULT_FEATURE_PROFILE
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.optimization_process_state import launch_optimization_worker
 from lotto_pattern_lab.paths import PROJECT_ROOT, project_path
@@ -106,6 +107,7 @@ def _invalidate_optimization_history_cache() -> None:
 
 
 def render_optimization() -> None:
+    st.session_state.setdefault("optimization_new_profile", DEFAULT_FEATURE_PROFILE)
     st.title("연구 조건 자동 최적화")
     apply_failure = st.session_state.pop("optimization_apply_failure", None)
     if apply_failure:
@@ -475,6 +477,10 @@ def render_optimization() -> None:
                 new_profile = st.selectbox(
                     "특징 프로파일",
                     ("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
+                    index=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1").index(
+                        DEFAULT_FEATURE_PROFILE
+                    ),
+                    key="optimization_new_profile",
                     format_func=lambda value: {
                         "legacy": "기본 당첨번호 특징",
                         "bonus_lag_v1": "보너스 번호 포함 특징",
@@ -488,6 +494,15 @@ def render_optimization() -> None:
                         "프로파일은 이름으로 추측하지 않습니다. 선택한 데이터에 "
                         "필수 정보가 있는지 시작 전에 검사합니다."
                     ),
+                )
+                st.caption(
+                    "포함 특징 그룹: "
+                    + {
+                        "legacy": "기본",
+                        "calendar_round": "기본 + 회차·날짜",
+                        "bonus_lag_v1": "기본 + 과거 보너스",
+                        "integrated_v1": "기본 + 회차·날짜 + 과거 보너스",
+                    }[new_profile]
                 )
                 new_mode = st.selectbox(
                     "최적화 모드",

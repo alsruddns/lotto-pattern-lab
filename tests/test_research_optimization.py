@@ -236,7 +236,12 @@ def test_new_optuna_study_records_exact_dataset_snapshot_and_resume_is_immutable
 
     dataset = make_random_dataset(30, seed=37)
     config = IntermittentConfig(
-        population_size=8, generations=1, max_depth=2, workers=1, control_runs=0
+        population_size=8,
+        generations=1,
+        max_depth=2,
+        workers=1,
+        control_runs=0,
+        feature_profile="legacy",
     )
     monkeypatch.setattr(optimization, "optuna_status", lambda: {"available": True})
     optimization.optimize_gp(

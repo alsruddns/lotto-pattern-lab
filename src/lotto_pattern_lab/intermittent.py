@@ -13,6 +13,7 @@ from deap import base, creator, gp, tools
 
 from .backtest import DataSplits
 from .feature_schema import (
+    DEFAULT_FEATURE_PROFILE,
     FEATURE_PROFILES,
     PRIMITIVE_SET_VERSION,
     feature_mapping,
@@ -36,7 +37,7 @@ class IntermittentConfig(GPConfig):
     min_activation_rate: float = 0.1
     top_candidates: int = 10
     hidden_states: int = 3
-    feature_profile: str = "legacy"
+    feature_profile: str = DEFAULT_FEATURE_PROFILE
     elite_seeding_enabled: bool = False
     elite_seed_ratio: float = 0.2
 

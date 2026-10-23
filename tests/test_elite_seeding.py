@@ -362,6 +362,7 @@ def test_research_checkpoint_reuses_selected_elites_and_next_seed(tmp_path) -> N
         control_runs=0,
         elite_seeding_enabled=True,
         elite_seed_ratio=0.25,
+        feature_profile="legacy",
     )
     first = run_research_schedule(
         dataset,

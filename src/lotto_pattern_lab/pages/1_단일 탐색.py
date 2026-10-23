@@ -18,6 +18,7 @@ from lotto_pattern_lab.dataset import (
     save_official_csv,
 )
 from lotto_pattern_lab.experiment import run_experiment
+from lotto_pattern_lab.feature_schema import DEFAULT_FEATURE_PROFILE
 from lotto_pattern_lab.gp_config import GPConfig
 from lotto_pattern_lab.gp_engine import SearchConfig
 from lotto_pattern_lab.intermittent import IntermittentConfig
@@ -202,9 +203,25 @@ if base_dataset is not None:
     feature_profile = st.selectbox(
         "\ud2b9\uc9d5 \ud504\ub85c\ud30c\uc77c",
         ("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1"),
+        format_func=lambda value: {
+            "legacy": "기본 특징",
+            "calendar_round": "회차·날짜 특징",
+            "bonus_lag_v1": "보너스 번호 포함 특징",
+            "integrated_v1": "전체 통합 특징",
+        }[value],
         help="\uae30\uc874\u0020\ud2b9\uc9d5\u0020\ud504\ub85c\ud30c\uc77c\uc785\ub2c8\ub2e4\u002e\u0020\ub0a0\uc9dc\u0020\ud2b9\uc9d5\uc740\u0020\ubaa8\ub4e0\u0020\ud68c\ucc28\uc5d0\u0020\uacf5\uc2dd\u0020\ucd94\ucc28\uc77c\uc774\u0020\uc788\uc744\u0020\ub54c\ub9cc\u0020\uc0ac\uc6a9\ud569\ub2c8\ub2e4\u002e",
         key="general_feature_profile",
+        index=("legacy", "calendar_round", "bonus_lag_v1", "integrated_v1").index(
+            DEFAULT_FEATURE_PROFILE
+        ),
     )
+    profile_groups = {
+        "legacy": "기본",
+        "calendar_round": "기본 + 회차·날짜",
+        "bonus_lag_v1": "기본 + 과거 보너스",
+        "integrated_v1": "기본 + 회차·날짜 + 과거 보너스",
+    }
+    st.caption(f"포함 특징 그룹: {profile_groups[feature_profile]}")
     st.caption(
         f"데이터 상태: {status_text} · "
         f"기본 연구 범위: 2017-05-06(753회) 이후 · 현재 {low_round}~{high_round}회"

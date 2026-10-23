@@ -35,6 +35,7 @@ def _config() -> IntermittentConfig:
         validation_ratio=0.25,
         max_lag=5,
         control_runs=0,
+        feature_profile="legacy",
     )
 
 

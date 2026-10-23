@@ -25,7 +25,7 @@ from lotto_pattern_lab.cumulative_research import (
 )
 from lotto_pattern_lab.data_audit import dataset_hashes
 from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
-from lotto_pattern_lab.feature_schema import feature_schema_version
+from lotto_pattern_lab.feature_schema import DEFAULT_FEATURE_PROFILE, feature_schema_version
 from lotto_pattern_lab.intermittent import IntermittentConfig
 from lotto_pattern_lab.paths import PROJECT_ROOT, locate_checkpoint, project_path
 from lotto_pattern_lab.pattern_library import PatternLibrary
@@ -135,7 +135,7 @@ def _apply_research_preset() -> None:
         "new_elite_seed_ratio": 0.20,
     }
     st.session_state.update(values)
-    profile = st.session_state.get("new_profile", "legacy")
+    profile = st.session_state.get("new_profile", DEFAULT_FEATURE_PROFILE)
     pysr_defaults = PySRConfig(feature_profile=profile)
     is_comparison = st.session_state.get("new_research_engine") == ENGINE_OPTIONS[2]
     share = 0.5 if is_comparison else 0.8
@@ -802,7 +802,7 @@ with new_tab:
         new_integrity = None
         st.error(f"선택한 데이터를 읽지 못했습니다: {error}")
     st.session_state.setdefault("new_research_engine", ENGINE_OPTIONS[0])
-    st.session_state.setdefault("new_profile", "legacy")
+    st.session_state.setdefault("new_profile", DEFAULT_FEATURE_PROFILE)
     st.session_state.setdefault("new_duration_minutes", 180)
     st.session_state.setdefault("new_duration_mode", "recommended")
     st.session_state.setdefault("new_custom_duration_minutes", 5)
@@ -2244,6 +2244,9 @@ with resume_tab:
         if selected_resume.get("_error"):
             st.error(f"재개 검증 실패: {selected_resume['_error']}")
         config_payload = {**state.get("config", {})}
+        if "feature_profile" not in config_payload:
+            # Historical checkpoints without profile metadata were generated as legacy.
+            config_payload["feature_profile"] = "legacy"
         try:
             resume_config = IntermittentConfig(**config_payload)
         except (TypeError, ValueError):

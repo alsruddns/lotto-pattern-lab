@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+from pathlib import Path
+
 from lotto_pattern_lab import __main__ as app_cli
 from lotto_pattern_lab.research_startup import worker_start_failure_metadata
 
@@ -43,6 +46,56 @@ def test_research_cli_accepts_cumulative_mode_and_optimization_source(monkeypatc
     assert captured["optimization_origin"] == {"study_name": "test-study"}
     assert captured["duration_seconds"] == 300
     assert "test-only" in capsys.readouterr().out
+
+
+def test_new_research_cli_defaults_to_integrated_profile(monkeypatch, capsys):
+    captured = {}
+    monkeypatch.setattr(app_cli, "load_csv", lambda _path: object())
+
+    def fake_run_research_schedule(_dataset, config, **kwargs):
+        captured["profile"] = config.feature_profile
+        return {"status": "test-only"}
+
+    monkeypatch.setattr(app_cli, "run_research_schedule", fake_run_research_schedule)
+    app_cli._run_research_cli(
+        ["--csv", "unused.csv", "--checkpoint", "unused.json", "--engine", "intermittent_gp"]
+    )
+
+    assert captured["profile"] == "integrated_v1"
+    assert "test-only" in capsys.readouterr().out
+
+
+def test_optuna_cli_defaults_only_new_studies_to_integrated_profile(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    captured = []
+    monkeypatch.setattr(app_cli, "load_csv", lambda _path: object())
+    monkeypatch.setattr(app_cli, "project_path", lambda value: Path(value))
+    monkeypatch.setattr(app_cli, "interprocess_lock", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(
+        app_cli,
+        "list_optimization_studies",
+        lambda _directory: [{"study_name": "existing", "feature_profile": "bonus_lag_v1"}],
+    )
+
+    def fake_optimize_gp(_dataset, config, **_kwargs):
+        captured.append(config.feature_profile)
+        return {"status": "test-only"}
+
+    monkeypatch.setattr(app_cli, "optimize_gp", fake_optimize_gp)
+    shared = [
+        "--csv",
+        "unused.csv",
+        "--study-name",
+        "existing",
+        "--storage-directory",
+        str(tmp_path / "studies"),
+    ]
+    app_cli._run_optimization_cli([*shared, "--action", "new"])
+    app_cli._run_optimization_cli([*shared, "--action", "resume"])
+
+    assert captured == ["integrated_v1", "bonus_lag_v1"]
+    assert capsys.readouterr().out.count("test-only") == 2
 
 
 def test_worker_exit_before_checkpoint_records_failure_without_fake_results():
