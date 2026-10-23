@@ -1576,8 +1576,22 @@ else:
                 else:
                     st.error(f"재검증 보고서 복사 실패: {response.get('message', '브라우저 오류')}")
 
-    report = build_chatgpt_report(selected)
-    full_report = build_chatgpt_report(selected, detailed=True)
+    top_candidates_per_model = st.number_input(
+        "보고서 상위 후보 수 (모델별)",
+        min_value=1,
+        max_value=20,
+        value=5,
+        step=1,
+        key="research_report_top_candidates_per_model",
+    )
+    report = build_chatgpt_report(
+        selected, top_candidates_per_model=int(top_candidates_per_model)
+    )
+    full_report = build_chatgpt_report(
+        selected,
+        detailed=True,
+        top_candidates_per_model=int(top_candidates_per_model),
+    )
     saved_report_path = selected.get("report_path")
     if saved_report_path:
         saved_report = project_path(saved_report_path)
@@ -1635,37 +1649,70 @@ else:
             )
             comparison = compare_research_rounds(left_record, right_record)
             if comparison["directly_comparable"]:
-                st.success(
-                    "데이터와 주요 탐색·평가 설정이 일치합니다. 모델별 지표를 비교할 수 있습니다."
-                )
+                if comparison["profile_comparison"]:
+                    st.success(
+                        "프로파일 이외의 데이터 범위, 분할, 엔진, 시드, 탐색 설정과 예산이 "
+                        "일치합니다. 모델별 지표를 분리해 프로파일을 비교합니다."
+                    )
+                else:
+                    st.success(
+                        "데이터와 탐색 조건이 일치합니다. "
+                        "모델별 지표를 비교합니다."
+                    )
             else:
                 st.warning("데이터셋 또는 탐색·평가 설정이 달라 직접 비교가 제한됩니다.")
                 st.json(
                     {
                         "동일 데이터 해시": comparison["same_dataset"],
+                        "동일 회차 범위": comparison["same_dataset_round_range"],
+                        "동일 시드·분할": comparison["same_seed_and_split_settings"],
+                        "동일 평가 예산": comparison["same_evaluation_budget"],
+                        "완료 실험 수 일치": comparison[
+                            "same_completed_experiment_count"
+                        ],
+                        "두 연구 모두 완료": comparison["both_researches_completed"],
                         "동일 평가 설정": comparison["same_evaluation_settings"],
                         "설정 차이": comparison["differences"],
                     }
                 )
-            st.dataframe(
-                [
-                    {
-                        "연구": f"연구 {record['research_round']}회차",
-                        "모델": model,
-                        "지표": metric,
-                        "평균": stats.get("mean"),
-                        "최고": stats.get("best"),
-                        "중앙값": stats.get("median"),
-                    }
-                    for record, side in (
-                        (left_record, "left_metrics"),
-                        (right_record, "right_metrics"),
-                    )
-                    for model, model_stats in comparison[side].items()
-                    for metric, stats in model_stats.items()
-                ],
-                hide_index=True,
-                width="stretch",
-            )
+            if comparison["directly_comparable"]:
+                st.dataframe(
+                    [
+                        {
+                            "\uc5f0\uad6c": f"\uc5f0\uad6c {record['research_round']}\ud68c\ucc28",
+                            "\ud504\ub85c\ud30c\uc77c": (record.get("config") or {}).get(
+                                "feature_profile", "\ubbf8\uc218\uc9d1"
+                            ),
+                            "\ubaa8\ub378": model,
+                            "\ud3c9\uac00 \uad6c\uac04": phase,
+                            "\uace0\uc720 \uc2e4\ud5d8 \uc218": values["experiment_count"],
+                            "\ud3c9\uac00 \ud68c\ucc28 \ud569\uacc4": values[
+                                "evaluation_round_count"
+                            ],
+                            "\uace0\uc720 \ud3c9\uac00 \ud68c\ucc28": values[
+                                "unique_evaluation_round_count"
+                            ],
+                            "\ud65c\uc131 \uc608\uce21 \uc218": values["active_prediction_count"],
+                            "\uc801\uc911 \uc218": values["hit_count"],
+                            "3+": values["3_plus"],
+                            "4+": values["4_plus"],
+                            "5+": values["5_plus"],
+                            "2\ub4f1": values["2_exact"],
+                            "6\uac1c \uc77c\uce58": values["6_exact"],
+                            "\ud3c9\uade0 \uc810\uc218": values["score"]["mean"],
+                            "\ub3c5\ub9bd \ud14c\uc2a4\ud2b8 \ucd5c\uace0 \uc810\uc218": values[
+                                "score"
+                            ]["best"],
+                        }
+                        for record, side in (
+                            (left_record, "left_phase_stats"),
+                            (right_record, "right_phase_stats"),
+                        )
+                        for model, phases in comparison[side].items()
+                        for phase, values in phases.items()
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                )
     else:
         st.info("회차 비교는 연구가 2회 이상 저장되면 사용할 수 있습니다.")

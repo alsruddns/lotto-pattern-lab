@@ -498,6 +498,7 @@ def summarize_experiment(
         "experiment_id": result.get("experiment_id"),
         "status": result.get("status"),
         "seed": result.get("seed", config.get("seed")),
+        "split_rounds": result.get("splits"),
         "runtime_seconds": result.get("runtime_seconds"),
         "candidate_count": int(
             result.get("candidate_count")
@@ -665,6 +666,12 @@ def summarize_experiment(
                 "actual_runtime_seconds": actual_runtime,
                 "paired_runtime_seconds": paired_runtime,
                 "runtime_source": runtime_source,
+                "actual_candidate_diversity": _candidate_diversity(
+                    result.get(model_key, {})
+                ),
+                "unseeded_candidate_diversity": _candidate_diversity(
+                    paired.get(model_key, {})
+                ),
             }
     output["p_values"] = result.get("random_control_empirical_p_value", {})
     output["control_replicates"] = result.get("random_control_replicates")
@@ -683,6 +690,23 @@ def _progress_count(result: dict[str, Any]) -> int:
     if isinstance(progress, list):
         return len(progress)
     return int(result.get("storage", {}).get("statistics", {}).get("progress_event_count", 0))
+
+
+def _candidate_diversity(model: dict[str, Any]) -> dict[str, int | None]:
+    candidates = model.get("candidates", [])
+    if not candidates:
+        return {"candidate_count": None, "unique_formula_count": None}
+    signatures = {
+        (
+            str(item.get("activation_condition", "")),
+            tuple(map(str, item.get("formulas") or ())),
+        )
+        for item in candidates
+    }
+    return {
+        "candidate_count": len(candidates),
+        "unique_formula_count": len(signatures),
+    }
 
 
 def _progress_span(progress: Any, prefix: str) -> float | None:
@@ -755,15 +779,57 @@ def merge_unique_hit_rounds(
 
 def _top_candidates(result: dict[str, Any], limit: int = 10) -> list[dict[str, Any]]:
     candidates = []
+    config = result.get("config", {})
+    feature_profile = config.get("feature_profile")
+    validation_round_count = _phase_round_count(result, "validation_rounds")
+    registered_patterns = result.get("pattern_library_candidates", [])
     for model_key, label in (
         ("one_number_model", "one_number"),
         ("six_number_set_model", "six_number_set"),
     ):
         for rank, item in enumerate(result.get(model_key, {}).get("candidates", []), 1):
+            model_pattern_ids = [
+                str(pattern.get("pattern_id"))
+                for pattern in registered_patterns
+                if pattern.get("model") == model_key
+                and pattern.get("candidate_rank") == rank
+                and pattern.get("pattern_id")
+            ]
+            split_distributions = item.get("match_distribution_by_split", {})
+            test_distribution = split_distributions.get(
+                "independent_test", split_distributions.get("test", {})
+            )
+            if not isinstance(test_distribution, dict):
+                test_distribution = {}
+            candidate_events = item.get("activation_events", [])
+            if not isinstance(candidate_events, list):
+                candidate_events = []
+            test_events = [
+                event
+                for event in candidate_events
+                if isinstance(event, dict)
+                if _event_phase(event, result) == "independent_test"
+            ]
+            active_test_events = [event for event in test_events if event.get("active")]
+            hit_counts = {
+                int(hit_count): int(count)
+                for hit_count, count in test_distribution.items()
+            }
+            if not hit_counts and active_test_events:
+                for event in active_test_events:
+                    count = int(event.get("hit_count") or 0)
+                    hit_counts[count] = hit_counts.get(count, 0) + 1
             candidates.append(
                 {
                     "model": label,
                     "rank": rank,
+                    "formula_id": item.get("pattern_id")
+                    or item.get("formula_id")
+                    or item.get("candidate_id")
+                    or ", ".join(model_pattern_ids)
+                    or None,
+                    "feature_profile": feature_profile,
+                    "validation_round_count": validation_round_count,
                     "activation_condition": item.get("activation_condition"),
                     "formulas": item.get("formulas"),
                     "training_score": item.get("training_score"),
@@ -774,20 +840,68 @@ def _top_candidates(result: dict[str, Any], limit: int = 10) -> list[dict[str, A
                     "independent_test_activation_rate": item.get("test_activation_rate"),
                     "complexity": item.get("complexity"),
                     "validation_full_set_matches": item.get("validation_full_set_matches"),
-                    "independent_test_full_set_matches": item.get("test_full_set_matches"),
+                    "independent_test_full_set_matches": item.get(
+                        "test_full_set_matches", hit_counts.get(6) if hit_counts else None
+                    ),
+                    "validation_hit_counts": item.get("validation_hit_counts"),
+                    "independent_test_hit_counts": item.get("test_hit_counts"),
+                    "validation_activation_count": item.get("validation_activation_count"),
+                    "independent_test_activation_count": item.get("test_activation_count")
+                    or (len(active_test_events) if test_events else None),
+                    "validation_unique_round_count": item.get("validation_unique_round_count"),
+                    "independent_test_unique_round_count": item.get(
+                        "test_unique_round_count"
+                    )
+                    or len(
+                        {
+                            int(event["round_number"])
+                            for event in active_test_events
+                            if event.get("round_number") is not None
+                        }
+                    )
+                    or None,
+                    "independent_test_3_plus": (
+                        sum(count for hits, count in hit_counts.items() if hits >= 3)
+                        if hit_counts
+                        else None
+                    ),
+                    "independent_test_4_plus": (
+                        sum(count for hits, count in hit_counts.items() if hits >= 4)
+                        if hit_counts
+                        else None
+                    ),
+                    "independent_test_5_plus": (
+                        sum(count for hits, count in hit_counts.items() if hits >= 5)
+                        if hit_counts
+                        else None
+                    ),
+                    "independent_test_2_prize": sum(
+                        event.get("prize_tier") == 2 for event in active_test_events
+                    )
+                    if any("prize_tier" in event for event in active_test_events)
+                    else None,
                     "selection_basis": "validation score, train-validation stability, complexity",
                 }
             )
-    candidates.sort(
-        key=lambda item: (
-            item.get("validation_score") is not None,
-            float(item.get("validation_score") or -1),
-            -abs(float(item.get("training_score") or 0) - float(item.get("validation_score") or 0)),
-            -int(item.get("complexity") or 0),
-        ),
-        reverse=True,
-    )
-    return candidates[:limit]
+    # Keep model candidate lists independent. A score for a single-number model
+    # is not commensurate with a six-number set score.
+    output = []
+    for model in ("one_number", "six_number_set"):
+        model_candidates = [item for item in candidates if item["model"] == model]
+        model_candidates.sort(
+            key=lambda item: (
+                item.get("validation_score") is not None,
+                float(item.get("validation_score") or -1),
+                -abs(
+                    float(item.get("training_score") or 0)
+                    - float(item.get("validation_score") or 0)
+                ),
+                -int(item.get("complexity") or 0),
+            ),
+            reverse=True,
+        )
+        output.extend(model_candidates[:limit])
+    return output
 
 
 def rebuild_dashboard_summary(
@@ -1180,6 +1294,53 @@ def model_metric_stats(summary: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def model_phase_comparison_stats(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return count and hit context beside model scores for fair round comparisons."""
+    output: dict[str, Any] = {}
+    phase_names = {
+        "training": ("training", "train_rounds"),
+        "validation": ("validation", "validation_rounds"),
+        "independent_test": ("independent_test", "test_rounds"),
+    }
+    for model, experiments in summary.get("model_metrics", {}).items():
+        output[model] = {}
+        for phase, (source, split_key) in phase_names.items():
+            score_key = f"{source}_score"
+            round_key = f"{source}_target_round_count"
+            active_key = f"{source}_activation_count"
+            hit_key = f"{source}_hit_count"
+            hit_totals = summary.get("hit_totals", {}).get(f"{model}:{phase}", {})
+            distinct_rounds: set[int] = set()
+            has_round_bounds = False
+            for experiment in summary.get("experiment_summaries", []):
+                bounds = (experiment.get("split_rounds") or {}).get(split_key)
+                if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+                    has_round_bounds = True
+                    distinct_rounds.update(range(int(bounds[0]), int(bounds[1]) + 1))
+            output[model][phase] = {
+                "score": _stats([item.get(score_key) for item in experiments]),
+                "evaluation_round_count": sum(
+                    int(item.get(round_key) or 0) for item in experiments
+                ),
+                "unique_evaluation_round_count": (
+                    len(distinct_rounds) if has_round_bounds else None
+                ),
+                "active_prediction_count": sum(
+                    int(item.get(active_key) or 0) for item in experiments
+                ),
+                "hit_count": sum(int(item.get(hit_key) or 0) for item in experiments),
+                "3_plus": hit_totals.get("3_plus"),
+                "4_plus": hit_totals.get("4_plus"),
+                "5_plus": hit_totals.get("5_plus"),
+                "2_exact": hit_totals.get("2_exact"),
+                "6_exact": hit_totals.get("6_exact"),
+                "experiment_count": sum(
+                    item.get(score_key) is not None for item in experiments
+                ),
+            }
+    return output
+
+
 def paired_comparison_summary(summary: dict[str, Any]) -> dict[str, Any]:
     """Summarize paired seeded-versus-new-initialization comparisons by model."""
     output = {}
@@ -1224,6 +1385,19 @@ def paired_comparison_summary(summary: dict[str, Any]) -> dict[str, Any]:
             (item.get("runtime_source") for item in experiments if item.get("runtime_source")),
             None,
         )
+        for side, key in (
+            ("actual", "actual_candidate_diversity"),
+            ("unseeded", "unseeded_candidate_diversity"),
+        ):
+            for metric in ("candidate_count", "unique_formula_count"):
+                values = [
+                    item.get(key, {}).get(metric)
+                    for item in experiments
+                    if item.get(key, {}).get(metric) is not None
+                ]
+                row[f"{side}_{metric}_mean"] = (
+                    statistics.fmean(values) if values else None
+                )
         output[model] = row
     return output
 
@@ -1235,7 +1409,6 @@ def compare_research_rounds(left: dict[str, Any], right: dict[str, Any]) -> dict
     right_hash = right.get("dataset_sha256")
     same_dataset = bool(left_hash and right_hash and left_hash == right_hash)
     comparable_fields = (
-        "feature_profile",
         "train_ratio",
         "validation_ratio",
         "max_lag",
@@ -1248,21 +1421,82 @@ def compare_research_rounds(left: dict[str, Any], right: dict[str, Any]) -> dict
         "control_runs",
         "min_activation_rate",
         "hidden_states",
+        "seed",
+        "selection_criterion",
+        "evaluation_metric",
+    )
+    same_dataset_range = bool(
+        left.get("dataset_round_range")
+        and right.get("dataset_round_range")
+        and left.get("dataset_round_range") == right.get("dataset_round_range")
+    )
+    left_budget = left.get("target_duration_seconds") or left_config.get(
+        "target_duration_seconds"
+    )
+    right_budget = right.get("target_duration_seconds") or right_config.get(
+        "target_duration_seconds"
+    )
+    same_budget = (
+        left_budget is not None and right_budget is not None and left_budget == right_budget
     )
     same_evaluation = left.get("engines") == right.get("engines") and all(
         left_config.get(key) == right_config.get(key) for key in comparable_fields
+    ) and same_budget
+    left_experiment_count = (left.get("dashboard_summary") or {}).get(
+        "completed_experiment_count"
+    )
+    right_experiment_count = (right.get("dashboard_summary") or {}).get(
+        "completed_experiment_count"
+    )
+    same_completed_experiment_count = (
+        left_experiment_count is not None
+        and right_experiment_count is not None
+        and left_experiment_count == right_experiment_count
+    )
+    same_completion_state = left.get("status") == right.get("status") == "completed"
+    left_profile = left_config.get("feature_profile")
+    right_profile = right_config.get("feature_profile")
+    profile_comparison = bool(left_profile and right_profile and left_profile != right_profile)
+    directly_comparable = bool(
+        same_dataset
+        and same_dataset_range
+        and same_evaluation
+        and same_completed_experiment_count
+        and same_completion_state
     )
     return {
-        "directly_comparable": bool(same_dataset and same_evaluation),
+        "directly_comparable": directly_comparable,
+        "profile_comparison": profile_comparison and directly_comparable,
+        "left_feature_profile": left_profile,
+        "right_feature_profile": right_profile,
         "same_dataset": same_dataset,
+        "same_dataset_round_range": same_dataset_range,
+        "same_seed_and_split_settings": all(
+            left_config.get(key) == right_config.get(key)
+            for key in ("seed", "train_ratio", "validation_ratio")
+        ) and left_config.get("seed") is not None,
+        "same_evaluation_budget": same_budget,
+        "same_completed_experiment_count": same_completed_experiment_count,
+        "both_researches_completed": same_completion_state,
         "same_evaluation_settings": same_evaluation,
         "differences": {
             key: {"left": left_config.get(key), "right": right_config.get(key)}
             for key in comparable_fields
             if left_config.get(key) != right_config.get(key)
-        },
+        }
+        | (
+            {"feature_profile": {"left": left_profile, "right": right_profile}}
+            if left_profile != right_profile
+            else {}
+        ),
         "left_metrics": model_metric_stats(left.get("dashboard_summary", {})),
         "right_metrics": model_metric_stats(right.get("dashboard_summary", {})),
+        "left_phase_stats": model_phase_comparison_stats(
+            left.get("dashboard_summary", {})
+        ),
+        "right_phase_stats": model_phase_comparison_stats(
+            right.get("dashboard_summary", {})
+        ),
     }
 
 
@@ -1270,7 +1504,9 @@ def _display(value: Any) -> str:
     return "미수집" if value is None else str(value)
 
 
-def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False) -> str:
+def build_chatgpt_report(
+    round_record: dict[str, Any], *, detailed: bool = False, top_candidates_per_model: int = 5
+) -> str:
     summary = round_record.get("dashboard_summary", {})
     config = round_record.get("config", {})
     metrics = model_metric_stats(summary)
@@ -1307,6 +1543,11 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
         f"{_display(config.get('elite_seed_ratio'))}",
         f"- 계승 원본 패턴 ID: "
         f"{_display(round_record.get('elite_seeding', {}).get('source_pattern_ids'))}",
+        "- "
+        "\uacc4\uc2b9 \ud504\ub85c\ud30c\uc77c / "
+        "\uc5f0\uad6c \ud504\ub85c\ud30c\uc77c: "
+        f"{_display(round_record.get('elite_seeding', {}).get('feature_profile'))} / "
+        f"{_display(config.get('feature_profile'))}",
         "",
         "## 연구 집계",
         f"- 완료/실패 실험: {_display(summary.get('completed_experiment_count'))} / "
@@ -1393,6 +1634,15 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
     lines.append("- Elite GP 대 신규 무작위 초기화 GP paired 결과:")
     for model, label in (("one_number", "한 번호"), ("six_number_set", "6개 집합")):
         stats = paired_summary.get(model, {})
+        lines.append(
+            "  - "
+            "\uac80\uc0c9 \ud6c4\ubcf4 \uc218 / \uace0\uc720 \uc218\uc2dd \uc218"
+            "\uff08\uacc4\uc2b9 / \ubb34\uc791\uc704\uff09: "
+            f"{_display(stats.get('actual_candidate_count_mean'))} / "
+            f"{_display(stats.get('actual_unique_formula_count_mean'))} vs "
+            f"{_display(stats.get('unseeded_candidate_count_mean'))} / "
+            f"{_display(stats.get('unseeded_unique_formula_count_mean'))}"
+        )
         lines.append(
             f"  - {label}: 검증 평균 차 { _display(stats.get('validation_mean_delta')) }, "
             f"우세/열세/동률 { _display(stats.get('validation_wins')) }/"
@@ -1512,40 +1762,59 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
                         f"(판정 가능 조합 {counts.get('second_prize_known', 0)}, "
                         f"보너스 미수집 {counts.get('second_prize_unknown', 0)})"
                     )
-    lines.extend(["", "## 상위 후보 (검증 기반 정렬)"])
+    lines.extend(["", "## 모델별 상위 후보 (검증 구간 기준)"])
     candidates = [
         candidate
         for experiment in summary.get("experiment_summaries", [])
         for candidate in experiment.get("top_candidates", [])
     ]
-    candidates.sort(
-        key=lambda item: (
-            item.get("validation_score") is not None,
-            float(item.get("validation_score") or -1),
-            -int(item.get("complexity") or 0),
-        ),
-        reverse=True,
-    )
-    for index, candidate in enumerate(candidates[: 10 if detailed else 5], start=1):
-        model_label = {
-            "one_number": "한 번호 모델",
-            "six_number_set": "6개 집합 모델",
-        }.get(candidate.get("model"), str(candidate.get("model", "모델 미수집")))
-        lines.append(
-            f"{index}. {model_label} · 후보 {candidate.get('rank')} — "
-            f"검증 {format_decimal(candidate.get('validation_score'), suffix='점')}, "
-            f"독립 테스트 {format_decimal(candidate.get('independent_test_score'), suffix='점')}, "
-            f"활성률 {format_percent(candidate.get('validation_activation_rate'))}, "
-            f"복잡도 {format_count(candidate.get('complexity'))}"
+    limit = max(1, int(top_candidates_per_model))
+    for model_key, model_label in (
+        ("one_number", "한 번호 모델"),
+        ("six_number_set", "6개 집합 모델"),
+    ):
+        lines.append(f"### {model_label}")
+        model_candidates = [item for item in candidates if item.get("model") == model_key]
+        model_candidates.sort(
+            key=lambda item: (
+                item.get("validation_score") is not None,
+                float(item.get("validation_score") or -1),
+                -int(item.get("complexity") or 0),
+            ),
+            reverse=True,
         )
-        lines.append(f"   - 조건: `{_display(candidate.get('activation_condition'))}`")
-        formulae = candidate.get("formulas") or []
-        readable_formulas = "; ".join(pretty_formula(item) for item in formulae)
-        lines.append(f"   - 읽기 쉬운 수식: `{readable_formulas}`")
-        lines.append(f"   - 원본 수식: `{'; '.join(formulae)}`")
-        lines.append("   - 독립 테스트 점수는 후보 선정에 사용되지 않았습니다.")
-    if not candidates:
-        lines.append("- 후보 상세: 미수집")
+        for index, candidate in enumerate(model_candidates[:limit], start=1):
+            lines.append(
+                f"{index}. 후보 {candidate.get('rank')} — "
+                f"검증 {format_decimal(candidate.get('validation_score'), suffix='점')}, "
+                f"독립 테스트 "
+                f"{format_decimal(candidate.get('independent_test_score'), suffix='점')}, "
+                f"활성률 {format_percent(candidate.get('validation_activation_rate'))}, "
+                f"복잡도 {format_count(candidate.get('complexity'))}, "
+                f"공식 ID {_display(candidate.get('formula_id'))}, "
+                f"프로파일 {_display(candidate.get('feature_profile'))}, "
+                f"검증 회차 {format_count(candidate.get('validation_round_count'))}"
+            )
+            if model_key == "six_number_set":
+                lines.append(
+                    "   - 독립 테스트 적중 3+/4+/5+/2등/6개: "
+                    f"{_display(candidate.get('independent_test_3_plus'))}/"
+                    f"{_display(candidate.get('independent_test_4_plus'))}/"
+                    f"{_display(candidate.get('independent_test_5_plus'))}/"
+                    f"{_display(candidate.get('independent_test_2_prize'))}/"
+                    f"{_display(candidate.get('independent_test_full_set_matches'))}; "
+                    f"활성 예측 {_display(candidate.get('independent_test_activation_count'))}, "
+                    "고유 평가 회차 "
+                    f"{_display(candidate.get('independent_test_unique_round_count'))}"
+                )
+            lines.append(f"   - 조건: `{_display(candidate.get('activation_condition'))}`")
+            formulae = candidate.get("formulas") or []
+            readable_formulas = "; ".join(pretty_formula(item) for item in formulae)
+            lines.append(f"   - 읽기 쉬운 수식: `{readable_formulas}`")
+            lines.append(f"   - 원본 수식: `{'; '.join(formulae)}`")
+            lines.append("   - 독립 테스트 점수는 후보 선정에 사용되지 않았습니다.")
+        if not model_candidates:
+            lines.append("- 해당 모델 후보 상세: 미수집")
     lines.extend(["", "## 완전 일치 후보 및 검증"])
     matches = round_record.get("discovered_exact_matches", [])
     if matches:
@@ -1564,7 +1833,17 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
     else:
         lines.append("- 해당 없음 또는 미수집")
     lines.extend(["", "## 다음 연구 준비"])
-    predictions = round_record.get("prediction_candidates", [])
+    saved_predictions = round_record.get("prediction_candidates", [])
+    predictions = [
+        item
+        for item in saved_predictions
+        if item.get("recommendation_status") == "pre_draw_prediction"
+    ]
+    retrospective_predictions = [
+        item
+        for item in saved_predictions
+        if item.get("recommendation_status") != "pre_draw_prediction"
+    ]
     lines.append("### 다음 회차 예측 후보")
     if predictions:
         for prediction in predictions[: 20 if detailed else 5]:
@@ -1576,7 +1855,18 @@ def build_chatgpt_report(round_record: dict[str, Any], *, detailed: bool = False
                 f"패턴 {prediction.get('pattern_context', {}).get('pattern_id', '미수집')}"
             )
     else:
-        lines.append("- 미수집")
+        lines.append(
+            "- 저장된 사전 추천 없음. 보고서 생성 단계에서는 후보 수식 재실행·평가를 하지 않아 "
+            "실행 가능 후보 여부는 판정되지 않았습니다."
+        )
+    if retrospective_predictions:
+        lines.append("### 회고 분석 추천 기록 (사전 예측 성과에 미포함)")
+        for prediction in retrospective_predictions[: 20 if detailed else 5]:
+            lines.append(
+                f"- 대상 회차 {prediction.get('target_round', '미수집')} / "
+                f"상태 {prediction.get('recommendation_status', '미수집')} / "
+                f"번호 `{prediction.get('recommended_numbers', '미수집')}`"
+            )
     lines.append(f"- 다음 난수 시드: {_display(round_record.get('next_seed'))}")
     lines.append(
         f"- 다음 연구 비교 설정: 프로파일 {_display(config.get('feature_profile'))}, "

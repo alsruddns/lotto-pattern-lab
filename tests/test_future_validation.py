@@ -84,12 +84,18 @@ def test_future_scorecard_separates_official_provisional_and_pending_results() -
     row = build_future_scorecard(history, events, [frozen])[0]
 
     assert row["prediction_count"] == 2
+    assert row["recommendation_count"] == 2
     assert row["official_verified_round_count"] == 1
     assert row["provisional_round_count"] == 0
     assert row["pending_round_count"] == 1
     assert row["mean_hits_official"] == 5
     assert row["mean_random_hits_official"] == 3
+    assert row["mean_hits_minus_random_official"] == 2
     assert row["hit_distribution_official"]["5"] == 1
+    assert row["at_least_3_official"] == 1
+    assert row["at_least_4_official"] == 1
+    assert row["at_least_5_official"] == 1
+    assert row["six_exact_official"] == 0
     assert row["validation_status"] == "표본 부족"
     assert row["second_prize_hits_official"] is None
     assert row["second_prize_status"] == "미수집"

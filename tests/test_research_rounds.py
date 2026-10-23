@@ -8,6 +8,7 @@ from lotto_pattern_lab.research_rounds import (
     build_chatgpt_report,
     compare_research_rounds,
     legacy_research_records,
+    model_phase_comparison_stats,
     paired_comparison_summary,
     rebuild_dashboard_summary,
     rebuild_dashboard_summary_from_store,
@@ -271,6 +272,10 @@ def test_hit_repetition_and_unique_round_counts_are_separate() -> None:
 
 def test_paired_comparison_summarizes_delta_wins_losses_and_time() -> None:
     experiment = _experiment("exp-paired", 0.4, elite=True)
+    experiment["paired_unseeded_comparison"]["six_number_set_model"]["candidates"] = [
+        {"activation_condition": "add(x0,1)", "formulas": ["x1"] * 6},
+        {"activation_condition": "add(x0,1)", "formulas": ["x1"] * 6},
+    ]
     compact = summarize_experiment(experiment)
     summary = rebuild_dashboard_summary([compact])
     stats = paired_comparison_summary(summary)["six_number_set"]
@@ -278,6 +283,8 @@ def test_paired_comparison_summarizes_delta_wins_losses_and_time() -> None:
     assert stats["validation_wins"] == 1
     assert stats["test_wins"] == 1
     assert stats["actual_runtime_mean"] is None
+    assert stats["unseeded_candidate_count_mean"] == 2
+    assert stats["unseeded_unique_formula_count_mean"] == 1
 
 
 def test_report_summarizes_p_values_instead_of_dumping_each_observation() -> None:
@@ -403,6 +410,121 @@ def test_report_missing_fields_are_explicit_and_comparison_flags_differences() -
     comparison = compare_research_rounds(round_record, other)
     assert comparison["directly_comparable"] is False
     assert comparison["differences"]["population_size"] == {"left": 8, "right": 32}
+
+
+def test_profile_comparison_requires_matching_dataset_range_seed_and_budget() -> None:
+    base = {
+        "dataset_sha256": "same-data",
+        "dataset_round_range": [753, 1246],
+        "target_duration_seconds": 3600,
+        "status": "completed",
+        "engines": ["intermittent_gp"],
+        "dashboard_summary": {"completed_experiment_count": 5},
+        "config": {
+            "feature_profile": "bonus_lag_v1",
+            "seed": 17,
+            "train_ratio": 0.6,
+            "validation_ratio": 0.2,
+            "population_size": 64,
+            "generations": 10,
+            "max_lag": 10,
+        },
+    }
+    integrated = {
+        **base,
+        "config": {**base["config"], "feature_profile": "integrated_v1"},
+    }
+
+    comparison = compare_research_rounds(base, integrated)
+
+    assert comparison["directly_comparable"] is True
+    assert comparison["profile_comparison"] is True
+    assert comparison["left_feature_profile"] == "bonus_lag_v1"
+    assert comparison["right_feature_profile"] == "integrated_v1"
+
+    different_seed = {**integrated, "config": {**integrated["config"], "seed": 18}}
+    assert compare_research_rounds(base, different_seed)["directly_comparable"] is False
+    incomplete = {**integrated, "status": "running"}
+    assert compare_research_rounds(base, incomplete)["directly_comparable"] is False
+
+
+def test_report_ranks_one_number_and_six_number_candidates_separately() -> None:
+    experiment = _experiment("exp-separated", 0.4, elite=False)
+    summary = rebuild_dashboard_summary([experiment])
+    report = build_chatgpt_report(
+        {
+            "research_round": 1,
+            "research_id": "separated",
+            "status": "completed",
+            "config": experiment["config"],
+            "dashboard_summary": summary,
+        },
+        top_candidates_per_model=1,
+    )
+
+    assert "### 한 번호 모델" in report
+    assert "### 6개 집합 모델" in report
+    assert "## 상위 후보 (검증 기반 정렬)" not in report
+    assert "실행 가능 후보 여부는 판정되지 않았습니다" in report
+
+
+def test_report_keeps_retrospective_recommendations_out_of_prospective_section() -> None:
+    report = build_chatgpt_report(
+        {
+            "research_round": 1,
+            "research_id": "retrospective",
+            "config": {"feature_profile": "integrated_v1"},
+            "prediction_candidates": [
+                {
+                    "recommendation_status": "historical_reproduction",
+                    "target_round": 1246,
+                    "recommended_numbers": [1, 2, 3, 4, 5, 6],
+                }
+            ],
+        }
+    )
+
+    assert "저장된 사전 추천 없음" in report
+    assert "회고 분석 추천 기록" in report
+    assert "사전 예측 성과에 미포함" in report
+
+
+def test_profile_comparison_stats_include_rounds_predictions_and_hits() -> None:
+    stats = model_phase_comparison_stats(
+        {
+            "model_metrics": {
+                "six_number_set": [
+                    {
+                        "independent_test_score": 0.25,
+                        "independent_test_target_round_count": 12,
+                        "independent_test_activation_count": 10,
+                        "independent_test_hit_count": 23,
+                    }
+                ]
+            },
+            "experiment_summaries": [
+                {"split_rounds": {"test_rounds": [31, 42]}}
+            ],
+            "hit_totals": {
+                "six_number_set:independent_test": {
+                    "3_plus": 4,
+                    "4_plus": 1,
+                    "5_plus": 0,
+                    "2_exact": 1,
+                    "6_exact": 0,
+                }
+            },
+        }
+    )
+
+    assert stats["six_number_set"]["independent_test"]["evaluation_round_count"] == 12
+    assert (
+        stats["six_number_set"]["independent_test"]["unique_evaluation_round_count"]
+        == 12
+    )
+    assert stats["six_number_set"]["independent_test"]["active_prediction_count"] == 10
+    assert stats["six_number_set"]["independent_test"]["hit_count"] == 23
+    assert stats["six_number_set"]["independent_test"]["2_exact"] == 1
 
 
 def test_report_includes_worker_start_failure_code_without_trial_counts() -> None:

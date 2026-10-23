@@ -140,6 +140,7 @@ def build_future_scorecard(
                 "model_type": model,
                 "frozen_at": frozen.get("frozen_at"),
                 "prediction_count": len(predictions),
+                "recommendation_count": len(predictions),
                 "target_rounds": [int(item["target_round"]) for item in predictions],
                 "official_verified_round_count": len(verified),
                 "provisional_round_count": len(provisional),
@@ -151,6 +152,16 @@ def build_future_scorecard(
                 ),
                 "mean_random_hits_official": (
                     sum(int(item.get("random_hit_count", 0)) for item in verified) / len(verified)
+                    if verified
+                    else None
+                ),
+                "mean_hits_minus_random_official": (
+                    sum(
+                        int(item.get("ai_hit_count", 0))
+                        - int(item.get("random_hit_count", 0))
+                        for item in verified
+                    )
+                    / len(verified)
                     if verified
                     else None
                 ),
@@ -179,6 +190,18 @@ def build_future_scorecard(
                 "second_prize_status": second_prize_status,
                 "at_least_3_official": sum(
                     count for hit_count, count in distribution.items() if int(hit_count) >= 3
+                ),
+                "at_least_4_official": sum(
+                    count for hit_count, count in distribution.items() if int(hit_count) >= 4
+                ),
+                "at_least_5_official": sum(
+                    count for hit_count, count in distribution.items() if int(hit_count) >= 5
+                ),
+                "six_exact_official": distribution["6"],
+                "second_prize_official": (
+                    sum(item.get("prize_tier") == 2 for item in second_prize_evaluable)
+                    if second_prize_evaluable
+                    else None
                 ),
                 "validation_status": (
                     "표본 부족" if len(verified) < 30 else "공식 결과 검증"
