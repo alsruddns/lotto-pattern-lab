@@ -6,7 +6,9 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
 import uuid
+from contextlib import ExitStack
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -88,7 +90,110 @@ def _backup_original(csv_path: Path, content: bytes, backup_directory: str | Pat
     return backup_path
 
 
+def _research_lock_path() -> Path:
+    return project_path("checkpoints/research_global")
+
+
+def _research_queue_database_path() -> Path:
+    return project_path("data/database/research_queue.sqlite")
+
+
+def _assert_no_pending_research(queue_database_path: str | Path | None = None) -> None:
+    queue_path = (
+        Path(queue_database_path).resolve()
+        if queue_database_path is not None
+        else _research_queue_database_path()
+    )
+    if not queue_path.is_file():
+        return
+
+    connection = None
+    try:
+        connection = sqlite3.connect(f"{queue_path.as_uri()}?mode=ro", uri=True, timeout=1)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        pending_queue = False
+        pending_item = False
+        if "research_queues" in tables:
+            pending_queue = connection.execute(
+                "SELECT 1 FROM research_queues "
+                "WHERE status IN ('waiting','running','paused','interrupted') LIMIT 1"
+            ).fetchone() is not None
+        if "research_queue_items" in tables:
+            pending_item = connection.execute(
+                "SELECT 1 FROM research_queue_items "
+                "WHERE status IN ('waiting','running','paused','interrupted') LIMIT 1"
+            ).fetchone() is not None
+    except sqlite3.Error as error:
+        raise RuntimeError(
+            f"예약 연구 상태를 안전하게 확인할 수 없어 등록을 보류했습니다: {error}"
+        ) from error
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if pending_queue or pending_item:
+        raise RuntimeError(
+            "실행·예약·재개 대기 연구가 있어 당첨번호 데이터 변경을 보류했습니다. "
+            "해당 연구와 예약이 모두 완료된 뒤 다시 시도하세요."
+        )
+
+
+def draw_registration_block_reason() -> str | None:
+    """Return a safe, read-only UI reason when draw writes could affect research."""
+    try:
+        with interprocess_lock(
+            _research_lock_path(), timeout=0, scope="research-global"
+        ):
+            pass
+    except TimeoutError:
+        return "연구 또는 최적화 작업이 실행 중이어서 당첨번호 등록을 보류합니다."
+    try:
+        _assert_no_pending_research()
+    except RuntimeError as error:
+        return str(error)
+    return None
+
+
 def register_draw(
+    csv_path: str | Path,
+    *,
+    round_number: int,
+    draw_date: date,
+    main_numbers: tuple[int, ...] | list[int],
+    bonus_number: int,
+    official_dates_path: str | Path = "data/official/draws.csv",
+    backup_directory: str | Path | None = None,
+) -> dict[str, Any]:
+    """Serialize draw writes against workers and refuse queued dataset consumers."""
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(
+                interprocess_lock(
+                    _research_lock_path(), timeout=0, scope="research-global"
+                )
+            )
+        except TimeoutError as error:
+            raise RuntimeError(
+                "연구 또는 최적화 작업이 실행 중이어서 당첨번호 등록을 보류했습니다."
+            ) from error
+        _assert_no_pending_research()
+        return _register_draw_under_research_lock(
+            csv_path,
+            round_number=round_number,
+            draw_date=draw_date,
+            main_numbers=main_numbers,
+            bonus_number=bonus_number,
+            official_dates_path=official_dates_path,
+            backup_directory=backup_directory,
+        )
+
+
+def _register_draw_under_research_lock(
     csv_path: str | Path,
     *,
     round_number: int,

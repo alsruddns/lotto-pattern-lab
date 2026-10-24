@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import date
+import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,16 @@ from lotto_pattern_lab.draw_management import (
     register_draw,
     verify_draw_against_official,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_research_guard(tmp_path, monkeypatch):
+    import lotto_pattern_lab.draw_management as manager
+
+    monkeypatch.setattr(manager, "_research_lock_path", lambda: tmp_path / "research_global")
+    monkeypatch.setattr(
+        manager, "_research_queue_database_path", lambda: tmp_path / "research_queue.sqlite"
+    )
 
 
 def _write_sources(tmp_path):
@@ -71,6 +82,36 @@ def test_registration_backups_appends_and_preserves_fixed_range(tmp_path):
     ] == "manual_unverified"
 
 
+def test_registration_is_blocked_by_running_reservation_without_changing_csv(
+    tmp_path, monkeypatch
+):
+    import lotto_pattern_lab.draw_management as manager
+
+    raw, official = _write_sources(tmp_path)
+    original = raw.read_bytes()
+    queue_db = tmp_path / "research_queue.sqlite"
+    with sqlite3.connect(queue_db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE research_queues (status TEXT NOT NULL);
+            CREATE TABLE research_queue_items (status TEXT NOT NULL);
+            INSERT INTO research_queues VALUES ('running');
+            INSERT INTO research_queue_items VALUES ('running');
+            """
+        )
+    monkeypatch.setattr(manager, "_research_lock_path", lambda: tmp_path / "global-lock")
+    monkeypatch.setattr(manager, "_research_queue_database_path", lambda: queue_db)
+
+    reason = manager.draw_registration_block_reason()
+    assert reason and "연구" in reason
+    with pytest.raises(RuntimeError, match="예약.*연구"):
+        _register(raw, official)
+
+    assert raw.read_bytes() == original
+    assert not (tmp_path / "draws.csv.metadata.json").exists()
+    assert not (tmp_path / "backups").exists()
+
+
 def test_duplicate_round_and_invalid_draw_values_are_rejected(tmp_path):
     raw, official = _write_sources(tmp_path)
     _register(raw, official)
@@ -96,6 +137,33 @@ def test_duplicate_round_and_invalid_draw_values_are_rejected(tmp_path):
             bonus_number=1,
             official_dates_path=official,
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"round_number": 0}, "1 이상의 정수"),
+        ({"round_number": 755.5}, "1 이상의 정수"),
+        ({"main_numbers": [1, 2, 3, 4, 5]}, "정확히 6개"),
+        ({"main_numbers": [0, 2, 3, 4, 5, 6]}, "1~45 범위"),
+        ({"bonus_number": 46}, "1~45"),
+        ({"draw_date": "2017-05-20"}, "추첨일을 입력"),
+        ({"draw_date": date.today() + timedelta(days=1)}, "미래 날짜"),
+        ({"draw_date": date(2017, 5, 13)}, "직전 회차의 추첨일"),
+        ({"round_number": 756}, "다음 등록 가능 회차는 755"),
+    ],
+)
+def test_registration_rejects_invalid_round_number_date_or_sequence(
+    tmp_path, overrides, message
+):
+    raw, official = _write_sources(tmp_path)
+    original = raw.read_bytes()
+
+    with pytest.raises(ValueError, match=message):
+        _register(raw, official, **overrides)
+
+    assert raw.read_bytes() == original
+    assert not (tmp_path / "backups").exists()
 
 
 def test_metadata_write_failure_restores_original_csv(tmp_path, monkeypatch):

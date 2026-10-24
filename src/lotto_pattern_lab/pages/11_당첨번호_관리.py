@@ -14,6 +14,7 @@ from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
 from lotto_pattern_lab.draw_management import (
     confirm_manual_official_comparison,
     create_draw_correction_request,
+    draw_registration_block_reason,
     register_draw,
     verify_draw_against_official,
 )
@@ -73,6 +74,9 @@ st.caption(
     "등록 전 원본 CSV를 백업하고 기존 컬럼 순서·인코딩을 유지합니다. "
     "새 입력은 공식 대조 전까지 수동 미검증 상태입니다."
 )
+registration_block_reason = draw_registration_block_reason()
+if registration_block_reason:
+    st.warning(registration_block_reason)
 with st.form("manual_draw_entry", clear_on_submit=False):
     round_number = st.number_input(
         "회차 번호", min_value=1, value=latest.round_number + 1, step=1, key="draw_entry_round"
@@ -86,7 +90,11 @@ with st.form("manual_draw_entry", clear_on_submit=False):
         for index in range(6)
     ]
     bonus_number = st.number_input("보너스 번호", min_value=1, max_value=45, value=7, step=1)
-    submitted = st.form_submit_button("당첨번호 저장", type="primary")
+    submitted = st.form_submit_button(
+        "당첨번호 저장",
+        type="primary",
+        disabled=registration_block_reason is not None,
+    )
 
 if submitted:
     try:
@@ -125,7 +133,7 @@ if submitted:
                 "새 연구에서 새 회차를 다시 불러옵니다."
             )
             st.rerun()
-    except (OSError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         st.error(f"등록하지 않았습니다: {error}")
 
 st.subheader("기존 당첨번호 조회")

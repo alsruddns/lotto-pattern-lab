@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -12,6 +13,84 @@ def test_streamlit_script_executes_without_import_errors() -> None:
 
     assert not app.exception, [exception.message for exception in app.exception]
     assert app.title[0].value == "AI 패턴 연구실"
+
+
+def test_research_home_links_to_draw_management_and_shows_cached_summary(
+    tmp_path, monkeypatch
+):
+    from lotto_pattern_lab import paths
+
+    raw = tmp_path / "data/raw/lotto_draws_753_1246_with_bonus.csv"
+    raw.parent.mkdir(parents=True)
+    raw.write_text(
+        "draw_no,n1,n2,n3,n4,n5,n6,bonus\n"
+        "753,2,17,19,24,37,41,3\n"
+        "754,1,5,13,24,29,33,9\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    app = AppTest.from_file(
+        Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/app.py"
+    ).run(timeout=30)
+
+    assert not app.exception, [error.message for error in app.exception]
+    assert "당첨번호 관리 열기" in [item.label for item in app.page_link]
+    metrics = {item.label: item.value for item in app.metric}
+    assert metrics["최신 등록 회차"] == "754회"
+    assert metrics["최신 공식 검증 완료 회차"] == "미수집"
+    assert metrics["총 등록 회차 수"] == "2회"
+    assert metrics["검증 대기 회차 수"] == "2회"
+
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob(
+            "11_*.py"
+        )
+    )
+    app.switch_page(f"pages/{page.name}").run(timeout=30)
+    assert not app.exception, [error.message for error in app.exception]
+    assert app.title[0].value == "당첨번호 관리"
+
+
+def test_draw_registration_page_disables_save_when_research_is_queued(
+    tmp_path,
+):
+    raw = tmp_path / "data/raw/lotto_draws_753_1246_with_bonus.csv"
+    raw.parent.mkdir(parents=True)
+    raw.write_text(
+        "draw_no,n1,n2,n3,n4,n5,n6,bonus\n"
+        "753,2,17,19,24,37,41,3\n"
+        "754,1,5,13,24,29,33,9\n",
+        encoding="utf-8",
+    )
+    queue = tmp_path / "data/database/research_queue.sqlite"
+    queue.parent.mkdir(parents=True)
+    with sqlite3.connect(queue) as connection:
+        connection.execute("CREATE TABLE research_queues (status TEXT NOT NULL)")
+        connection.execute("INSERT INTO research_queues VALUES ('running')")
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob(
+            "11_*.py"
+        )
+    )
+    harness = tmp_path / "draw_management_test_page.py"
+    harness.write_text(
+        "import runpy\n"
+        "from pathlib import Path\n"
+        "import lotto_pattern_lab.paths as paths\n"
+        "original_project_root = paths.PROJECT_ROOT\n"
+        f"paths.PROJECT_ROOT = Path({str(tmp_path)!r})\n"
+        "try:\n"
+        f"    runpy.run_path({str(page)!r})\n"
+        "finally:\n"
+        "    paths.PROJECT_ROOT = original_project_root\n",
+        encoding="utf-8",
+    )
+    app = AppTest.from_file(harness).run(timeout=30)
+
+    assert not app.exception, [error.message for error in app.exception]
+    assert app.warning
+    save_button = next(button for button in app.button if button.label == "당첨번호 저장")
+    assert save_button.disabled
 
 
 def test_replay_and_draw_management_pages_render_from_app_navigation() -> None:
