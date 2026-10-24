@@ -60,7 +60,7 @@ from lotto_pattern_lab.research_optimization_apply import (
     optimization_origin_record,
 )
 from lotto_pattern_lab.research_queue import QUEUE_DB, ResearchQueueStore
-from lotto_pattern_lab.research_rounds import ResearchRoundStore
+from lotto_pattern_lab.research_rounds import ResearchRoundStore, list_saved_research_predictions
 from lotto_pattern_lab.research_startup import (
     worker_start_failure_metadata,
 )
@@ -2184,6 +2184,74 @@ with new_tab:
                         },
                     )
                     st.error(f"연구 워커를 시작하지 못했습니다: {error}")
+
+st.subheader("저장된 다음 회차 예측")
+try:
+    saved_prediction_researches = rounds.list_overview()
+except (OSError, sqlite3.Error, ValueError) as error:
+    st.error(f"연구 목록 조회 실패: {error}")
+    saved_prediction_researches = []
+if not saved_prediction_researches:
+    st.info("조회할 연구가 없습니다.")
+else:
+    research_labels = {
+        item["research_id"]: (
+            f"{item.get('research_round', '?')}회차 · {item['research_id']} · "
+            f"{item.get('status', '상태 미수집')}"
+        )
+        for item in saved_prediction_researches
+    }
+    saved_prediction_research_id = st.selectbox(
+        "예측을 조회할 연구",
+        list(research_labels),
+        format_func=lambda value: research_labels[value],
+        key="saved_prediction_research_id",
+    )
+    selected_prediction_research = next(
+        item
+        for item in saved_prediction_researches
+        if item["research_id"] == saved_prediction_research_id
+    )
+    st.caption(
+        f"연구 상태: {selected_prediction_research.get('status', '미수집')} · "
+        f"연구 ID: `{saved_prediction_research_id}`"
+    )
+    try:
+        linked_experiment_ids = rounds.experiment_ids(saved_prediction_research_id)
+        saved_predictions, prediction_read_errors = list_saved_research_predictions(
+            saved_prediction_research_id,
+            linked_experiment_ids,
+        )
+    except (OSError, sqlite3.Error, ValueError) as error:
+        saved_predictions = []
+        prediction_read_errors = [str(error)]
+    if prediction_read_errors:
+        st.error("저장소 조회 오류가 있어 결과가 불완전할 수 있습니다.")
+        for message in prediction_read_errors[:5]:
+            st.caption(message)
+    if not saved_predictions and not prediction_read_errors:
+        st.info("해당 연구의 저장된 예측 후보 없음")
+    elif saved_predictions:
+        st.dataframe(
+            [
+                {
+                    "대상 회차": item.get("target_round"),
+                    "추천 번호": item.get("recommended_numbers"),
+                    "추천 ID": item.get("recommendation_id"),
+                    "예측 생성 시각": item.get("created_at"),
+                    "추천 저장 시각": item.get("saved_at", "저장 시각 미수집"),
+                    "공식 ID": item.get("source_pattern_id") or item.get("experiment_id"),
+                    "연구 ID": item.get("research_id"),
+                    "공식 원본 연구 ID": item.get("origin_research_id"),
+                    "프로파일": item.get("feature_profile"),
+                    "사전 추천": item.get("recommendation_status") == "pre_draw_prediction",
+                    "실제 결과 검증": item.get("result_status", "미검증"),
+                }
+                for item in saved_predictions
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
 with resume_tab:
     resume_items = resume_records

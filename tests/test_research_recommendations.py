@@ -205,3 +205,16 @@ def test_recommendation_page_renders_automatic_research_mode_without_user_data(
     assert not app.exception, [exception.message for exception in app.exception]
     assert len(app.subheader) > 0
     assert any(item.key == "generate_research_based_recommendations" for item in app.button)
+    source = next(item for item in app.selectbox if item.label == "추천 패턴 출처")
+    assert source.options == [
+        "기존 고적중 패턴 사례",
+        "5개 이상 적중 패턴",
+        "6개 완전 일치 패턴",
+        "누적 연구 자동 추천",
+    ]
+    source.select("6개 완전 일치 패턴")
+    app.run(timeout=30)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert next(item for item in app.selectbox if item.label == "추천 패턴 출처").value == (
+        "6개 완전 일치 패턴"
+    )

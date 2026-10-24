@@ -93,6 +93,7 @@ class PatternLibrary:
 
     def __init__(self, path: str | Path = "data/database/patterns.sqlite") -> None:
         self.path = project_path(path)
+        self._read_only = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if run_with_busy_retry(
             "check pattern library schema", self.path, self._schema_needs_migration
@@ -101,9 +102,22 @@ class PatternLibrary:
                 "pattern library schema migration", self.path, self._initialize_schema
             )
 
+    @classmethod
+    def read_only(cls, path: str | Path = "data/database/patterns.sqlite") -> "PatternLibrary":
+        """Open the existing library without creating directories or migrating schema."""
+        instance = cls.__new__(cls)
+        instance.path = project_path(path)
+        instance._read_only = True
+        return instance
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=2.0)
+        if self._read_only:
+            connection = sqlite3.connect(
+                f"{self.path.as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=2.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=2000")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -995,6 +1009,145 @@ class PatternLibrary:
                 "discovered_at",
             )
         } | {"current_status": row["status"]}
+
+    def list_hit_pattern_candidates(
+        self, *, minimum_hits: int, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return a compact, deduplicated view of recorded hit evidence.
+
+        The query only reads the pattern and observation tables.  Repeated evaluations
+        remain visible as counts, while round numbers are deduplicated per formula.
+        A six-number exact match requires six main-number hits and matching sorted sets;
+        bonus matches never count toward this filter.
+        """
+        if minimum_hits not in {4, 5, 6}:
+            raise ValueError("minimum_hits must be 4, 5, or 6")
+        if limit < 1:
+            return []
+        exact_only = minimum_hits == 6
+        hit_filter = (
+            "COALESCE(CAST(json_extract(o.payload, '$.hit_count') AS INTEGER), 0) >= ?"
+        )
+        exact_filter = """
+            AND json_extract(o.payload, '$.full_set_match') = 1
+        """ if exact_only else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT p.pattern_id, p.payload, p.status,
+                           o.round_number, o.phase, o.payload AS observation
+                    FROM patterns p JOIN observations o USING(pattern_id)
+                    WHERE {hit_filter} {exact_filter}
+                    ORDER BY o.round_number DESC, o.observed_at DESC
+                    LIMIT ?""",
+                (minimum_hits, max(limit * 20, limit)),
+            ).fetchall()
+            round_by_research_id: dict[str, int] = {}
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='research_rounds'"
+                )
+            }
+            if tables:
+                round_by_research_id = {
+                    str(row["research_id"]): int(row["round_number"])
+                    for row in connection.execute(
+                        "SELECT research_id, round_number FROM research_rounds"
+                    )
+                }
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            pattern_id = str(row["pattern_id"])
+            item = grouped.get(pattern_id)
+            observation = json.loads(row["observation"])
+            exact = bool(
+                observation.get("full_set_match")
+                and int(observation.get("hit_count", 0)) == 6
+                and sorted(observation.get("predicted_numbers", []))
+                == sorted(observation.get("winning_numbers", []))
+            )
+            if exact_only and not exact:
+                continue
+            if item is None:
+                payload = json.loads(row["payload"])
+                source_research_id = payload.get("origin_research_id") or payload.get(
+                    "research_id"
+                )
+                outputs = int(payload.get("outputs_per_event", 0))
+                model_type = payload.get("model_type") or (
+                    "six_number_set" if outputs == 6 else "one_number" if outputs == 1 else None
+                )
+                item = {
+                    "pattern_id": pattern_id,
+                    "origin_research_id": source_research_id,
+                    "research_round": round_by_research_id.get(str(source_research_id))
+                    or payload.get("research_round"),
+                    "experiment_id": payload.get("experiment_id"),
+                    "feature_profile": payload.get("feature_profile")
+                    or payload.get("experiment_config", {}).get("feature_profile", "legacy"),
+                    "engine": payload.get("engine", "미수집"),
+                    "model_type": model_type,
+                    "outputs_per_event": outputs,
+                    "activation_condition": payload.get("activation_condition"),
+                    "formulas": payload.get("formulas", []),
+                    "candidate_rank": payload.get("candidate_rank", 1),
+                    "rule_index": payload.get("rule_index", 1),
+                    "experiment_config": payload.get("experiment_config", {}),
+                    "feature_mapping": payload.get("feature_mapping", {}),
+                    "current_status": row["status"],
+                    "evidence_source": "pattern_observations",
+                    "hit_count": 0,
+                    "unique_hit_rounds": 0,
+                    "exact_six_count": 0,
+                    "phases": set(),
+                    "hit_rounds": [],
+                    "prediction_created_before_draw": False,
+                    "replayable": bool(
+                        model_type == "six_number_set"
+                        and outputs == 6
+                        and len(payload.get("formulas", [])) == 6
+                        and payload.get("activation_condition")
+                    ),
+                }
+                grouped[pattern_id] = item
+            item["hit_count"] += 1
+            item["phases"].add(str(row["phase"]))
+            round_number = int(row["round_number"])
+            if exact:
+                item["exact_six_count"] += 1
+            item["prediction_created_before_draw"] |= bool(
+                observation.get("prediction_created_before_draw")
+            )
+            if not any(hit["round_number"] == round_number for hit in item["hit_rounds"]):
+                item["unique_hit_rounds"] += 1
+                item["hit_rounds"].append(
+                    {
+                        "round_number": round_number,
+                        "hit_count": int(observation.get("hit_count", 0)),
+                        "phase": str(row["phase"]),
+                        "exact_six": exact,
+                        "prediction_created_before_draw": bool(
+                            observation.get("prediction_created_before_draw")
+                        ),
+                        "predicted_numbers": observation.get("predicted_numbers", []),
+                        "winning_numbers": observation.get("winning_numbers", []),
+                        "classification": observation.get("classification"),
+                    }
+                )
+        results = list(grouped.values())
+        for item in results:
+            item["phases"] = sorted(item["phases"])
+            item["hit_rounds"].sort(key=lambda hit: hit["round_number"], reverse=True)
+        return sorted(
+            results,
+            key=lambda item: (
+                item["exact_six_count"],
+                item["unique_hit_rounds"],
+                item["hit_count"],
+                item["pattern_id"],
+            ),
+            reverse=True,
+        )[:limit]
 
     def list_patterns(self, limit: int = 1000) -> list[dict[str, Any]]:
         with self._connect() as connection:

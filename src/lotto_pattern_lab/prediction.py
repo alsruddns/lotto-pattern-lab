@@ -685,6 +685,109 @@ def create_recommendation(
     }
 
 
+def create_pattern_recommendation(
+    pattern: dict[str, Any],
+    dataset: DrawDataset,
+    target_round: int,
+    *,
+    data_file_sha256: str | None = None,
+    random_seed: int | None = None,
+    official_latest_round: int | None = None,
+    target_date: date | None = None,
+) -> dict[str, Any]:
+    """Replay one saved six-number GP pattern through the normal feature/executor path."""
+    if pattern.get("model_type") != "six_number_set" or int(
+        pattern.get("outputs_per_event", 0)
+    ) != 6:
+        raise ValueError("6개 집합 모델 공식만 다음 회차 조합으로 실행할 수 있습니다.")
+    formulas = [str(formula) for formula in pattern.get("formulas", ())]
+    if len(formulas) != 6 or not pattern.get("activation_condition"):
+        raise ValueError("저장된 패턴에 실행 가능한 활성 조건 또는 6개 수식이 없습니다.")
+    config = dict(pattern.get("experiment_config", {}))
+    config["feature_profile"] = str(pattern.get("feature_profile") or "legacy")
+    recorded_schema = pattern.get("feature_schema_version")
+    current_schema = feature_schema_version(config["feature_profile"])
+    if recorded_schema is not None and int(recorded_schema) != current_schema:
+        raise ValueError(
+            f"저장 특징 스키마 {recorded_schema}와 현재 스키마 {current_schema}가 달라 "
+            "재실행할 수 없습니다."
+        )
+    rank = int(pattern.get("candidate_rank", 1))
+    rule_index = int(pattern.get("rule_index", 1))
+    if rule_index not in {1, 2}:
+        raise ValueError("지원하지 않는 저장 규칙 번호입니다.")
+    # The original pattern belongs to one gate branch. Duplicate its six formulas
+    # only to satisfy the existing two-branch executor, then reject any other branch.
+    candidate = {
+        "activation_condition": str(pattern["activation_condition"]),
+        "formulas": formulas + formulas,
+        "rule_count": RULE_COUNT,
+        "outputs_per_event": 6,
+        "train_rounds": [1, max(1, target_round - 1)],
+        "complexity": None,
+    }
+    source_research_id = pattern.get("origin_research_id") or pattern.get("research_id")
+    experiment_id = str(pattern.get("experiment_id") or pattern.get("pattern_id"))
+    experiment = {
+        "experiment_id": experiment_id,
+        "research_id": source_research_id,
+        "experiment_type": "intermittent",
+        "status": "completed",
+        "engine": pattern.get("engine", "deap_intermittent_gp"),
+        "config": config,
+        "splits": {"train_rounds": [1, max(1, target_round - 1)]},
+        "selected_candidate_rank": rank,
+        "six_number_set_model": {"selected": candidate},
+        "pattern_library_candidates": [
+            {
+                "model": "six_number_set_model",
+                "candidate_rank": rank,
+                "rule_index": rule_index,
+                "pattern_id": pattern.get("pattern_id"),
+                "origin_research_id": source_research_id,
+            }
+        ],
+    }
+    recommendation = create_recommendation(
+        experiment,
+        dataset,
+        target_round,
+        "six_number_set",
+        data_file_sha256=data_file_sha256,
+        random_seed=random_seed,
+        official_latest_round=official_latest_round,
+        target_date=target_date,
+    )
+    active_rule = int(recommendation.get("selected_rule") or 0)
+    if active_rule == 0:
+        raise ValueError(
+            "선택한 패턴의 활성 조건이 현재 입력에서 비활성이어서 번호를 만들지 않았습니다."
+        )
+    if active_rule != rule_index:
+        raise ValueError(
+            f"선택 패턴은 규칙 {rule_index} 전용이지만 현재 입력은 "
+            f"규칙 {active_rule}을 활성화합니다."
+        )
+    recorded_mapping = pattern.get("feature_mapping")
+    if isinstance(recorded_mapping, dict) and recorded_mapping:
+        normalized_mapping = {str(key): str(value) for key, value in recorded_mapping.items()}
+        if normalized_mapping != recommendation["feature_schema"]["mapping"]:
+            raise ValueError(
+                "저장된 공식의 입력 특징 배치와 현재 프로파일이 달라 "
+                "재실행할 수 없습니다."
+            )
+    recommendation.update(
+        {
+            "source_pattern_id": pattern.get("pattern_id"),
+            "origin_research_id": source_research_id,
+            "research_id": source_research_id,
+            "recommendation_source_type": pattern.get("recommendation_source_type"),
+            "recommendation_status": recommendation["recommendation_status"],
+        }
+    )
+    return recommendation
+
+
 def save_recommendation(
     recommendation: dict[str, Any], directory: str | Path = "predictions"
 ) -> Path:

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import sqlite3
 import tempfile
 from datetime import date
 from pathlib import Path
@@ -17,6 +18,7 @@ from lotto_pattern_lab.pattern_library import PatternLibrary, register_prospecti
 from lotto_pattern_lab.prediction import (
     audit_candidate_history,
     compare_recommendation,
+    create_pattern_recommendation,
     create_recommendation,
     load_prediction_history,
     pysr_replay_readiness,
@@ -39,6 +41,12 @@ def _candidate_validation_value(candidate: dict) -> object:
     return candidate.get("evaluation", {}).get("validation", {}).get("mae")
 
 
+def _pattern_option_label(pattern_id: str, rows: list[dict]) -> str:
+    item = next(candidate for candidate in rows if candidate["pattern_id"] == pattern_id)
+    source_id = item.get("origin_research_id") or "미수집"
+    return f"{pattern_id[:8]} · 연구 {source_id[:8]}"
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _cached_research_candidates(
     directory: str, file_manifest: tuple[tuple[str, int, int], ...]
@@ -46,6 +54,14 @@ def _cached_research_candidates(
     # The manifest is part of the key so newly completed experiments invalidate the cache.
     del file_manifest
     return list_research_recommendation_candidates(directory, limit=200)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_hit_patterns(database: str, signature: tuple[int, int], minimum_hits: int):
+    del signature
+    return PatternLibrary.read_only(database).list_hit_pattern_candidates(
+        minimum_hits=minimum_hits, limit=100
+    )
 
 
 st.set_page_config(page_title="다음 회차 번호 추천", layout="wide")
@@ -382,7 +398,246 @@ if st.session_state.get("research_recommendation_failures"):
             width="stretch",
         )
 
-with st.expander("\uae30\uc874 \uace0\uc801\uc911 \ud328\ud134 \uc0ac\ub840", expanded=False):
+st.subheader("추천 패턴 출처")
+pattern_source = st.selectbox(
+    "추천 패턴 출처",
+    (
+        "기존 고적중 패턴 사례",
+        "5개 이상 적중 패턴",
+        "6개 완전 일치 패턴",
+        "누적 연구 자동 추천",
+    ),
+    key="recommendation_pattern_source",
+)
+if pattern_source == "누적 연구 자동 추천":
+    st.info("위의 ‘누적 연구 기반 자동 추천’에서 시간순 검증을 통과한 수식을 실행합니다.")
+else:
+    minimum_hits = {
+        "기존 고적중 패턴 사례": 4,
+        "5개 이상 적중 패턴": 5,
+        "6개 완전 일치 패턴": 6,
+    }[pattern_source]
+    library_path = project_path("data/database/patterns.sqlite")
+    if not library_path.is_file():
+        st.info("패턴 라이브러리 데이터베이스가 없어 후보를 조회할 수 없습니다.")
+        hit_patterns = []
+    else:
+        stat = library_path.stat()
+        try:
+            hit_patterns = _cached_hit_patterns(
+                str(library_path), (stat.st_mtime_ns, stat.st_size), minimum_hits
+            )
+            if pattern_source == "기존 고적중 패턴 사례":
+                known_id = "b5f4b83e-20e3-47ea-9ac1-9d613e0e28f0"
+                if known_id not in {item["pattern_id"] for item in hit_patterns}:
+                    try:
+                        known = PatternLibrary.read_only(library_path).get_pattern(known_id)
+                    except KeyError:
+                        known = None
+                    if known and len(known.get("formulas", [])) == 6:
+                        hit_patterns.append(
+                            {
+                                **known,
+                                "experiment_id": known.get("experiment_id"),
+                                "origin_research_id": known.get("origin_research_id"),
+                                "research_round": None,
+                                "feature_profile": known.get("feature_profile", "legacy"),
+                                "engine": known.get("engine", "미수집"),
+                                "model_type": known.get("model_type"),
+                                "outputs_per_event": known.get("outputs_per_event", 6),
+                                "experiment_config": known.get("experiment_config", {}),
+                                "hit_count": 2,
+                                "unique_hit_rounds": 2,
+                                "exact_six_count": 0,
+                                "phases": ["retrospective"],
+                                "hit_rounds": [
+                                    {
+                                        "round_number": 1118,
+                                        "hit_count": 5,
+                                        "phase": "retrospective",
+                                        "exact_six": False,
+                                        "prediction_created_before_draw": False,
+                                        "evidence_source": "existing_ui_case",
+                                    },
+                                    {
+                                        "round_number": 1207,
+                                        "hit_count": 4,
+                                        "phase": "retrospective",
+                                        "exact_six": False,
+                                        "prediction_created_before_draw": False,
+                                        "evidence_source": "existing_ui_case",
+                                    },
+                                ],
+                                "prediction_created_before_draw": False,
+                                "evidence_source": "기존 화면의 회고 사례 기록",
+                                "replayable": bool(
+                                    known.get("model_type") == "six_number_set"
+                                    and len(known.get("formulas", [])) == 6
+                                    and known.get("activation_condition")
+                                ),
+                            }
+                        )
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            hit_patterns = []
+            st.error(f"패턴 저장소 조회 실패: {error}")
+    st.caption(
+        "최고 적중과 목록은 본번호 적중 기록 기준입니다. 반복 기록 수와 "
+        "고유 적중 회차 수를 따로 표시하며, "
+        "6개 완전 일치는 저장된 본번호 집합이 일치하는 기록만 포함합니다."
+    )
+    if not hit_patterns:
+        st.info("선택한 출처에 해당하는 저장 패턴이 없습니다.")
+    else:
+        pattern_options = [item["pattern_id"] for item in hit_patterns]
+        st.write(
+            f"조회 후보: **{len(hit_patterns):,}개** · 정렬: 완전 일치 수, "
+            "고유 적중 회차 수, 반복 기록 수 내림차순"
+        )
+        st.dataframe(
+            [
+                {
+                    "패턴 ID": item["pattern_id"][:8],
+                    "연구 ID": (item.get("origin_research_id") or "미수집")[:8],
+                    "연구 회차": item.get("research_round") or "미수집",
+                    "모델": item.get("model_type") or "미수집",
+                    "프로파일": item.get("feature_profile"),
+                    "엔진": item.get("engine"),
+                    "최고 적중": max(
+                        (int(hit.get("hit_count", 0)) for hit in item["hit_rounds"]),
+                        default=0,
+                    ),
+                    "기록 수": item["hit_count"],
+                    "고유 적중 회차": item["unique_hit_rounds"],
+                    "6개 완전 일치": item["exact_six_count"],
+                    "발생 회차": ", ".join(
+                        str(hit["round_number"]) for hit in item["hit_rounds"][:10]
+                    )
+                    + (" …" if len(item["hit_rounds"]) > 10 else ""),
+                    "구간": ", ".join(item["phases"]),
+                    "기록 출처": item.get("evidence_source", "저장된 검증 관측"),
+                    "사전 예측 포함": item["prediction_created_before_draw"],
+                    "재실행 가능": item["replayable"],
+                }
+                for item in hit_patterns
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+        selected_pattern_id = st.selectbox(
+            "패턴 선택",
+            pattern_options,
+            format_func=lambda value: _pattern_option_label(value, hit_patterns),
+            key="selected_recommendation_pattern_id",
+        )
+        selected_pattern_row = next(
+            item for item in hit_patterns if item["pattern_id"] == selected_pattern_id
+        )
+        if st.button("선택한 패턴 상세 조회", key="load_recommendation_pattern_detail"):
+            try:
+                st.session_state["recommendation_pattern_detail"] = PatternLibrary.read_only(
+                    library_path
+                ).get_pattern(selected_pattern_id)
+                st.session_state["recommendation_pattern_detail_id"] = selected_pattern_id
+            except (OSError, ValueError, KeyError, RuntimeError) as error:
+                st.error(f"패턴 상세 조회 실패: {error}")
+        if st.session_state.get("recommendation_pattern_detail_id") == selected_pattern_id:
+            detail = st.session_state.get("recommendation_pattern_detail", {})
+            st.markdown("#### 선택한 패턴 상세")
+            st.write(
+                f"모델 `{selected_pattern_row.get('model_type')}` · "
+                f"프로파일 `{selected_pattern_row.get('feature_profile')}` · "
+                f"연구 회차 `{selected_pattern_row.get('research_round') or '미수집'}` · "
+                f"원본 연구 `{selected_pattern_row.get('origin_research_id') or '미수집'}` · "
+                "필요 lag "
+                f"{selected_pattern_row.get('experiment_config', {}).get('max_lag', '미수집')}"
+            )
+            st.write(
+                "읽기 쉬운 수식",
+                [pretty_formula(value) for value in detail.get("formulas", [])],
+            )
+            st.code("\n".join(detail.get("formulas", [])), language="text", wrap_lines=True)
+            st.write("조건식", detail.get("activation_condition", "미수집"))
+            st.write("과거 적중 기록", selected_pattern_row["hit_rounds"])
+            st.write("평가 이력", detail.get("observations", []))
+            st.caption(
+                "회고 적합은 과거 당첨번호를 사용한 기록입니다. "
+                "이를 사전 예측 성과로 해석하지 않습니다."
+            )
+            replayable = bool(selected_pattern_row["replayable"])
+            if not replayable:
+                st.warning(
+                    "이 패턴은 6개 집합 실행 조건을 갖추지 않아 "
+                    "추천 조합으로 재실행할 수 없습니다."
+                )
+            if st.button(
+                "선택 패턴으로 다음 회차 조합 미리보기",
+                key=f"replay_recommendation_pattern_{selected_pattern_id}",
+                disabled=not replayable or dataset is None,
+                type="primary",
+            ):
+                try:
+                    official_latest = _fetch_latest_round()
+                    if int(target) != int(official_latest) + 1:
+                        raise ValueError(
+                            f"대상 회차는 최신 확정 회차 다음인 {official_latest + 1}회여야 합니다."
+                        )
+                    pattern_for_run = {
+                        **detail,
+                        **selected_pattern_row,
+                        "recommendation_source_type": pattern_source,
+                    }
+                    draft = create_pattern_recommendation(
+                        pattern_for_run,
+                        dataset,
+                        int(target),
+                        data_file_sha256=hashlib.sha256(data_bytes).hexdigest()
+                        if data_bytes
+                        else None,
+                        random_seed=int(seed),
+                        official_latest_round=official_latest,
+                        target_date=target_date,
+                    )
+                    st.session_state["selected_pattern_recommendation_draft"] = draft
+                    st.success("선택한 공식을 최신 회차 이전 데이터로 재실행했습니다.")
+                except Exception as error:
+                    st.session_state.pop("selected_pattern_recommendation_draft", None)
+                    st.error(f"선택 패턴 실행 실패: {error}")
+
+pattern_draft = st.session_state.get("selected_pattern_recommendation_draft")
+if pattern_draft and pattern_draft.get("source_pattern_id") == st.session_state.get(
+    "selected_recommendation_pattern_id"
+):
+    st.markdown("#### 추천 결과 미리보기")
+    st.write(
+        f"대상 {pattern_draft['target_round']}회 · 번호 "
+        + " · ".join(map(str, pattern_draft["recommended_numbers"]))
+    )
+    st.caption(
+        f"패턴 `{pattern_draft['source_pattern_id']}` · 연구 "
+        f"`{pattern_draft.get('origin_research_id') or '미수집'}` · "
+        f"프로파일 `{pattern_draft['feature_schema']['profile']}` · "
+        f"상태 `{pattern_draft['recommendation_status']}`"
+    )
+    if st.button("미리보기 추천을 저장", key="save_selected_pattern_recommendation"):
+        try:
+            current_official_round = _fetch_latest_round()
+            if int(pattern_draft["target_round"]) != int(current_official_round) + 1:
+                raise ValueError(
+                    "저장 직전 대상 회차가 최신 확정 회차 다음이 아닙니다. "
+                    "다시 생성하세요."
+                )
+            if pattern_draft["recommendation_status"] != "pre_draw_prediction":
+                raise ValueError("사전 추천이 아닌 결과는 저장할 수 없습니다.")
+            saved_path = save_recommendation(pattern_draft, prediction_dir)
+            st.session_state["active_recommendation_id"] = pattern_draft["recommendation_id"]
+            st.toast(f"추천을 저장했습니다: {saved_path.name}")
+            st.success(f"추천 저장 완료: {saved_path.name}")
+        except FileExistsError:
+            st.info("이 추천 ID는 이미 저장되어 있습니다. 기존 기록은 변경하지 않았습니다.")
+        except (OSError, ValueError) as error:
+            st.error(f"추천 저장 실패: {error}")
+
+with st.expander("기존 고적중 패턴 사례", expanded=False):
     st.write("\ud328\ud134 ID: `b5f4b83e-20e3-47ea-9ac1-9d613e0e28f0`")
     st.write("\uc81c\uacf5\ub41c \uc0ac\ub840: 1118\ud68c 5\uac1c, 1207\ud68c 4\uac1c")
     st.caption(

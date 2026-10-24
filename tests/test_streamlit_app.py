@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
@@ -92,6 +93,91 @@ def test_continuous_research_page_separates_start_and_resume(tmp_path, monkeypat
     if resume_selector.value == "962a0a57-92c3-4e88-a04f-5cf4b836ba29":
         resume_button = next(button for button in app.button if button.label == "이어서 하기")
         assert not resume_button.disabled
+
+
+def test_continuous_research_prediction_panel_shows_empty_state_for_selected_research(
+    tmp_path, monkeypatch
+) -> None:
+    import shutil
+
+    import lotto_pattern_lab.paths as paths
+    from lotto_pattern_lab.research_rounds import ResearchRoundStore
+
+    root = tmp_path / "project"
+    for name in (
+        "data/database",
+        "checkpoints",
+        "experiments",
+        "predictions",
+        "data/raw",
+        "src/lotto_pattern_lab",
+    ):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        Path(__file__).resolve().parents[1]
+        / "src/lotto_pattern_lab/continuous_research_view.py",
+        root / "src/lotto_pattern_lab/continuous_research_view.py",
+    )
+    monkeypatch.setattr(paths, "PROJECT_ROOT", root)
+    monkeypatch.setattr(research_queue, "QUEUE_DB", root / "data/database/queue.sqlite")
+    rounds = ResearchRoundStore(root / "data/database/patterns.sqlite")
+    rounds.ensure_round(
+        "research-without-prediction",
+        {
+            "status": "running",
+            "checkpoint_path": str(root / "checkpoints/research.json"),
+            "completed_experiment_ids": [],
+        },
+        root / "checkpoints",
+        root / "experiments",
+    )
+    for status in ("completed", "failed"):
+        rounds.ensure_round(
+            f"research-{status}",
+            {
+                "status": status,
+                "checkpoint_path": str(root / f"checkpoints/{status}.json"),
+                "completed_experiment_ids": [],
+            },
+            root / "checkpoints",
+            root / "experiments",
+        )
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob("3_*.py")
+    )
+
+    app = AppTest.from_file(page).run(timeout=60)
+
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert "저장된 다음 회차 예측" in [item.value for item in app.subheader]
+    assert "해당 연구의 저장된 예측 후보 없음" in [item.value for item in app.info]
+    research_options = app.selectbox(key="saved_prediction_research_id").options
+    assert len(research_options) == 3
+    assert any("running" in option for option in research_options)
+    assert any("completed" in option for option in research_options)
+    assert any("failed" in option for option in research_options)
+    app.selectbox(key="saved_prediction_research_id").select("research-without-prediction")
+    (root / "predictions/recommendation-1.json").write_text(
+        json.dumps(
+            {
+                "recommendation_id": "recommendation-1",
+                "research_id": "research-without-prediction",
+                "target_round": 1247,
+                "recommended_numbers": [2, 6, 11, 13, 22, 37],
+                "created_at": "2026-10-24T00:00:00+00:00",
+                "experiment_id": "experiment-1",
+                "source_pattern_id": "pattern-1",
+                "feature_schema": {"profile": "integrated_v1"},
+                "recommendation_status": "pre_draw_prediction",
+                "result_status": "pending",
+            }
+        ),
+        encoding="utf-8",
+    )
+    app.run(timeout=60)
+    assert not app.exception, [exception.message for exception in app.exception]
+    assert "해당 연구의 저장된 예측 후보 없음" not in [item.value for item in app.info]
+    assert app.dataframe
 
 
 def test_optimization_tab_shows_history_and_separates_new_and_resume() -> None:

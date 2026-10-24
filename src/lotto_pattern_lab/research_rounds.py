@@ -437,12 +437,18 @@ class ResearchRoundStore:
         return [self._decode(row) for row in rows]
 
     def experiment_ids(self, research_id: str) -> list[str]:
-        with self._connect() as connection:
+        connection = sqlite3.connect(
+            f"{self.path.as_uri()}?mode=ro", uri=True, timeout=0.25
+        )
+        connection.row_factory = sqlite3.Row
+        try:
             rows = connection.execute(
                 "SELECT experiment_id FROM research_round_experiments "
                 "WHERE research_id=? ORDER BY experiment_id",
                 (research_id,),
             ).fetchall()
+        finally:
+            connection.close()
         return [str(row["experiment_id"]) for row in rows]
 
     @staticmethod
@@ -1272,6 +1278,67 @@ def collect_prediction_candidates(
             }
         )
     return sorted(candidates, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+
+def list_saved_research_predictions(
+    research_id: str,
+    experiment_ids: list[str],
+    prediction_directory: str | Path = "predictions",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read saved recommendations linked to this research without running work.
+
+    Newer records link by research_id. Older records are linked through the
+    experiment IDs already registered to the research round. An explicit, different
+    research_id always wins and prevents a cross-research match.
+    """
+    root = project_path(prediction_directory)
+    if not root.is_dir():
+        return [], []
+    experiment_set = set(map(str, experiment_ids))
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    try:
+        paths = sorted(root.glob("*.json"))
+    except OSError as error:
+        return [], [str(error)]
+    for path in paths:
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append(f"{path.name}: {error}")
+            continue
+        if not isinstance(item, dict):
+            errors.append(f"{path.name}: JSON root must be an object")
+            continue
+        explicit_research_id = item.get("research_id")
+        if explicit_research_id is not None:
+            if str(explicit_research_id) != research_id:
+                continue
+        elif str(item.get("experiment_id", "")) not in experiment_set:
+            continue
+        results.append(
+            {
+                "recommendation_id": item.get("recommendation_id") or path.stem,
+                "target_round": item.get("target_round"),
+                "recommended_numbers": item.get("recommended_numbers", []),
+                "created_at": item.get("created_at"),
+                "saved_at": item.get("saved_at")
+                or datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat(),
+                "experiment_id": item.get("experiment_id"),
+                "research_id": explicit_research_id or research_id,
+                "origin_research_id": item.get("origin_research_id")
+                or item.get("pattern_context", {}).get("origin_research_id"),
+                "feature_profile": item.get("feature_schema", {}).get("profile"),
+                "recommendation_status": item.get("recommendation_status"),
+                "result_status": item.get("result_status", "미검증"),
+                "result": item.get("result"),
+                "model_type": item.get("model_type"),
+                "source_pattern_id": item.get("source_pattern_id")
+                or item.get("pattern_context", {}).get("pattern_id"),
+            }
+        )
+    results.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return results, errors
 
 
 def _stats(values: list[Any]) -> dict[str, float | None]:
