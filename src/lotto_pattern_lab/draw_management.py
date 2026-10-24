@@ -6,7 +6,9 @@ import csv
 import hashlib
 import io
 import json
+import os
 import sqlite3
+import time
 import uuid
 from contextlib import ExitStack
 from datetime import UTC, date, datetime
@@ -94,18 +96,39 @@ def _research_lock_path() -> Path:
     return project_path("checkpoints/research_global")
 
 
+def _dataset_update_lock_path() -> Path:
+    return project_path("checkpoints/dataset_update_gate")
+
+
 def _research_queue_database_path() -> Path:
     return project_path("data/database/research_queue.sqlite")
 
 
-def _assert_no_pending_research(queue_database_path: str | Path | None = None) -> None:
+def _pid_is_alive(pid: int | None) -> bool:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _queue_registration_state(
+    queue_database_path: str | Path | None = None,
+) -> tuple[int, str | None]:
+    """Return waiting reservation count and a reason if a real worker may be active."""
     queue_path = (
         Path(queue_database_path).resolve()
         if queue_database_path is not None
         else _research_queue_database_path()
     )
     if not queue_path.is_file():
-        return
+        return 0, None
 
     connection = None
     try:
@@ -116,47 +139,103 @@ def _assert_no_pending_research(queue_database_path: str | Path | None = None) -
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )
         }
-        pending_queue = False
-        pending_item = False
-        if "research_queues" in tables:
-            pending_queue = connection.execute(
-                "SELECT 1 FROM research_queues "
-                "WHERE status IN ('waiting','running','paused','interrupted') LIMIT 1"
-            ).fetchone() is not None
-        if "research_queue_items" in tables:
-            pending_item = connection.execute(
-                "SELECT 1 FROM research_queue_items "
-                "WHERE status IN ('waiting','running','paused','interrupted') LIMIT 1"
-            ).fetchone() is not None
+        if "research_queue_items" not in tables:
+            raise RuntimeError("research_queue_items table is missing")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(research_queue_items)")}
+        required = {"status", "worker_pid", "checkpoint_path"}
+        if not required.issubset(columns):
+            raise RuntimeError("research queue worker columns are missing")
+        pending_count = int(
+            connection.execute(
+                "SELECT count(*) FROM research_queue_items WHERE status='waiting'"
+            ).fetchone()[0]
+        )
+        active_rows = connection.execute(
+            "SELECT worker_pid,checkpoint_path FROM research_queue_items WHERE status='running'"
+        ).fetchall()
+        lease_live = False
+        if "research_queue_lease" in tables:
+            lease = connection.execute(
+                "SELECT heartbeat_at FROM research_queue_lease WHERE singleton=1"
+            ).fetchone()
+            lease_live = bool(lease and time.time() - float(lease[0]) <= 45)
+        for worker_pid, checkpoint_path in active_rows:
+            pid = int(worker_pid) if worker_pid is not None else None
+            checkpoint = Path(checkpoint_path) if checkpoint_path else None
+            if checkpoint is None:
+                return pending_count, "unknown_worker_state"
+            try:
+                with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
+                    pass
+            except TimeoutError:
+                return pending_count, "queue_worker"
+            if pid is None:
+                return pending_count, "unknown_worker_state"
+            if _pid_is_alive(pid):
+                # A PID without its worker lock is ambiguous; the scheduler heartbeat
+                # distinguishes a launch transition from a stale/reused PID.
+                return pending_count, "queue_starting" if lease_live else "unknown_worker_state"
+            # A live scheduler lease is allowed for waiting work; it cannot claim work
+            # during registration because scheduler_step shares the update gate.
+            if lease_live:
+                continue
     except sqlite3.Error as error:
         raise RuntimeError(
             f"예약 연구 상태를 안전하게 확인할 수 없어 등록을 보류했습니다: {error}"
         ) from error
+    except RuntimeError:
+        raise
     finally:
         if connection is not None:
             connection.close()
-
-    if pending_queue or pending_item:
-        raise RuntimeError(
-            "실행·예약·재개 대기 연구가 있어 당첨번호 데이터 변경을 보류했습니다. "
-            "해당 연구와 예약이 모두 완료된 뒤 다시 시도하세요."
-        )
+    return pending_count, None
 
 
 def draw_registration_block_reason() -> str | None:
     """Return a safe, read-only UI reason when draw writes could affect research."""
     try:
-        with interprocess_lock(
-            _research_lock_path(), timeout=0, scope="research-global"
-        ):
-            pass
+        with interprocess_lock(_dataset_update_lock_path(), timeout=0, scope="dataset-update"):
+            with interprocess_lock(
+                _research_lock_path(), timeout=0, scope="research-global"
+            ):
+                pass
     except TimeoutError:
-        return "연구 또는 최적화 작업이 실행 중이어서 당첨번호 등록을 보류합니다."
+        return "등록 대기 — 다른 작업이 연구 데이터 잠금을 사용 중입니다."
     try:
-        _assert_no_pending_research()
-    except RuntimeError as error:
-        return str(error)
+        _, state = _queue_registration_state()
+        if state == "queue_worker":
+            return "등록 불가 — 예약 연구 워커가 실행 중입니다."
+        if state == "queue_starting":
+            return "등록 불가 — 예약 연구가 실행을 시작 중입니다."
+        if state == "unknown_worker_state":
+            return "등록 불가 — 연구 실행 상태 확인이 필요합니다."
+    except (OSError, RuntimeError, sqlite3.Error) as error:
+        return f"등록 불가 — 연구 실행 상태 확인이 필요합니다: {error}"
     return None
+
+
+def draw_registration_status() -> str:
+    """Describe whether registration is safe, including queued reservations."""
+    try:
+        with interprocess_lock(_dataset_update_lock_path(), timeout=0, scope="dataset-update"):
+            with interprocess_lock(
+                _research_lock_path(), timeout=0, scope="research-global"
+            ):
+                pass
+        pending_count, state = _queue_registration_state()
+    except TimeoutError:
+        return "등록 대기 — 다른 작업이 연구 데이터 잠금을 사용 중입니다."
+    except (OSError, RuntimeError, sqlite3.Error) as error:
+        return f"등록 불가 — 연구 실행 상태 확인이 필요합니다: {error}"
+    if state == "queue_worker":
+        return "등록 불가 — 예약 연구 워커가 실행 중입니다."
+    if state == "queue_starting":
+        return "등록 불가 — 예약 연구가 실행을 시작 중입니다."
+    if state:
+        return "등록 불가 — 연구 실행 상태 확인이 필요합니다."
+    if pending_count:
+        return f"등록 가능 — 대기 중인 예약 {pending_count}건"
+    return "등록 가능 — 실행 중인 연구 없음"
 
 
 def register_draw(
@@ -169,9 +248,14 @@ def register_draw(
     official_dates_path: str | Path = "data/official/draws.csv",
     backup_directory: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Serialize draw writes against workers and refuse queued dataset consumers."""
+    """Serialize data writes against active workers and scheduler launch transitions."""
     with ExitStack() as stack:
         try:
+            stack.enter_context(
+                interprocess_lock(
+                    _dataset_update_lock_path(), timeout=0, scope="dataset-update"
+                )
+            )
             stack.enter_context(
                 interprocess_lock(
                     _research_lock_path(), timeout=0, scope="research-global"
@@ -179,9 +263,13 @@ def register_draw(
             )
         except TimeoutError as error:
             raise RuntimeError(
-                "연구 또는 최적화 작업이 실행 중이어서 당첨번호 등록을 보류했습니다."
+                "연구 데이터 또는 실행 잠금이 사용 중이어서 등록을 보류했습니다."
             ) from error
-        _assert_no_pending_research()
+        _, state = _queue_registration_state()
+        if state in {"queue_worker", "queue_starting"}:
+            raise RuntimeError("예약 연구 워커가 실행 중이어서 등록을 보류했습니다.")
+        if state == "unknown_worker_state":
+            raise RuntimeError("연구 실행 상태를 확인할 수 없어 등록을 보류했습니다.")
         return _register_draw_under_research_lock(
             csv_path,
             round_number=round_number,
@@ -227,9 +315,14 @@ def _register_draw_under_research_lock(
         raise ValueError("미래 날짜의 추첨 결과는 등록할 수 없습니다.")
 
     metadata_path = _metadata_path(path)
+    manifest_path = Path(f"{path}.manifest.json")
     with interprocess_lock(path, scope="manual-draw-write"):
         original = path.read_bytes()
         old_hash = hashlib.sha256(original).hexdigest()
+        old_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
+        old_manifest_value = (
+            json.loads(old_manifest.decode("utf-8")) if old_manifest is not None else None
+        )
         header, rows = _read_raw_rows(path)
         index = {name: header.index(name) for name in header}
         round_column = "round" if "round" in index else "draw_no"
@@ -243,11 +336,20 @@ def _register_draw_under_research_lock(
             dates = dict(current_metadata.get("draw_dates", {}))
             statuses = dict(current_metadata.get("round_verification", {}))
         else:
-            dates, statuses = _official_dates(official_dates_path)[0], {}
+            dates = {
+                str(record.round_number): record.draw_date.isoformat()
+                for record in records.records
+                if record.draw_date is not None
+            }
+            dates.update(_official_dates(official_dates_path)[0])
             statuses = {
                 str(record.round_number): {
-                    "status": "manual_unverified",
-                    "method": "legacy source row has not been fully reconciled",
+                    "status": record.verification_status or "manual_unverified",
+                    "method": (
+                        "verified by original official provenance manifest"
+                        if record.verification_status == "official_verified"
+                        else "legacy source row has not been fully reconciled"
+                    ),
                 }
                 for record in records.records
             }
@@ -405,6 +507,30 @@ def _register_draw_under_research_lock(
             "format_encoding": encoding,
             "format_columns": header,
         }
+        official_source = None
+        if old_manifest_value is not None:
+            if old_manifest_value.get("source_kind") == "official_verified":
+                official_source = dict(old_manifest_value)
+                official_source["byte_length"] = len(original)
+            elif old_manifest_value.get("source_kind") == "manual_unverified":
+                official_source = old_manifest_value.get("official_source")
+                if not isinstance(official_source, dict):
+                    raise ValueError("기존 Manifest에 공식 원본 출처 정보가 없습니다.")
+            else:
+                raise ValueError("지원하지 않는 기존 CSV provenance Manifest입니다.")
+        new_manifest = None
+        if official_source is not None:
+            new_manifest = {
+                "schema_version": 2,
+                "source_kind": "manual_unverified",
+                "verification_status": "manual_unverified",
+                "source_description": "Official verified history with manually registered draws.",
+                "sha256": new_hash,
+                "start_round": dated_dataset.records[0].round_number,
+                "end_round": round_number,
+                "draw_count": len(dated_dataset.records),
+                "official_source": official_source,
+            }
         old_metadata = metadata_path.read_bytes() if metadata_path.exists() else None
         history_path = Path(f"{path}.history.jsonl")
         old_history = history_path.read_bytes() if history_path.exists() else b""
@@ -420,9 +546,19 @@ def _register_draw_under_research_lock(
             "fixed_range_before_sha256": metadata["fixed_range_before_sha256"],
             "fixed_range_after_sha256": metadata["fixed_range_after_sha256"],
         }
+        manifest_backup_path = None
+        if old_manifest is not None:
+            manifest_backup_path = backup_path.with_name(f"{backup_path.name}.manifest.json")
+            atomic_write_bytes(manifest_backup_path, old_manifest)
+            if hashlib.sha256(manifest_backup_path.read_bytes()).hexdigest() != hashlib.sha256(
+                old_manifest
+            ).hexdigest():
+                raise OSError("Provenance Manifest 백업 SHA-256 검증에 실패했습니다.")
         try:
             atomic_write_bytes(path, updated_bytes)
             atomic_write_bytes(metadata_path, _json_bytes(metadata))
+            if new_manifest is not None:
+                atomic_write_bytes(manifest_path, _json_bytes(new_manifest))
             atomic_write_bytes(
                 history_path,
                 old_history + json.dumps(history_event, ensure_ascii=False).encode("utf-8") + b"\n",
@@ -433,22 +569,45 @@ def _register_draw_under_research_lock(
                 or hashlib.sha256(path.read_bytes()).hexdigest() != new_hash
             ):
                 raise ValueError("저장 파일을 다시 읽은 결과가 저장 예정 데이터와 다릅니다.")
-        except Exception:
-            atomic_write_bytes(path, original)
-            if old_metadata is None:
-                metadata_path.unlink(missing_ok=True)
-            else:
-                atomic_write_bytes(metadata_path, old_metadata)
+        except Exception as write_error:
+            rollback_errors = []
+            restore_bytes = [(path, original)]
+            if old_manifest is not None:
+                restore_bytes.append((manifest_path, old_manifest))
+            if old_metadata is not None:
+                restore_bytes.append((metadata_path, old_metadata))
             if old_history:
-                atomic_write_bytes(history_path, old_history)
-            else:
-                history_path.unlink(missing_ok=True)
+                restore_bytes.append((history_path, old_history))
+            for target, content in restore_bytes:
+                try:
+                    atomic_write_bytes(target, content)
+                except Exception as rollback_error:  # preserve every possible artifact
+                    rollback_errors.append(f"{target}: {rollback_error}")
+            for target, existed in (
+                (metadata_path, old_metadata is not None),
+                (history_path, bool(old_history)),
+            ):
+                if existed:
+                    continue
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{target}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "저장 실패 후 일부 파일 복구를 완료하지 못했습니다. "
+                    f"원본 백업은 {backup_path} 및 {manifest_backup_path}에 보존됩니다. "
+                    + "; ".join(rollback_errors)
+                ) from write_error
             raise
     return {
         "status": "registered",
         "round_number": round_number,
         "csv_path": str(path),
         "backup_path": str(backup_path),
+        "manifest_backup_path": (
+            str(manifest_backup_path) if manifest_backup_path is not None else None
+        ),
         "old_csv_sha256": old_hash,
         "new_csv_sha256": new_hash,
         "fixed_range_before_sha256": metadata["fixed_range_before_sha256"],

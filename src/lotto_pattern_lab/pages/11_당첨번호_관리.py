@@ -14,7 +14,7 @@ from lotto_pattern_lab.dataset import dataset_integrity_report, load_csv
 from lotto_pattern_lab.draw_management import (
     confirm_manual_official_comparison,
     create_draw_correction_request,
-    draw_registration_block_reason,
+    draw_registration_status,
     register_draw,
     verify_draw_against_official,
 )
@@ -74,9 +74,14 @@ st.caption(
     "등록 전 원본 CSV를 백업하고 기존 컬럼 순서·인코딩을 유지합니다. "
     "새 입력은 공식 대조 전까지 수동 미검증 상태입니다."
 )
-registration_block_reason = draw_registration_block_reason()
+registration_status = draw_registration_status()
+registration_block_reason = (
+    None if registration_status.startswith("등록 가능") else registration_status
+)
 if registration_block_reason:
-    st.warning(registration_block_reason)
+    st.warning(registration_status)
+else:
+    st.success(registration_status)
 with st.form("manual_draw_entry", clear_on_submit=False):
     round_number = st.number_input(
         "회차 번호", min_value=1, value=latest.round_number + 1, step=1, key="draw_entry_round"

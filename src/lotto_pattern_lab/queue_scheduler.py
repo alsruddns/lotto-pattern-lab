@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .atomic_io import interprocess_lock
 from .dataset import load_csv
 from .engines import GP_ENGINE_ID, PYSR_ENGINE_ID
 from .intermittent import IntermittentConfig
@@ -29,6 +30,10 @@ from .storage_management import load_storage_settings, storage_inventory, storag
 
 class ExecutionSlotBusy(RuntimeError):
     """The shared worker slot became occupied while a reservation was being checked."""
+
+
+class DatasetVerificationPending(RuntimeError):
+    """The current draw file includes results that are not officially verified yet."""
 
 
 def start_detached_scheduler(store: ResearchQueueStore, queue_id: str) -> int:
@@ -158,6 +163,10 @@ def _check_queued_item_environment(item: dict[str, Any]) -> None:
     """Run a cached per-engine smoke check before a detached queue launches a worker."""
     settings = item["config"]
     dataset = load_csv(project_path(settings.get("csv", "data/official/draws.csv")))
+    if dataset.source_kind == "manual_unverified":
+        raise DatasetVerificationPending(
+            "The current draw dataset includes an unverified manual result."
+        )
     config_values = {
         field.name: settings[field.name]
         for field in fields(IntermittentConfig)
@@ -203,7 +212,32 @@ def scheduler_step(
     workspace_root: Path = PROJECT_ROOT,
     round_store: ResearchRoundStore | None = None,
 ) -> str:
-    """One deterministic scheduler tick, injectable for isolated, fast tests."""
+    """Serialize reservation starts with writes to the research dataset."""
+    gate = workspace_root / "checkpoints" / "dataset_update_gate"
+    try:
+        with interprocess_lock(gate, timeout=0, scope="dataset-update"):
+            return _scheduler_step_under_dataset_gate(
+                store,
+                queue_id,
+                launch=launch,
+                inspect=inspect,
+                workspace_root=workspace_root,
+                round_store=round_store,
+            )
+    except TimeoutError:
+        return "waiting_for_dataset_update"
+
+
+def _scheduler_step_under_dataset_gate(
+    store: ResearchQueueStore,
+    queue_id: str,
+    *,
+    launch: Callable[[dict[str, Any], Path, str], int],
+    inspect: Callable[[dict[str, Any]], tuple[bool, str | None]],
+    workspace_root: Path,
+    round_store: ResearchRoundStore | None,
+) -> str:
+    """One deterministic scheduler tick while holding the dataset update gate."""
     queue = store.queue(queue_id)
     current = store.current_item(queue_id)
     if current and current["status"] == "running":
@@ -257,6 +291,9 @@ def scheduler_step(
         except ExecutionSlotBusy:
             store.release_claim(item["item_id"], status=resumable["status"])
             return "waiting_for_global_worker"
+        except DatasetVerificationPending:
+            store.release_claim(item["item_id"], status=resumable["status"])
+            return "waiting_for_official_dataset"
         except Exception as error:
             store.finish_item(item["item_id"], "failed", error=str(error))
             store.set_queue_status(queue_id, "failed")
@@ -311,6 +348,10 @@ def scheduler_step(
         store.set_item_research(item["item_id"], research_id, int(round_number), str(checkpoint))
         store.release_claim(item["item_id"], status="waiting")
         return "waiting_for_global_worker"
+    except DatasetVerificationPending:
+        store.set_item_research(item["item_id"], research_id, int(round_number), str(checkpoint))
+        store.release_claim(item["item_id"], status="waiting")
+        return "waiting_for_official_dataset"
     except Exception as error:
         store.set_item_research(item["item_id"], research_id, round_number, str(checkpoint))
         store.finish_item(item["item_id"], "failed", error=str(error))

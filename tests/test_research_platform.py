@@ -12,6 +12,7 @@ from lotto_pattern_lab.dataset import (
     DrawDataset,
     DrawRecord,
     dataset_integrity_report,
+    load_csv,
     make_random_dataset,
 )
 from lotto_pattern_lab.draw import Draw
@@ -65,6 +66,39 @@ def test_shared_research_slot_reports_other_research_or_optimizer(tmp_path, monk
         research.GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"
     ):
         assert research_worker_active() is True
+
+
+def test_research_worker_rechecks_csv_after_acquiring_dataset_gate(tmp_path, monkeypatch):
+    import lotto_pattern_lab.research as research
+
+    monkeypatch.setattr(research, "GLOBAL_RESEARCH_LOCK", tmp_path / "research-global")
+    monkeypatch.setattr(research, "DATASET_UPDATE_GATE", tmp_path / "dataset-update")
+    source = tmp_path / "draws.csv"
+    source.write_text(
+        "round,n1,n2,n3,n4,n5,n6\n1,1,2,3,4,5,6\n2,7,8,9,10,11,12\n",
+        encoding="utf-8",
+    )
+    loaded_before_start = load_csv(source)
+    source.write_text(
+        "round,n1,n2,n3,n4,n5,n6\n1,1,2,3,4,5,6\n2,7,8,9,10,11,13\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    @research._single_research_worker
+    def worker(dataset, *, checkpoint_path, dataset_path, resume=False):
+        calls.append(dataset_path)
+        return {"status": "started"}
+
+    with pytest.raises(ValueError, match="Checkpoint dataset changed"):
+        worker(
+            loaded_before_start,
+            checkpoint_path=tmp_path / "checkpoint.json",
+            dataset_path=source,
+            resume=True,
+        )
+
+    assert calls == []
 
 
 def test_random_forest_baseline_uses_chronological_splits_and_saves_model(tmp_path) -> None:

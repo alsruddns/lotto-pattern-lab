@@ -91,37 +91,8 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
             except (TypeError, ValueError) as error:
                 raise ValueError(f"Invalid data on CSV line {line_number}: {error}") from error
     records.sort(key=lambda record: record.round_number)
-    manifest_path = Path(f"{path}.manifest.json")
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
-        if manifest.get("sha256") != digest:
-            raise ValueError("CSV content does not match its provenance manifest checksum.")
-        if manifest.get("source_kind") != "official_verified":
-            raise ValueError("CSV provenance manifest has an unsupported source kind.")
-        date_file_name = manifest.get("date_sidecar")
-        if date_file_name:
-            date_path = Path(path).parent / str(date_file_name)
-            date_digest = hashlib.sha256(date_path.read_bytes()).hexdigest()
-            if date_digest != manifest.get("date_sidecar_sha256"):
-                raise ValueError("Official date sidecar does not match its provenance checksum.")
-            with date_path.open(encoding="utf-8-sig", newline="") as date_file:
-                date_reader = csv.DictReader(date_file)
-                dates = {int(row["round"]): date.fromisoformat(row["date"]) for row in date_reader}
-            if set(dates) != {record.round_number for record in records}:
-                raise ValueError("Official date sidecar does not match the CSV round range.")
-            records = [
-                DrawRecord(record.round_number, record.draw, dates[record.round_number])
-                for record in records
-            ]
-        return DrawDataset(
-            tuple(records),
-            "official_verified",
-            str(manifest.get("source_description", "Official source CSV.")),
-            str(manifest.get("source_url", "")),
-            verified_at=str(manifest.get("verified_at", "")),
-        )
     metadata_path = Path(f"{path}.metadata.json")
+    metadata = None
     if metadata_path.exists():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
@@ -129,6 +100,122 @@ def load_csv(path: str | Path, source_url: str | None = None) -> DrawDataset:
             raise ValueError("수동 관리 데이터 메타데이터와 CSV 해시가 일치하지 않습니다.")
         if metadata.get("schema_version") != 1:
             raise ValueError("지원하지 않는 수동 관리 데이터 메타데이터 버전입니다.")
+
+    manifest_path = Path(f"{path}.manifest.json")
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        csv_bytes = Path(path).read_bytes()
+        digest = hashlib.sha256(csv_bytes).hexdigest()
+        if manifest.get("sha256") != digest:
+            raise ValueError("CSV content does not match its provenance manifest checksum.")
+        source_kind = manifest.get("source_kind")
+        official_source = manifest.get("official_source")
+        if source_kind == "official_verified":
+            official_source = manifest
+        elif source_kind != "manual_unverified" or not isinstance(official_source, dict):
+            raise ValueError("CSV provenance manifest has an unsupported source kind.")
+
+        date_file_name = official_source.get("date_sidecar")
+        official_dates: dict[int, date] = {}
+        if date_file_name:
+            date_path = Path(path).parent / str(date_file_name)
+            date_digest = hashlib.sha256(date_path.read_bytes()).hexdigest()
+            if date_digest != official_source.get("date_sidecar_sha256"):
+                raise ValueError("Official date sidecar does not match its provenance checksum.")
+            with date_path.open(encoding="utf-8-sig", newline="") as date_file:
+                date_reader = csv.DictReader(date_file)
+                official_dates = {
+                    int(row["round"]): date.fromisoformat(row["date"]) for row in date_reader
+                }
+
+        if source_kind == "official_verified":
+            if official_dates and set(official_dates) != {
+                record.round_number for record in records
+            }:
+                raise ValueError("Official date sidecar does not match the CSV round range.")
+            records = [
+                DrawRecord(
+                    record.round_number,
+                    record.draw,
+                    official_dates.get(record.round_number, record.draw_date),
+                    "official_verified",
+                )
+                for record in records
+            ]
+            return DrawDataset(
+                tuple(records),
+                "official_verified",
+                str(manifest.get("source_description", "Official source CSV.")),
+                str(manifest.get("source_url", "")),
+                verified_at=str(manifest.get("verified_at", "")),
+            )
+
+        prefix_length = official_source.get("byte_length")
+        prefix_digest = official_source.get("sha256")
+        if (
+            isinstance(prefix_length, bool)
+            or not isinstance(prefix_length, int)
+            or prefix_length < 1
+            or hashlib.sha256(csv_bytes[:prefix_length]).hexdigest() != prefix_digest
+        ):
+            raise ValueError("Official source prefix does not match its provenance checksum.")
+        start_round = int(official_source["start_round"])
+        end_round = int(official_source["end_round"])
+        expected_rounds = set(range(start_round, end_round + 1))
+        official_records = [
+            record for record in records if record.round_number in expected_rounds
+        ]
+        if (
+            {record.round_number for record in official_records} != expected_rounds
+            or (official_dates and set(official_dates) != expected_rounds)
+            or any(
+                record.draw_date is None and record.round_number not in official_dates
+                for record in official_records
+            )
+        ):
+            raise ValueError("Official source prefix does not match its declared round range.")
+        if metadata is None:
+            raise ValueError("Manual draw provenance metadata is missing.")
+        draw_dates = metadata.get("draw_dates", {})
+        statuses = metadata.get("round_verification", {})
+        records = [
+            DrawRecord(
+                record.round_number,
+                record.draw,
+                date.fromisoformat(draw_dates[str(record.round_number)])
+                if str(record.round_number) in draw_dates
+                else official_dates.get(record.round_number, record.draw_date),
+                statuses.get(
+                    str(record.round_number),
+                    {
+                        "status": (
+                            "official_verified"
+                            if record.round_number in expected_rounds
+                            else "manual_unverified"
+                        )
+                    },
+                ).get("status", "manual_unverified"),
+            )
+            for record in records
+        ]
+        all_verified = all(record.verification_status == "official_verified" for record in records)
+        return DrawDataset(
+            tuple(records),
+            "official_verified" if all_verified else "manual_unverified",
+            str(
+                official_source.get(
+                    "source_description", "Official history with manually managed draws."
+                )
+            ),
+            str(official_source.get("source_url", "")),
+            verified_at=(
+                str(manifest.get("verified_at") or official_source.get("verified_at", ""))
+                if all_verified
+                else None
+            ),
+        )
+
+    if metadata is not None:
         dates = metadata.get("draw_dates", {})
         statuses = metadata.get("round_verification", {})
         records = [

@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from lotto_pattern_lab.queue_scheduler import _research_command, scheduler_step
+from lotto_pattern_lab.queue_scheduler import (
+    DatasetVerificationPending,
+    _research_command,
+    scheduler_step,
+)
 from lotto_pattern_lab.research_queue import ResearchQueueStore
 from lotto_pattern_lab.research_rounds import ResearchRoundStore
 
@@ -528,6 +532,65 @@ def test_scheduler_releases_reservation_if_global_slot_becomes_busy_after_claim(
     assert record["item_id"] == item_id
     assert record["status"] == "waiting"
     assert record["research_id"] is not None
+
+
+def test_scheduler_waits_for_dataset_registration_gate(tmp_path: Path, monkeypatch) -> None:
+    import lotto_pattern_lab.queue_scheduler as scheduler
+
+    store = ResearchQueueStore(tmp_path / "queue.sqlite")
+    queue = store.create_queue()
+    item_id = _add(store, queue)
+    store.set_queue_status(queue, "running")
+
+    class BusyGate:
+        def __enter__(self):
+            raise TimeoutError("dataset update is in progress")
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(scheduler, "interprocess_lock", lambda *_args, **_kwargs: BusyGate())
+    result = scheduler_step(
+        store,
+        queue,
+        launch=lambda _item, _checkpoint, _research_id: 99,
+        inspect=lambda _item: (False, None),
+        workspace_root=tmp_path,
+        round_store=ResearchRoundStore(tmp_path / "patterns.sqlite"),
+    )
+    assert result == "waiting_for_dataset_update"
+    queued = store.list_items(queue)[0]
+    assert queued["item_id"] == item_id
+    assert queued["status"] == "waiting"
+
+
+def test_scheduler_keeps_reservation_waiting_until_manual_draw_is_officially_verified(
+    tmp_path: Path,
+) -> None:
+    store = ResearchQueueStore(tmp_path / "queue.sqlite")
+    queue = store.create_queue()
+    item_id = _add(store, queue)
+    store.set_queue_status(queue, "running")
+    original = store.list_items(queue)[0]
+
+    def wait_for_verification(_item, _checkpoint, _research_id):
+        raise DatasetVerificationPending("manual draw pending verification")
+
+    result = scheduler_step(
+        store,
+        queue,
+        launch=wait_for_verification,
+        inspect=lambda _row: (False, None),
+        workspace_root=tmp_path,
+        round_store=ResearchRoundStore(tmp_path / "patterns.sqlite"),
+    )
+
+    saved = store.list_items(queue)[0]
+    assert result == "waiting_for_official_dataset"
+    assert saved["item_id"] == item_id
+    assert saved["status"] == "waiting"
+    assert saved["feature_profile"] == original["feature_profile"]
+    assert saved["config"] == original["config"]
 
 
 def test_detached_scheduler_uses_hidden_windows_process_flags(tmp_path: Path, monkeypatch) -> None:

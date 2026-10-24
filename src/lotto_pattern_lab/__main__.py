@@ -5,6 +5,7 @@ import json
 import re
 import sys
 from datetime import UTC, date, datetime
+from functools import wraps
 
 from .atomic_io import LockTimeoutError, atomic_write_bytes, interprocess_lock
 from .dataset import load_csv, make_random_dataset, save_official_csv
@@ -21,6 +22,7 @@ from .pattern_library import PatternLibrary
 from .patterns import summarize_draw
 from .pysr_backend import PySRConfig
 from .research import (
+    DATASET_UPDATE_GATE,
     DEFAULT_ENGINES,
     GLOBAL_RESEARCH_LOCK,
     SUPPORTED_ENGINES,
@@ -33,6 +35,18 @@ from .storage import ExperimentStore
 from .tabular_models import run_tabular_model
 
 GP_DEFAULTS = GPConfig()
+
+
+def _research_dataset_execution(function):
+    """Hold shared dataset and execution locks for a new GP/Optuna run."""
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with interprocess_lock(DATASET_UPDATE_GATE, timeout=0, scope="dataset-update"):
+            with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
+                return function(*args, **kwargs)
+
+    return wrapped
 
 
 def main() -> None:
@@ -73,6 +87,7 @@ def _run_draw_cli(argv: list[str]) -> None:
     print(f"Ranges (1-10, 11-20, 21-30, 31-40, 41-45): {summary.decade_counts}")
 
 
+@_research_dataset_execution
 def _run_search_cli(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(description="Run a DEAP search and chronological backtest.")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -159,6 +174,7 @@ def _run_sync_cli(argv: list[str]) -> None:
     )
 
 
+@_research_dataset_execution
 def _run_intermittent_cli(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         description="Search intermittent rules and hidden-state hypotheses."
@@ -318,7 +334,8 @@ def _run_research_cli(argv: list[str]) -> None:
             )
         else:
             args.feature_profile = DEFAULT_FEATURE_PROFILE
-    dataset = load_csv(project_path(args.csv))
+    with interprocess_lock(DATASET_UPDATE_GATE, timeout=30, scope="dataset-update"):
+        dataset = load_csv(project_path(args.csv))
     config = IntermittentConfig(
         population_size=args.population,
         generations=args.generations,
@@ -389,6 +406,7 @@ def _run_research_cli(argv: list[str]) -> None:
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+@_research_dataset_execution
 def _run_optimization_cli(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         description="Tune GP research parameters using validation data."
@@ -442,21 +460,20 @@ def _run_optimization_cli(argv: list[str]) -> None:
     study_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.study_name).strip(".-")[:80]
     state_path = storage_root / f"{study_slug}.state.json"
     try:
-        with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
-            with interprocess_lock(state_path, scope="research-worker"):
-                result = optimize_gp(
-                    dataset,
-                    config,
-                    study_name=args.study_name,
-                    mode=args.mode,
-                    action=args.action,
-                    n_trials=args.trials,
-                    timeout_seconds=args.timeout_seconds,
-                    storage_directory=args.storage_directory,
-                    experiment_directory=args.experiment_directory,
-                    progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
-                    run_id=args.run_id,
-                )
+        with interprocess_lock(state_path, scope="research-worker"):
+            result = optimize_gp(
+                dataset,
+                config,
+                study_name=args.study_name,
+                mode=args.mode,
+                action=args.action,
+                n_trials=args.trials,
+                timeout_seconds=args.timeout_seconds,
+                storage_directory=args.storage_directory,
+                experiment_directory=args.experiment_directory,
+                progress=lambda event: print(json.dumps(event, ensure_ascii=False), flush=True),
+                run_id=args.run_id,
+            )
     except LockTimeoutError as error:
         # A competing project worker owns the shared CPU slot. Record a precise
         # launch failure only if this study does not already have a live worker.

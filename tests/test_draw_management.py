@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import os
 import sqlite3
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -13,6 +16,7 @@ from lotto_pattern_lab.draw import Draw
 from lotto_pattern_lab.draw_management import (
     confirm_manual_official_comparison,
     create_draw_correction_request,
+    draw_registration_status,
     register_draw,
     verify_draw_against_official,
 )
@@ -23,6 +27,9 @@ def _isolate_research_guard(tmp_path, monkeypatch):
     import lotto_pattern_lab.draw_management as manager
 
     monkeypatch.setattr(manager, "_research_lock_path", lambda: tmp_path / "research_global")
+    monkeypatch.setattr(
+        manager, "_dataset_update_lock_path", lambda: tmp_path / "dataset_update_gate"
+    )
     monkeypatch.setattr(
         manager, "_research_queue_database_path", lambda: tmp_path / "research_queue.sqlite"
     )
@@ -82,7 +89,83 @@ def test_registration_backups_appends_and_preserves_fixed_range(tmp_path):
     ] == "manual_unverified"
 
 
-def test_registration_is_blocked_by_running_reservation_without_changing_csv(
+def _write_official_provenance_sources(tmp_path):
+    raw, official = _write_sources(tmp_path)
+    raw.write_text(
+        "round,date,n1,n2,n3,n4,n5,n6,bonus\n"
+        "753,2017-05-06,2,17,19,24,37,41,3\n"
+        "754,2017-05-13,1,5,13,24,29,33,9\n",
+        encoding="utf-8",
+        newline="",
+    )
+    date_sidecar = tmp_path / "draws_dates.csv"
+    date_sidecar.write_text(
+        "round,date\n753,2017-05-06\n754,2017-05-13\n", encoding="utf-8", newline=""
+    )
+    manifest_path = Path(f"{raw}.manifest.json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "source_kind": "official_verified",
+                "verification_status": "official_verified",
+                "source_description": "Test official source",
+                "source_url": "https://example.invalid/results",
+                "verified_at": "2026-10-01T00:00:00+00:00",
+                "start_round": 753,
+                "end_round": 754,
+                "draw_count": 2,
+                "sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+                "date_sidecar": date_sidecar.name,
+                "date_sidecar_sha256": hashlib.sha256(date_sidecar.read_bytes()).hexdigest(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return raw, official, manifest_path, date_sidecar
+
+
+def test_official_manifest_is_advanced_with_manual_draw_and_keeps_official_prefix(
+    tmp_path,
+):
+    raw, official, manifest_path, date_sidecar = _write_official_provenance_sources(tmp_path)
+    old_csv = raw.read_bytes()
+    old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    result = _register(raw, official)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    loaded = load_csv(raw)
+    assert manifest["source_kind"] == "manual_unverified"
+    assert manifest["sha256"] == hashlib.sha256(raw.read_bytes()).hexdigest()
+    assert manifest["official_source"]["sha256"] == old_manifest["sha256"]
+    assert manifest["official_source"]["byte_length"] == len(old_csv)
+    assert hashlib.sha256(raw.read_bytes()[: len(old_csv)]).hexdigest() == old_manifest["sha256"]
+    assert date_sidecar.is_file()
+    assert loaded.records[0].verification_status == "official_verified"
+    assert loaded.records[1].verification_status == "official_verified"
+    assert loaded.records[-1].verification_status == "manual_unverified"
+    assert loaded.source_kind == "manual_unverified"
+    assert result["manifest_backup_path"]
+    assert Path(result["manifest_backup_path"]).read_bytes() == json.dumps(
+        old_manifest
+    ).encode("utf-8")
+
+
+def test_official_manifest_checksum_mismatch_is_not_rewritten_or_backed_up(tmp_path):
+    raw, official, manifest_path, _ = _write_official_provenance_sources(tmp_path)
+    raw.write_bytes(raw.read_bytes().replace(b"753,2017-05-06,2,17", b"753,2017-05-06,2,16"))
+    original_csv = raw.read_bytes()
+    original_manifest = manifest_path.read_bytes()
+
+    with pytest.raises(ValueError, match="CSV content does not match"):
+        _register(raw, official)
+
+    assert raw.read_bytes() == original_csv
+    assert manifest_path.read_bytes() == original_manifest
+    assert not (tmp_path / "backups").exists()
+
+
+def test_registration_is_blocked_by_live_reservation_worker_without_changing_csv(
     tmp_path, monkeypatch
 ):
     import lotto_pattern_lab.draw_management as manager
@@ -94,22 +177,141 @@ def test_registration_is_blocked_by_running_reservation_without_changing_csv(
         connection.executescript(
             """
             CREATE TABLE research_queues (status TEXT NOT NULL);
-            CREATE TABLE research_queue_items (status TEXT NOT NULL);
+            CREATE TABLE research_queue_items (
+                status TEXT NOT NULL, worker_pid INTEGER, checkpoint_path TEXT
+            );
             INSERT INTO research_queues VALUES ('running');
-            INSERT INTO research_queue_items VALUES ('running');
+            INSERT INTO research_queue_items VALUES ('running', NULL, NULL);
             """
         )
     monkeypatch.setattr(manager, "_research_lock_path", lambda: tmp_path / "global-lock")
     monkeypatch.setattr(manager, "_research_queue_database_path", lambda: queue_db)
 
     reason = manager.draw_registration_block_reason()
-    assert reason and "연구" in reason
-    with pytest.raises(RuntimeError, match="예약.*연구"):
+    assert reason and "상태 확인" in reason
+    with pytest.raises(RuntimeError):
         _register(raw, official)
 
     assert raw.read_bytes() == original
     assert not (tmp_path / "draws.csv.metadata.json").exists()
     assert not (tmp_path / "backups").exists()
+
+
+def test_waiting_reservations_do_not_block_registration(tmp_path, monkeypatch):
+    import lotto_pattern_lab.draw_management as manager
+
+    raw, official = _write_sources(tmp_path)
+    queue_db = tmp_path / "research_queue.sqlite"
+    with sqlite3.connect(queue_db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE research_queues (status TEXT NOT NULL);
+            CREATE TABLE research_queue_items (
+                status TEXT NOT NULL, worker_pid INTEGER, checkpoint_path TEXT,
+                scheduled_at TEXT
+            );
+            INSERT INTO research_queues VALUES ('running');
+            INSERT INTO research_queue_items VALUES ('waiting', NULL, NULL, NULL);
+            INSERT INTO research_queue_items VALUES ('waiting', NULL, NULL, NULL);
+            INSERT INTO research_queue_items VALUES (
+                'waiting', NULL, NULL, '2099-01-01T00:00:00+00:00'
+            );
+            """
+        )
+    monkeypatch.setattr(manager, "_research_queue_database_path", lambda: queue_db)
+
+    assert draw_registration_status() == "등록 가능 — 대기 중인 예약 3건"
+    result = _register(raw, official)
+
+    assert result["status"] == "registered"
+    with sqlite3.connect(queue_db) as connection:
+        assert connection.execute(
+            "SELECT status,count(*) FROM research_queue_items GROUP BY status"
+        ).fetchall() == [("waiting", 3)]
+
+
+def test_stale_queue_running_status_with_dead_pid_and_completed_checkpoint_allows_write(
+    tmp_path, monkeypatch
+):
+    import lotto_pattern_lab.draw_management as manager
+
+    raw, official = _write_sources(tmp_path)
+    queue_db = tmp_path / "research_queue.sqlite"
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text('{"status":"completed"}', encoding="utf-8")
+    with sqlite3.connect(queue_db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE research_queue_items (
+                status TEXT NOT NULL, worker_pid INTEGER, checkpoint_path TEXT
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO research_queue_items VALUES ('running', ?, ?)",
+            (2_147_483_647, str(checkpoint)),
+        )
+    monkeypatch.setattr(manager, "_research_queue_database_path", lambda: queue_db)
+
+    assert draw_registration_status() == "등록 가능 — 실행 중인 연구 없음"
+    assert _register(raw, official)["status"] == "registered"
+
+
+def test_live_scheduler_lease_and_pid_show_reservation_starting(tmp_path, monkeypatch):
+    import lotto_pattern_lab.draw_management as manager
+
+    raw, official = _write_sources(tmp_path)
+    queue_db = tmp_path / "research_queue.sqlite"
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text('{"status":"starting"}', encoding="utf-8")
+    with sqlite3.connect(queue_db) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE research_queue_items (
+                status TEXT NOT NULL, worker_pid INTEGER, checkpoint_path TEXT
+            );
+            CREATE TABLE research_queue_lease (
+                singleton INTEGER PRIMARY KEY, owner TEXT, queue_id TEXT, heartbeat_at REAL
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO research_queue_items VALUES ('running', ?, ?)",
+            (os.getpid(), str(checkpoint)),
+        )
+        connection.execute(
+            "INSERT INTO research_queue_lease VALUES (1, 'owner', 'queue', ?)",
+            (time.time(),),
+        )
+    monkeypatch.setattr(manager, "_research_queue_database_path", lambda: queue_db)
+
+    assert draw_registration_status() == "등록 불가 — 예약 연구가 실행을 시작 중입니다."
+    with pytest.raises(RuntimeError):
+        _register(raw, official)
+    assert not Path(f"{raw}.metadata.json").exists()
+
+
+def test_live_research_lock_blocks_registration_without_db_running_status(
+    tmp_path, monkeypatch
+):
+    import lotto_pattern_lab.draw_management as manager
+
+    raw, official = _write_sources(tmp_path)
+    original = raw.read_bytes()
+    lock_path = tmp_path / "research_global"
+    monkeypatch.setattr(manager, "_research_lock_path", lambda: lock_path)
+    real_lock = manager.interprocess_lock
+
+    def active_worker_lock(key, *, timeout=60.0, scope="write"):
+        if Path(key) == lock_path and scope == "research-global":
+            raise TimeoutError("simulated active research process")
+        return real_lock(key, timeout=timeout, scope=scope)
+
+    monkeypatch.setattr(manager, "interprocess_lock", active_worker_lock)
+    assert "등록 대기" in manager.draw_registration_block_reason()
+    with pytest.raises(RuntimeError, match="잠금"):
+        _register(raw, official)
+    assert raw.read_bytes() == original
 
 
 def test_duplicate_round_and_invalid_draw_values_are_rejected(tmp_path):
@@ -185,6 +387,32 @@ def test_metadata_write_failure_restores_original_csv(tmp_path, monkeypatch):
     assert raw.read_bytes() == original
     assert not metadata_path.exists()
     assert not (tmp_path / "draws.csv.history.jsonl").exists()
+
+
+def test_manifest_write_failure_restores_csv_and_original_manifest(tmp_path, monkeypatch):
+    import lotto_pattern_lab.draw_management as manager
+
+    raw, official, manifest_path, _ = _write_official_provenance_sources(tmp_path)
+    original_csv = raw.read_bytes()
+    original_manifest = manifest_path.read_bytes()
+    real_write = manager.atomic_write_bytes
+    failed = False
+
+    def fail_manifest(path, content, **kwargs):
+        nonlocal failed
+        if path == manifest_path and not failed:
+            failed = True
+            raise OSError("simulated manifest failure")
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(manager, "atomic_write_bytes", fail_manifest)
+    with pytest.raises(OSError, match="simulated manifest failure"):
+        _register(raw, official)
+
+    assert raw.read_bytes() == original_csv
+    assert manifest_path.read_bytes() == original_manifest
+    assert not Path(f"{raw}.metadata.json").exists()
+    assert not Path(f"{raw}.history.jsonl").exists()
 
 
 def test_official_main_number_mismatch_stops_before_backup_or_write(tmp_path):

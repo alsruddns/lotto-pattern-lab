@@ -46,6 +46,7 @@ SUPPORTED_ENGINES = tuple(
 )
 DEFAULT_ENGINES = ("intermittent_gp",)
 GLOBAL_RESEARCH_LOCK = project_path("checkpoints/research_global")
+DATASET_UPDATE_GATE = project_path("checkpoints/dataset_update_gate")
 
 
 def research_worker_active() -> bool:
@@ -100,10 +101,24 @@ def _single_research_worker(function: Callable[..., dict[str, Any]]):
     @wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> dict[str, Any]:
         checkpoint = project_path(kwargs.get("checkpoint_path", "checkpoints/research.json"))
-        with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
-            Path(f"{checkpoint}.launch").unlink(missing_ok=True)
-            with interprocess_lock(GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"):
-                return function(*args, **kwargs)
+        with interprocess_lock(DATASET_UPDATE_GATE, timeout=30, scope="dataset-update"):
+            with interprocess_lock(checkpoint, timeout=0, scope="research-worker"):
+                with interprocess_lock(
+                    GLOBAL_RESEARCH_LOCK, timeout=0, scope="research-global"
+                ):
+                    Path(f"{checkpoint}.launch").unlink(missing_ok=True)
+                    dataset_path = kwargs.get("dataset_path")
+                    run_args = args
+                    if dataset_path:
+                        disk_dataset = load_csv(project_path(dataset_path))
+                        if dataset_digest(disk_dataset) != dataset_digest(args[0]):
+                            if kwargs.get("resume", False):
+                                raise ValueError(
+                                    "Checkpoint dataset changed; resume with a different "
+                                    "dataset is not allowed."
+                                )
+                            run_args = (disk_dataset, *args[1:])
+                    return function(*run_args, **kwargs)
 
     return wrapped
 
