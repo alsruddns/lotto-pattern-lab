@@ -26,7 +26,12 @@ from lotto_pattern_lab.prediction import (
     save_recommendation,
     summarize_prediction_history,
 )
-from lotto_pattern_lab.presentation import format_count, format_decimal, pretty_formula
+from lotto_pattern_lab.presentation import (
+    format_count,
+    format_decimal,
+    format_research_round,
+    pretty_formula,
+)
 from lotto_pattern_lab.research_recommendations import (
     generate_research_recommendations,
     list_research_recommendation_candidates,
@@ -498,7 +503,9 @@ else:
                 {
                     "패턴 ID": item["pattern_id"][:8],
                     "연구 ID": (item.get("origin_research_id") or "미수집")[:8],
-                    "연구 회차": item.get("research_round") or "미수집",
+                    "연구 회차": format_research_round(
+                        item.get("research_round"), missing_label="미수집"
+                    ),
                     "모델": item.get("model_type") or "미수집",
                     "프로파일": item.get("feature_profile"),
                     "엔진": item.get("engine"),

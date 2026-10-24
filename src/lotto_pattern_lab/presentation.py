@@ -86,9 +86,20 @@ def format_count(value: object) -> str:
     return f"{int(number):,}"
 
 
-def format_research_round(value: object) -> str:
-    """Format an optional research round for a homogeneous display-only column."""
-    return "미배정" if value is None else str(value)
+def format_research_round(value: object, missing_label: str = "미배정") -> str:
+    """Format an optional research round as text for Arrow-safe display columns."""
+    if value is None:
+        return missing_label
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return missing_label
+    if isinstance(value, Real) and not isinstance(value, bool):
+        if not math.isfinite(float(value)):
+            return missing_label
+        if float(value).is_integer():
+            return str(int(value))
+    return str(value)
 
 
 def format_duration(seconds: object) -> str:

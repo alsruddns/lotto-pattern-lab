@@ -14,6 +14,7 @@ from lotto_pattern_lab.presentation import (
 
 
 def test_queue_research_round_display_is_arrow_compatible_and_keeps_ids() -> None:
+    import pandas as pd
     import pyarrow as pa
 
     records = [
@@ -36,15 +37,71 @@ def test_queue_research_round_display_is_arrow_compatible_and_keeps_ids() -> Non
         for item in ordered
     ]
 
-    table = pa.Table.from_pylist(display_rows)
+    table = pa.Table.from_pandas(pd.DataFrame(display_rows), preserve_index=False)
 
-    assert table.schema.field("연구 회차").type == pa.string()
+    assert pa.types.is_string(table.schema.field("연구 회차").type) or pa.types.is_large_string(
+        table.schema.field("연구 회차").type
+    )
     assert table.column("연구 회차").to_pylist() == ["2", "10", "미배정"]
     assert table.column("연구 ID").to_pylist() == [
         "round-two",
         "round-ten",
         "unassigned",
     ]
+
+
+@pytest.mark.parametrize(
+    ("value", "missing_label", "expected"),
+    [
+        (3, "미수집", "3"),
+        ("미수집", "미수집", "미수집"),
+        (None, "미배정", "미배정"),
+        (None, "미수집", "미수집"),
+        ("7", "미수집", "7"),
+        ("", "미수집", "미수집"),
+        (float("nan"), "미수집", "미수집"),
+    ],
+)
+def test_research_round_display_is_arrow_safe(value, missing_label, expected):
+    import pandas as pd
+    import pyarrow as pa
+
+    table = pa.Table.from_pandas(
+        pd.DataFrame(
+            [{"연구 회차": format_research_round(value, missing_label=missing_label)}]
+        ),
+        preserve_index=False,
+    )
+
+    arrow_type = table.schema.field("연구 회차").type
+    assert pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type)
+    assert table.column("연구 회차").to_pylist() == [expected]
+
+
+def test_research_round_display_keeps_numeric_order_and_handles_empty_data():
+    import pandas as pd
+    import pyarrow as pa
+
+    records = [{"research_round": 10}, {"research_round": 2}, {"research_round": None}]
+    records.sort(
+        key=lambda row: (
+            row["research_round"] is None,
+            row["research_round"] if row["research_round"] is not None else 0,
+        )
+    )
+    frame = pd.DataFrame(
+        [
+            {"연구 회차": format_research_round(row["research_round"])}
+            for row in records
+        ]
+    )
+    table = pa.Table.from_pandas(frame, preserve_index=False)
+    empty_table = pa.Table.from_pandas(
+        pd.DataFrame(columns=["연구 회차"]), preserve_index=False
+    )
+
+    assert table.column("연구 회차").to_pylist() == ["2", "10", "미배정"]
+    assert empty_table.num_rows == 0
 
 
 @pytest.mark.parametrize(

@@ -103,6 +103,55 @@ def test_read_only_library_access_does_not_create_or_migrate_database(tmp_path):
     assert not path.exists()
 
 
+def test_recommendation_pattern_table_formats_missing_research_round_for_arrow(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from streamlit.testing.v1 import AppTest
+
+    from lotto_pattern_lab import paths
+
+    monkeypatch.setattr(paths, "PROJECT_ROOT", tmp_path)
+    library = PatternLibrary(tmp_path / "data/database/patterns.sqlite")
+    for rule_index, research_id, research_round, formula in [
+        (1, "research-with-round", 8, "x0"),
+        (2, "research-without-round", None, "add(x0,1)"),
+    ]:
+        payload = _pattern_payload(rule_index=rule_index)
+        payload.update(
+            origin_research_id=research_id,
+            research_id=research_id,
+            formulas=[formula] * 6,
+        )
+        if research_round is not None:
+            payload["research_round"] = research_round
+        pattern_id, _ = library.register_pattern(payload)
+        library.record_observation(
+            pattern_id,
+            1400,
+            "validation",
+            {
+                "hit_count": 5,
+                "full_set_match": False,
+                "predicted_numbers": [1, 2, 3, 4, 5, 6],
+                "winning_numbers": [1, 2, 3, 4, 5, 7],
+                "prediction_created_before_draw": False,
+            },
+        )
+
+    page = next(
+        (Path(__file__).resolve().parents[1] / "src/lotto_pattern_lab/pages").glob(
+            "2_*.py"
+        )
+    )
+    app = AppTest.from_file(page).run(timeout=60)
+
+    assert not app.exception, [error.message for error in app.exception]
+    assert len(app.dataframe) == 1
+    assert set(app.dataframe[0].value["연구 회차"]) == {"8", "미수집"}
+
+
 def test_pattern_replay_uses_saved_six_formula_and_rejects_other_gate_branch():
     dataset = make_random_dataset(10, seed=7, first_round=1237)
     pattern = _pattern_payload(pattern_id="pattern-1")
